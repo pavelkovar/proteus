@@ -1,0 +1,17 @@
+[Unit]
+Description=Proteus PHP application server
+After=network.target
+
+[Service]
+Type=simple
+User=phpapp
+Group=phpapp
+ExecStart=/usr/bin/proteus /etc/proteus/config.json
+Restart=on-failure
+RestartSec=1s
+
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+[Install]
+WantedBy=multi-user.target

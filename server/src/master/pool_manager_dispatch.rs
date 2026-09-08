@@ -1,0 +1,310 @@
+//! Request dispatch and response streaming: acquire capacity, send the
+//! request, then own the worker and permit for the response's life.
+//!
+//! A child module rather than a sibling, so these `impl PoolManager` methods
+//! still reach private fields.
+
+use super::{sigkill, PooledWorker, PoolManager, TempBodyFile};
+use crate::ipc::data::{HeaderBlob, PhpRequest, ResponseFrame};
+use bytes::Bytes;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tokio_stream::wrappers::ReceiverStream;
+
+/// Headers known; the body may still be arriving.
+pub type BodyStream = ReceiverStream<std::io::Result<Bytes>>;
+
+pub struct StreamedResponse {
+    pub status: u16,
+    pub headers: HeaderBlob<'static>,
+    pub body: BodyStream,
+    pub worker_pid: u32,
+}
+
+/// Both variants hand `permit` back so a retry can reuse it.
+enum StartAttempt {
+    /// Never reached a Headers frame, so a fresh retry is safe.
+    WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
+    /// Timed out before Headers, so retrying would only hang again.
+    TimedOut(OwnedSemaphorePermit, Option<TempBodyFile>),
+}
+
+/// Worker metadata is already cleaned up by the time this is returned.
+enum DispatchAttemptError {
+    WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
+    TimedOut(OwnedSemaphorePermit),
+}
+
+pub enum DispatchOutcome {
+    Ok(StreamedResponse),
+
+    Timeout,
+    /// Never reached a worker at all.
+    QueueTimeout,
+    Failed,
+}
+
+impl PoolManager {
+    /// Always cleans up worker metadata on `WorkerUnavailable`.
+    async fn try_dispatch_to(
+        self: &Arc<Self>,
+        worker: PooledWorker,
+        req: &Arc<PhpRequest<'static>>,
+        permit: OwnedSemaphorePermit,
+        body_cleanup: Option<TempBodyFile>,
+    ) -> Result<StreamedResponse, DispatchAttemptError> {
+        let pid = worker.pid;
+        // No lock and no lookup: the counters hang off the `Arc` already held.
+        worker.meta.mark_busy(Instant::now(), self.started_at);
+        match self.start_streaming(worker, req, permit, body_cleanup).await {
+            Ok(started) => Ok(started),
+            Err(StartAttempt::TimedOut(permit, _body_cleanup)) => Err(DispatchAttemptError::TimedOut(permit)),
+            Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)) => {
+                self.remove_worker_meta(pid);
+                Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup))
+            }
+        }
+    }
+
+    /// The retry forces a fresh spawn rather than another `get_worker()`,
+    /// which could pop a second stale worker from the same recycle burst.
+    pub async fn dispatch(self: &Arc<Self>, req: &Arc<PhpRequest<'static>>, body_cleanup: Option<TempBodyFile>) -> DispatchOutcome {
+        self.requests_total.fetch_add(1, Relaxed);
+
+        // Rejects immediately rather than waiting out queue_timeout.
+        let Some(queue_guard) = super::QueueDepthGuard::try_new(&self.queue_depth, self.queue_max_depth) else {
+            self.queue_timeouts.fetch_add(1, Relaxed);
+            return DispatchOutcome::QueueTimeout;
+        };
+        let acquire_result =
+            tokio::time::timeout(self.queue_timeout, Arc::clone(&self.semaphore).acquire_owned()).await;
+        drop(queue_guard);
+        let permit = match acquire_result {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => unreachable!("semaphore never closed"),
+            Err(_) => {
+                self.queue_timeouts.fetch_add(1, Relaxed);
+                return DispatchOutcome::QueueTimeout;
+            }
+        };
+
+        let worker = match self.get_worker().await {
+            Ok(w) => w,
+            Err(e) => return self.give_up(&format!("failed to obtain a worker ({e}) - prototype may be dead"), permit),
+        };
+        let pid = worker.pid;
+        let (permit, body_cleanup) = match self.try_dispatch_to(worker, req, permit, body_cleanup).await {
+            Ok(started) => return DispatchOutcome::Ok(started),
+            Err(DispatchAttemptError::TimedOut(permit)) => return self.timed_out(pid, permit),
+            Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
+                tracing::warn!(
+                    r#type = "controller",
+                    pid,
+                    error = %e,
+                    "dispatch to pooled worker failed - probably just self-retired, forcing a fresh spawn"
+                );
+                // Probably self-retired is not certainly: otherwise this
+                // worker is now untracked, and `mark_peer_dead` cannot reach
+                // one that is wedged rather than parked.
+                sigkill(pid, "pooled worker failed its dispatch, replaced by a fresh spawn");
+                (permit, body_cleanup)
+            }
+        };
+
+        let worker = match self.spawn_worker().await {
+            Ok(w) => w,
+            Err(e) => return self.give_up(&format!("fresh worker spawn also failed ({e}), giving up on this request"), permit),
+        };
+        let pid = worker.pid;
+        match self.try_dispatch_to(worker, req, permit, body_cleanup).await {
+            Ok(started) => DispatchOutcome::Ok(started),
+            Err(DispatchAttemptError::TimedOut(permit)) => self.timed_out(pid, permit),
+            Err(DispatchAttemptError::WorkerUnavailable(e, permit, _body_cleanup)) => {
+                sigkill(pid, "freshly spawned worker failed its dispatch too");
+                self.give_up(&format!("freshly spawned worker pid={pid} STILL failed ({e}), giving up"), permit)
+            }
+        }
+    }
+
+    /// The kill has already happened; this is the shared cleanup.
+    fn timed_out(&self, pid: u32, permit: OwnedSemaphorePermit) -> DispatchOutcome {
+        self.watchdog_kills.fetch_add(1, Relaxed);
+        self.remove_worker_meta(pid);
+        drop(permit);
+        DispatchOutcome::Timeout
+    }
+
+    /// Logs, counts, releases the permit.
+    fn give_up(&self, context: &str, permit: OwnedSemaphorePermit) -> DispatchOutcome {
+        tracing::error!(r#type = "controller", "{context}");
+        self.dispatch_failed.fetch_add(1, Relaxed);
+        drop(permit);
+        DispatchOutcome::Failed
+    }
+
+    /// Returns once the first Headers frame arrives, handing the rest to a
+    /// task that owns it. `permit` is never dropped here - it goes back
+    /// through `StartAttempt` for a retry to reuse.
+    async fn start_streaming(
+        self: &Arc<Self>,
+        mut worker: PooledWorker,
+        req: &Arc<PhpRequest<'static>>,
+        permit: OwnedSemaphorePermit,
+        body_cleanup: Option<TempBodyFile>,
+    ) -> Result<StreamedResponse, StartAttempt> {
+        let pid = worker.pid;
+        let channel = &mut worker.channel;
+        // write_request never blocks, so one window covers it and the first
+        // response frame together.
+        let first = tokio::time::timeout(self.request_timeout, async {
+            channel.write_request(Arc::clone(req))?;
+            channel.read_response_frame().await
+        })
+        .await;
+        let (status, headers) = match first {
+            Ok(Ok(ResponseFrame::Headers { status, headers, .. })) => (status, headers),
+            Ok(Ok(_unexpected)) => {
+                return Err(StartAttempt::WorkerUnavailable(
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "expected a Headers frame first"),
+                    permit,
+                    body_cleanup,
+                ));
+            }
+            Ok(Err(e)) => return Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)),
+            // Even a worker that hung before reading the request must be
+            // killed, or it runs on invisible to every later watchdog pass.
+            Err(_elapsed) => {
+                tracing::warn!(
+                    r#type = "controller",
+                    pid,
+                    request_timeout = ?self.request_timeout,
+                    "worker exceeded request_timeout writing the request or waiting for headers"
+                );
+                sigkill(pid, "write_request/headers wait timed out");
+                return Err(StartAttempt::TimedOut(permit, body_cleanup));
+            }
+        };
+
+        // Bounded, so a slow client backpressures the send rather than
+        // hoarding a whole unstreamed response in memory.
+        let (body_tx, body_rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            pool.drive_stream_to_completion(worker, permit, body_tx, body_cleanup).await;
+        });
+
+        Ok(StreamedResponse { status, headers, body: ReceiverStream::new(body_rx), worker_pid: pid })
+    }
+
+    /// Owns the worker and permit for the rest of the response, returning it
+    /// to idle only once the done marker arrives - which after an early
+    /// `fastcgi_finish_request()` can be long after `End`.
+    ///
+    /// The watchdog resets per frame: slow but steady is not hung.
+    async fn drive_stream_to_completion(
+        self: Arc<Self>,
+        mut worker: PooledWorker,
+        permit: OwnedSemaphorePermit,
+        body_tx: mpsc::Sender<std::io::Result<Bytes>>,
+        _body_cleanup: Option<TempBodyFile>,
+    ) {
+        let pid = worker.pid;
+        let retiring = loop {
+            match tokio::time::timeout(self.request_timeout, worker.channel.read_response_frame()).await {
+                Ok(Ok(ResponseFrame::Body(chunk))) => {
+                    if body_tx.send(Ok(Bytes::from(chunk.into_owned()))).await.is_err() {
+                        // Client gone: the worker's state can no longer be
+                        // trusted enough to pool it, but this is not its fault.
+                        tracing::debug!(r#type = "controller", pid, "body receiver dropped (client gone), killing worker");
+                        self.kill_worker(pid, permit);
+                        return;
+                    }
+                }
+                Ok(Ok(ResponseFrame::End { retiring })) => break retiring,
+                Ok(Ok(ResponseFrame::Headers { .. })) => {
+                    let _ = body_tx
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected second Headers frame")))
+                        .await;
+                    tracing::error!(r#type = "controller", pid, "worker sent a second Headers frame, protocol violation");
+                    self.watchdog_kills.fetch_add(1, Relaxed);
+                    self.kill_worker(pid, permit);
+                    return;
+                }
+                Ok(Err(e)) => {
+                    let _ = body_tx.send(Err(std::io::Error::new(e.kind(), e.to_string()))).await;
+                    self.read_failed(pid, permit, &format!("response stream read failed ({e}), not returning it to the pool"));
+                    return;
+                }
+                Err(_elapsed) => {
+                    let _ = body_tx
+                        .send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "worker exceeded request_timeout mid-response")))
+                        .await;
+                    tracing::warn!(
+                        r#type = "controller",
+                        pid,
+                        request_timeout = ?self.request_timeout,
+                        "worker exceeded request_timeout mid-response, sending SIGKILL"
+                    );
+                    self.watchdog_kills.fetch_add(1, Relaxed);
+                    self.kill_worker(pid, permit);
+                    return;
+                }
+            }
+        };
+        drop(body_tx); // ends the body stream cleanly (EOF) for the HTTP client
+
+        if retiring {
+            // The worker exits right after this, so there is no done marker
+            // coming and nothing to return to the pool.
+            tracing::debug!(r#type = "controller", pid, "worker self-retired after limits.requests");
+            self.recycled_request_limit.fetch_add(1, Relaxed);
+            self.remove_worker_meta(pid);
+            drop(permit);
+            return;
+        }
+
+        match tokio::time::timeout(self.request_timeout, worker.channel.read_worker_done()).await {
+            Ok(Ok(())) => {
+                let now = Instant::now();
+                worker.meta.mark_idle(now, self.started_at);
+                self.return_worker(worker);
+                drop(permit);
+            }
+            Ok(Err(e)) => {
+                self.read_failed(pid, permit, &format!("trailing worker-done read failed ({e}), not returning it to the pool"));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    r#type = "controller",
+                    pid,
+                    request_timeout = ?self.request_timeout,
+                    "worker exceeded request_timeout finishing work after fastcgi_finish_request(), sending SIGKILL"
+                );
+                self.watchdog_kills.fetch_add(1, Relaxed);
+                self.kill_worker(pid, permit);
+            }
+        }
+    }
+
+    /// Bumps no counter itself: a watchdog timeout and a disconnected client
+    /// both end in a kill, but only one is the worker's fault.
+    fn kill_worker(&self, pid: u32, permit: OwnedSemaphorePermit) {
+        sigkill(pid, "drive_stream_to_completion");
+        self.remove_worker_meta(pid);
+        drop(permit);
+    }
+
+    /// A read failure rather than a timeout, but still a kill: dropping the
+    /// channel gets a *parked* worker to exit on its own, while one still
+    /// inside `execute_file` would run on unowned and untracked.
+    fn read_failed(&self, pid: u32, permit: OwnedSemaphorePermit, context: &str) {
+        tracing::warn!(r#type = "controller", pid, "{context}");
+        self.dispatch_failed.fetch_add(1, Relaxed);
+        sigkill(pid, "response stream failed, worker abandoned");
+        self.remove_worker_meta(pid);
+        drop(permit);
+    }
+}

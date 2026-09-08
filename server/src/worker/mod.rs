@@ -1,0 +1,153 @@
+//! The worker process: forked, never exec'd, from an already-initialized
+//! prototype, so it inherits the SAPI and OPcache/APCu state for free.
+//! Single-threaded, no tokio.
+
+use crate::ipc::data;
+use crate::ipc::shm;
+use crate::prototype::php_ffi::{PhpChunk, PhpConn};
+use std::os::fd::OwnedFd;
+
+/// Bounds how much a response coalesces before being flushed, so a large
+/// one streams in fixed steps no matter how PHP chose to call `ub_write`.
+/// The cost is that small, gapped writes wait for the buffer to fill.
+pub(crate) const COALESCE_FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// Last-resort orphan guard. The in-band shutdown path needs someone alive
+/// to set it, so once master and then the prototype exit, a parked worker
+/// would be reparented to init and wait forever on a ring nobody will write
+/// to, holding its whole PHP heap.
+///
+/// The `getppid()` recheck closes the fork/prctl race, where the signal
+/// would have been dispatched to the old parent. Best-effort: failing this
+/// is not a reason to refuse to serve requests.
+#[cfg(target_os = "linux")]
+fn die_with_parent(expected_parent: nix::unistd::Pid) {
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        tracing::warn!(
+            r#type = "worker",
+            error = %std::io::Error::last_os_error(),
+            "prctl(PR_SET_PDEATHSIG) failed - this worker will not die with its prototype"
+        );
+        return;
+    }
+    if nix::unistd::getppid() != expected_parent {
+        std::process::exit(0);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_expected_parent: nix::unistd::Pid) {}
+
+
+/// Serves requests until `max_requests` or the peer goes away.
+///
+/// `_liveness` is held for the worker's whole life, so its process exit is
+/// the EOF master watches for. `prototype_pid` must be read before the
+/// `fork()` - see `die_with_parent`.
+pub(crate) fn run(
+    _liveness: OwnedFd,
+    channel: shm::MappedChannel,
+    phpconn: &PhpConn,
+    max_requests: u32,
+    notify: shm::NotifyEfds,
+    prototype_pid: nix::unistd::Pid,
+    idle_timeout: Option<std::time::Duration>,
+) {
+    use std::os::fd::AsRawFd;
+    // Before the worker can park on anything untimed.
+    die_with_parent(prototype_pid);
+    // The owning `OwnedFd`s must outlive these raw numbers, or the fd could
+    // be closed and silently aliased by something opened later.
+    let req_space_efd_raw = notify.req_space.as_raw_fd();
+    let resp_data_efd_raw = notify.resp_data.as_raw_fd();
+    let pid = std::process::id();
+    let channel = channel.channel();
+    let mut served = 0u32;
+    // Reused for the worker's whole life, in both directions.
+    let mut scratch = data::RingScratch::default();
+
+    loop {
+        let deadline = idle_timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let req = match data::read_command_from_ring(
+            &channel.request,
+            &channel.peer_death,
+            &mut scratch.read,
+            req_space_efd_raw,
+            deadline,
+        ) {
+            Ok(Some(data::WorkerCommand::Request(req))) => req,
+            Ok(Some(data::WorkerCommand::Retire)) => {
+                // Only reachable while genuinely idle, so there is nothing
+                // to finish first.
+                tracing::debug!(r#type = "worker", pid, "idle timeout reached, retiring");
+                break;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                tracing::warn!(r#type = "worker", pid, error = %e, "read_command_from_ring failed");
+                break;
+            }
+        };
+        served += 1;
+        // Computed before execute_file, because `End` can fire well ahead of
+        // its return via fastcgi_finish_request() and must carry this.
+        let retiring = served >= max_requests;
+
+        // Once a write fails every later one fails identically, so this only
+        // keeps a large response from logging once per remaining chunk.
+        let mut write_failed = false;
+        let write_scratch = &mut scratch.write;
+        let mut on_chunk = |chunk: PhpChunk| {
+            if write_failed {
+                return;
+            }
+            let result = match chunk {
+                PhpChunk::Headers { status, headers } => data::write_headers_to_ring(
+                    &channel.response,
+                    &channel.peer_death,
+                    status,
+                    &headers,
+                    write_scratch,
+                    resp_data_efd_raw,
+                ),
+                // Split before framing, or a single huge echo() would build
+                // one frame larger than the ring can hold.
+                PhpChunk::Body(bytes) => data::write_body_to_ring(
+                    &channel.response,
+                    &channel.peer_death,
+                    bytes,
+                    COALESCE_FLUSH_THRESHOLD,
+                    write_scratch,
+                    resp_data_efd_raw,
+                ),
+                PhpChunk::End => data::write_response_frame_to_ring(
+                    &channel.response,
+                    &channel.peer_death,
+                    &data::ResponseFrameRef::End { retiring },
+                    write_scratch,
+                    resp_data_efd_raw,
+                ),
+            };
+            if let Err(e) = result {
+                tracing::warn!(r#type = "worker", pid, error = %e, "write_response_frame_to_ring failed");
+                write_failed = true;
+            }
+        };
+        let result = phpconn.execute_file(&req.script_path, &req, &mut on_chunk);
+
+        // Unconditional, right after execute_file truly returns: this marker
+        // is the only thing that tells master the worker is free again.
+        if result.early_sent {
+            tracing::debug!(r#type = "worker", pid, "fastcgi_finish_request() fired, response already streamed early");
+        }
+        if let Err(e) = data::write_worker_done_to_ring(&channel.response, &channel.peer_death, resp_data_efd_raw) {
+            tracing::warn!(r#type = "worker", pid, error = %e, "write_worker_done_to_ring failed");
+            break;
+        }
+
+        if retiring {
+            tracing::debug!(r#type = "worker", pid, max_requests, "hit max_requests, retiring");
+            break;
+        }
+    }
+}
