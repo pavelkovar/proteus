@@ -15,6 +15,7 @@ use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::{Response, StatusCode};
+use tokio::io::AsyncReadExt as _;
 use tokio_stream::StreamExt as _;
 use tokio_util::io::ReaderStream;
 
@@ -53,12 +54,17 @@ fn buffered_body(bytes: Vec<u8>) -> ResponseBody {
     Full::new(Bytes::from(bytes)).map_err(|never: std::convert::Infallible| match never {}).boxed()
 }
 
-/// Chunked, so the whole body never has to fit in one allocation. The chunk
-/// is much larger than `ReaderStream`'s default because `tokio::fs::File`
-/// dispatches every `poll_read` as its own `spawn_blocking` call.
-fn streamed_body<R: tokio::io::AsyncRead + Send + Sync + 'static>(reader: R) -> ResponseBody {
-    let frames = ReaderStream::with_capacity(reader, COALESCE_FLUSH_THRESHOLD).map(|chunk| chunk.map(Frame::data));
+/// Chunked, so the whole body never has to fit in one allocation.
+fn streamed_body<R: tokio::io::AsyncRead + Send + Sync + 'static>(reader: R, capacity: usize) -> ResponseBody {
+    let frames = ReaderStream::with_capacity(reader, capacity).map(|chunk| chunk.map(Frame::data));
     StreamBody::new(frames).boxed()
+}
+
+/// `ReaderStream` allocates its buffer at full capacity on every read, so a
+/// small file must not be handed a large one. The cap is what keeps a big
+/// file from paying a `spawn_blocking` round trip per few KB.
+fn read_buffer_for(len: u64) -> usize {
+    len.clamp(1, COALESCE_FLUSH_THRESHOLD as u64) as usize
 }
 
 /// Message-framing headers are master's alone to set. A script-set
@@ -175,14 +181,20 @@ pub(crate) async fn build_static_response(
     let body = match encoding {
         None => {
             builder = builder.header(hyper::header::CONTENT_LENGTH, len).header(hyper::header::ACCEPT_RANGES, "bytes");
-            if is_head { buffered_body(Vec::new()) } else { streamed_body(file) }
+            if is_head {
+                buffered_body(Vec::new())
+            } else {
+                // Bounded by the length the header promises: that was read at
+                // stat time, and a file grown since must not overrun it.
+                streamed_body(file.take(len), read_buffer_for(len))
+            }
         }
         Some(encoding) => {
             builder = with_content_encoding(builder, encoding);
             if is_head {
                 buffered_body(Vec::new())
             } else {
-                compressed_body(ReaderStream::with_capacity(file, COALESCE_FLUSH_THRESHOLD), encoding, Some(len))
+                compressed_body(ReaderStream::with_capacity(file.take(len), read_buffer_for(len)), encoding, Some(len))
             }
         }
     };
