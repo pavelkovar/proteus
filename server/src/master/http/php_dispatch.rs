@@ -46,6 +46,11 @@ fn version_str(version: Version) -> &'static str {
 /// which is the hard cap.
 const BODY_MEMORY_THRESHOLD: usize = 256 * 1024; // 256 KiB
 
+/// How much a spilled body gathers before reaching the file. Every write to
+/// a `tokio::fs::File` is its own trip through the blocking pool, so writing
+/// frames as they arrive costs one per frame, however small the client's are.
+const SPILL_WRITE_THRESHOLD: usize = 64 * 1024;
+
 static BODY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// pid plus a counter, so no randomness is needed to avoid collisions.
@@ -85,6 +90,7 @@ async fn collect_body_streaming(
     let mut limited = Limited::new(body, max_body_size);
     let mut inline: Vec<u8> = Vec::new();
     let mut spilled: Option<(tokio::fs::File, PathBuf)> = None;
+    let mut pending: Vec<u8> = Vec::new();
     let mut total_len: u64 = 0;
 
     let cleanup_on_error = |spilled: &Option<(tokio::fs::File, PathBuf)>| {
@@ -125,10 +131,14 @@ async fn collect_body_streaming(
         total_len += data.len() as u64;
 
         if let Some((file, _)) = spilled.as_mut() {
-            if let Err(e) = file.write_all(&data).await {
-                tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-                cleanup_on_error(&spilled);
-                return Err(BodyCollectError::Io);
+            pending.extend_from_slice(&data);
+            if pending.len() >= SPILL_WRITE_THRESHOLD {
+                if let Err(e) = file.write_all(&pending).await {
+                    tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
+                    cleanup_on_error(&spilled);
+                    return Err(BodyCollectError::Io);
+                }
+                pending.clear();
             }
             continue;
         }
@@ -157,6 +167,18 @@ async fn collect_body_streaming(
             inline.shrink_to_fit(); // don't hoard BODY_MEMORY_THRESHOLD bytes for nothing
             spilled = Some((file, path));
         }
+    }
+
+    // The tail is under the threshold by definition, so without this the file
+    // would be short of the length already counted into `total_len`.
+    let tail = match spilled.as_mut() {
+        Some((file, _)) => file.write_all(&pending).await,
+        None => Ok(()),
+    };
+    if let Err(e) = tail {
+        tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
+        cleanup_on_error(&spilled);
+        return Err(BodyCollectError::Io);
     }
 
     Ok(match spilled {

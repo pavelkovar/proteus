@@ -25,7 +25,6 @@ libloading = "0.9"
 mimalloc = "0.1.52"
 mime_guess = "2"
 nix = { version = "0.31.3", features = ["event", "fs", "process", "socket", "user", "uio", "signal"] }
-parking_lot = "0.12"
 postcard = { version = "1", features = ["alloc"] }
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +33,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time", "fs", "signal"] }
 tokio-seqpacket = "0.9"
 tokio-stream = "0.1"
-tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["json", "fmt"] }

@@ -9,8 +9,13 @@ use crate::ipc::data::HeaderBlob;
 use crate::master::pool_manager::BodyStream;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
+use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use std::net::IpAddr;
 use std::path::PathBuf;
+
+/// Below this the hint costs more than it buys: the kernel's own default
+/// readahead window already covers a file this small.
+const MIN_READ_AHEAD: u64 = 128 * 1024;
 
 /// Finds the matching route only; walking a `fallback` chain is separate.
 #[derive(Debug, PartialEq)]
@@ -109,7 +114,7 @@ pub(crate) struct RequestContext<'a> {
 /// A matched action, not yet a response.
 pub(crate) enum ActionBody {
 
-    StaticFile { file: tokio::fs::File, meta: std::fs::Metadata, candidate: PathBuf },
+    StaticFile { file: std::fs::File, meta: std::fs::Metadata, candidate: PathBuf },
     /// Headers landed; the body may still be streaming from the worker.
     PhpStream { status: StatusCode, headers: HeaderBlob<'static>, body: BodyStream },
 
@@ -177,6 +182,11 @@ pub(crate) async fn dispatch_action(
                     tokio::task::spawn_blocking(move || {
                         let file = std::fs::File::open(&candidate)?;
                         let meta = file.metadata()?;
+                        // Every path this fd takes reads it in order, whole
+                        // file or range.
+                        if !meta.is_dir() && meta.len() > MIN_READ_AHEAD {
+                            let _ = posix_fadvise(&file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
+                        }
                         Ok::<_, std::io::Error>((file, meta))
                     })
                     .await
@@ -184,7 +194,7 @@ pub(crate) async fn dispatch_action(
                 };
                 let (opened, kind) = match stat_result {
                     Ok((_file, meta)) if meta.is_dir() => (None, FsKind::Dir),
-                    Ok((file, meta)) => (Some((tokio::fs::File::from_std(file), meta)), FsKind::File),
+                    Ok((file, meta)) => (Some((file, meta)), FsKind::File),
                     Err(_) => (None, FsKind::Missing),
                 };
                 state.fs_cache.put(candidate.clone(), kind);

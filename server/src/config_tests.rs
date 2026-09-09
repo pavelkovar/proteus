@@ -504,7 +504,9 @@ fn connection_timeouts_default_when_the_whole_block_is_absent() {
     assert_eq!(cfg.connection.body_read_timeout, 60);
     assert_eq!(cfg.connection.header_read_timeout, 10);
     assert_eq!(cfg.connection.idle_timeout, 65);
-    assert_eq!(cfg.connection.max, 10_000);
+    // Derived from the core count, so only the zero case is worth asserting:
+    // a 0 there would disable the cap outright.
+    assert_ne!(cfg.connection.max, 0);
     assert!(validate(&cfg).is_empty(), "the defaults must themselves be valid");
 }
 

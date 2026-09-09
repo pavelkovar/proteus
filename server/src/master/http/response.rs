@@ -6,18 +6,13 @@ use super::compression::{
     with_content_encoding,
 };
 use super::conditional::{if_range_matches, make_etag, not_modified, weaken_etag, with_cache_headers, ConditionalHeaders};
-use super::range::{parse_range, RangeBody};
+use super::range::{parse_range, FileBody};
 use super::ResponseBody;
 use crate::ipc::data::HeaderBlob;
 use crate::master::pool_manager::BodyStream;
-use crate::worker::COALESCE_FLUSH_THRESHOLD;
 use bytes::Bytes;
-use http_body::Frame;
-use http_body_util::{BodyExt, Full, StreamBody};
+use http_body_util::{BodyExt, Full};
 use hyper::{Response, StatusCode};
-use tokio::io::AsyncReadExt as _;
-use tokio_stream::StreamExt as _;
-use tokio_util::io::ReaderStream;
 
 struct ScriptHeaders<'a> {
     content_type: &'a str,
@@ -52,19 +47,6 @@ fn guess_mime_type(path: &str) -> mime_guess::Mime {
 /// The `Infallible` error is mapped only to unify with `streamed_body`.
 fn buffered_body(bytes: Vec<u8>) -> ResponseBody {
     Full::new(Bytes::from(bytes)).map_err(|never: std::convert::Infallible| match never {}).boxed()
-}
-
-/// Chunked, so the whole body never has to fit in one allocation.
-fn streamed_body<R: tokio::io::AsyncRead + Send + Sync + 'static>(reader: R, capacity: usize) -> ResponseBody {
-    let frames = ReaderStream::with_capacity(reader, capacity).map(|chunk| chunk.map(Frame::data));
-    StreamBody::new(frames).boxed()
-}
-
-/// `ReaderStream` allocates its buffer at full capacity on every read, so a
-/// small file must not be handed a large one. The cap is what keeps a big
-/// file from paying a `spawn_blocking` round trip per few KB.
-fn read_buffer_for(len: u64) -> usize {
-    len.clamp(1, COALESCE_FLUSH_THRESHOLD as u64) as usize
 }
 
 /// Message-framing headers are master's alone to set. A script-set
@@ -105,7 +87,7 @@ pub(crate) fn build_response(status: StatusCode, body: Vec<u8>, headers: &Header
 /// starts its blocking-pool task the instant it is called, and hyper would
 /// discard the result unread.
 pub(crate) async fn build_static_response(
-    file: tokio::fs::File,
+    file: std::fs::File,
     meta: &std::fs::Metadata,
     candidate: &std::path::Path,
     path: &str,
@@ -152,8 +134,7 @@ pub(crate) async fn build_static_response(
                     identity_etag.as_deref(),
                     modified,
                 );
-                let std_file = file.try_into_std().expect("fresh File, no I/O performed on it yet");
-                return builder.body(body_from_stream(RangeBody::new(std_file, start, range_len))).unwrap();
+                return builder.body(body_from_stream(FileBody::new(file, start, range_len))).unwrap();
             }
             Some(Err(())) => {
                 let builder = with_cache_headers(
@@ -181,20 +162,14 @@ pub(crate) async fn build_static_response(
     let body = match encoding {
         None => {
             builder = builder.header(hyper::header::CONTENT_LENGTH, len).header(hyper::header::ACCEPT_RANGES, "bytes");
-            if is_head {
-                buffered_body(Vec::new())
-            } else {
-                // Bounded by the length the header promises: that was read at
-                // stat time, and a file grown since must not overrun it.
-                streamed_body(file.take(len), read_buffer_for(len))
-            }
+            if is_head { buffered_body(Vec::new()) } else { body_from_stream(FileBody::new(file, 0, len)) }
         }
         Some(encoding) => {
             builder = with_content_encoding(builder, encoding);
             if is_head {
                 buffered_body(Vec::new())
             } else {
-                compressed_body(ReaderStream::with_capacity(file.take(len), read_buffer_for(len)), encoding, Some(len))
+                compressed_body(FileBody::new(file, 0, len), encoding, Some(len))
             }
         }
     };

@@ -87,13 +87,67 @@ async fn range_body_streams_exactly_the_requested_bytes() {
     let path = write_temp_file("range-body", &content);
     let file = std::fs::File::open(&path).unwrap();
 
-    let mut stream = RangeBody::new(file, 100, 500);
+    let mut stream = FileBody::new(file, 100, 500);
     let mut collected = Vec::new();
     while let Some(chunk) = stream.next().await {
         collected.extend_from_slice(&chunk.unwrap());
     }
 
     assert_eq!(collected, content[100..600]);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The length reaches the client as `Content-Length` before the body is read,
+/// so coming up short has to fail the stream rather than end it early and
+/// leave the connection desynced.
+#[tokio::test]
+async fn file_body_fails_rather_than_truncating_a_file_shorter_than_promised() {
+    let content: Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
+    let path = write_temp_file("file-body-short", &content);
+    let file = std::fs::File::open(&path).unwrap();
+
+    let mut stream = FileBody::new(file, 0, content.len() as u64 + 4096);
+    let mut collected = Vec::new();
+    let mut failure = None;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(bytes) => collected.extend_from_slice(&bytes),
+            Err(e) => {
+                failure = Some(e);
+                break;
+            }
+        }
+    }
+
+    assert_eq!(collected, content, "everything the file did hold must still arrive");
+    assert_eq!(
+        failure.expect("a file shorter than promised must fail the stream").kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    assert!(stream.next().await.is_none(), "a failed stream must stay ended");
+    std::fs::remove_file(&path).ok();
+}
+
+/// The other direction: a file appended to after the `stat` must not overrun
+/// the `Content-Length` already sent, which would desync the connection just
+/// as badly as coming up short.
+#[tokio::test]
+async fn file_body_stops_at_the_promised_length_when_the_file_grew() {
+    let content: Vec<u8> = (0..200_000u32).map(|i| (i % 256) as u8).collect();
+    let path = write_temp_file("file-body-grown", &content);
+    let file = std::fs::File::open(&path).unwrap();
+
+    // Not a chunk multiple, so the last read has to be clamped to the promise
+    // rather than filled.
+    let promised = 130_000u64;
+    let mut stream = FileBody::new(file, 0, promised);
+    let mut collected = Vec::new();
+    while let Some(item) = stream.next().await {
+        collected.extend_from_slice(&item.expect("a longer file must not fail the stream"));
+    }
+
+    assert_eq!(collected.len() as u64, promised, "must send exactly what the header promised");
+    assert_eq!(collected, content[..promised as usize]);
     std::fs::remove_file(&path).ok();
 }
 
@@ -105,7 +159,7 @@ async fn range_body_reads_across_multiple_chunks() {
     let path = write_temp_file("range-body-multi", &content);
     let file = std::fs::File::open(&path).unwrap();
 
-    let mut stream = RangeBody::new(file, 0, len as u64);
+    let mut stream = FileBody::new(file, 0, len as u64);
     let mut collected = Vec::new();
     while let Some(chunk) = stream.next().await {
         collected.extend_from_slice(&chunk.unwrap());

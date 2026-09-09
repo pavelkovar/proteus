@@ -15,7 +15,6 @@ use nix::errno::Errno;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use parking_lot::Mutex as PlMutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -119,7 +118,7 @@ pub struct PoolManager {
     /// Keyed by pid; presence doubles as "still one of ours". Touched twice
     /// in a worker's life plus once per `/status`, never per HTTP request -
     /// those updates go through `WorkerMeta` and take no lock here.
-    workers: PlMutex<HashMap<u32, Arc<WorkerMeta>>>,
+    workers: StdMutex<HashMap<u32, Arc<WorkerMeta>>>,
 }
 
 #[derive(Default)]
@@ -331,7 +330,7 @@ impl PoolManager {
             respawn_backoff: Mutex::new(RespawnBackoff::default()),
             crash_loop_backoffs: AtomicU64::new(0),
             prototype_respawns: AtomicU64::new(0),
-            workers: PlMutex::new(HashMap::new()),
+            workers: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -451,7 +450,7 @@ impl PoolManager {
             // spawns without a semaphore permit, so topping up while others
             // are busy would push the pool past `processes.max` and past the
             // slot array sized for it.
-            while self.idle.len() < spare && self.workers.lock().len() < self.max_workers {
+            while self.idle.len() < spare && self.workers.lock().unwrap().len() < self.max_workers {
                 match self.spawn_worker().await {
                     Ok(worker) => self.return_worker(worker),
                     Err(e) => {
@@ -566,7 +565,7 @@ impl PoolManager {
             return Err(std::io::Error::other("idle pool has no free slot"));
         };
         let meta = Arc::new(WorkerMeta::new(slot, Instant::now(), self.started_at));
-        self.workers.lock().insert(pid, Arc::clone(&meta));
+        self.workers.lock().unwrap().insert(pid, Arc::clone(&meta));
         tracing::debug!(r#type = "controller", pid, "spawned worker");
         Ok(PooledWorker { channel, pid, meta })
     }
@@ -574,7 +573,7 @@ impl PoolManager {
     /// Forgets a worker and returns its slot. The worker must already be out
     /// of the idle stack.
     fn remove_worker_meta(&self, pid: u32) {
-        if let Some(meta) = self.workers.lock().remove(&pid) {
+        if let Some(meta) = self.workers.lock().unwrap().remove(&pid) {
             self.idle.release_slot(meta.slot);
         }
     }
@@ -615,6 +614,7 @@ impl PoolManager {
         let workers: Vec<_> = self
             .workers
             .lock()
+            .unwrap()
             .iter()
             .map(|(pid, meta)| {
                 serde_json::json!({

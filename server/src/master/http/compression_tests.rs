@@ -3,7 +3,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-/// The same shape as `ReaderStream<File>`, without needing a real file.
+/// A source that only ever answers from the blocking pool, without needing
+/// a real file.
 struct FakeBlockingSource {
     remaining: usize,
     pending: Option<tokio::task::JoinHandle<Bytes>>,

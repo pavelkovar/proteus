@@ -65,10 +65,9 @@ pub struct Config {
 
 /// Caps on what one client can tie up before ever reaching a worker.
 ///
-/// The `php.queue` and `php.processes` limits bound work already accepted.
-/// A connection costs a task, a socket buffer and, once a body starts
-/// arriving, heap - all committed before the request is queued, where
-/// neither of those limits reaches it.
+/// The `php.queue` and `php.processes` limits bound work already accepted. A
+/// connection commits a task, a socket buffer and, once a body arrives, heap
+/// and then temp space up to `max_body_size` - all before either limit sees it.
 #[derive(Debug, Deserialize)]
 pub struct ConnectionConfig {
     /// Concurrently open connections; 0 disables the cap. Set well above
@@ -96,8 +95,13 @@ pub struct ConnectionConfig {
     pub body_read_timeout: u64,
 }
 
+/// Per core, so the cap tracks the size of the machine the way the runtime's
+/// own worker-thread count already does. On a large host the product can
+/// outgrow `RLIMIT_NOFILE`, which has to be raised alongside it.
+const MAX_CONNECTIONS_PER_CORE: usize = 512;
+
 fn default_max_connections() -> usize {
-    10_000
+    std::thread::available_parallelism().map_or(1, |n| n.get()) * MAX_CONNECTIONS_PER_CORE
 }
 
 fn default_header_read_timeout() -> u64 {

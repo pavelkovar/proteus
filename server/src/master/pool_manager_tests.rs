@@ -36,7 +36,7 @@ fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
         respawn_backoff: Mutex::new(RespawnBackoff::default()),
         crash_loop_backoffs: AtomicU64::new(0),
         prototype_respawns: AtomicU64::new(0),
-        workers: PlMutex::new(HashMap::new()),
+        workers: StdMutex::new(HashMap::new()),
     }
 }
 
