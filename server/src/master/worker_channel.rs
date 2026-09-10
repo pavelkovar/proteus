@@ -153,8 +153,7 @@ async fn io_task(
         let mut pending_headers: Option<(u16, data::HeaderBlob)> = None;
         let mut pending_headers_bytes: usize = 0;
         loop {
-            match data::read_response_frame_from_ring(&channel.response, &channel.peer_death, &mut scratch, &resp_data_efd)
-                .await
+            match data::read_response_frame_from_ring(&mapped, &mut scratch, &resp_data_efd).await
             {
                 Ok(Some(ResponseFrame::Headers { status, headers, more })) => {
                     pending_headers_bytes += scratch.len();
@@ -196,13 +195,6 @@ async fn io_task(
                         {
                             return;
                         }
-                    }
-                    // The only safe reclaim point - see `reclaim_if_due`'s
-                    // safety note. Awaited, not fire-and-forget, because it
-                    // cannot safely overlap itself.
-                    if mapped.reclaim_is_due() {
-                        let mapped_for_reclaim = Arc::clone(&mapped);
-                        let _ = tokio::task::spawn_blocking(move || mapped_for_reclaim.reclaim_if_due()).await;
                     }
                     if response_tx.send(Ok(None)).await.is_err() {
                         return;

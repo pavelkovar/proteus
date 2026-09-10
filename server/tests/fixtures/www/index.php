@@ -114,6 +114,17 @@ if (strpos($_SERVER['REQUEST_URI'], '/many-headers') !== false) {
     exit;
 }
 
+// header() only rejects CR/LF, not other control bytes, so an app that
+// reflects untrusted input into a header can hand master a value that is
+// not valid HTTP grammar - must not take the connection down with it.
+if (strpos($_SERVER['REQUEST_URI'], '/reflect-header') !== false) {
+    header('X-Before: still-here');
+    header('X-Reflected: ' . ($_GET['v'] ?? ''));
+    header('X-After: also-here');
+    echo "reflected\n";
+    exit;
+}
+
 // Echoes the body back verbatim, so a large one can be checked byte-exact
 // across the disk-spillover path rather than only by length.
 if (strpos($_SERVER['REQUEST_URI'], '/echo-body') !== false) {

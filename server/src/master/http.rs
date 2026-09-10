@@ -1,18 +1,21 @@
 //! HTTP entry point: connection accept and drain, request handling, client
 //! IP resolution, access log.
 
+mod bounded_map;
 mod compression;
 mod conditional;
 mod fs_cache;
 mod php_dispatch;
 mod proxy;
 mod range;
+mod rate_limit;
 mod response;
 mod routing;
 
 use conditional::*;
 pub(crate) use fs_cache::FsCache;
 use proxy::*;
+use rate_limit::RateLimiter;
 use response::*;
 use routing::*;
 
@@ -42,12 +45,17 @@ pub struct AppState {
     /// Decided once at startup, so a request need not scan every route just
     /// to learn whether it has to resolve a Host at all.
     pub uses_host_matching: bool,
+    /// `None` when `rate_limit` is absent from config - the feature is off.
+    rate_limiter: Option<RateLimiter>,
 }
 
 impl AppState {
-    pub fn new(pool: Arc<PoolManager>, config: Config, fs_cache: FsCache) -> Self {
+    pub fn new(pool: Arc<PoolManager>, mut config: Config, fs_cache: FsCache) -> Self {
         let uses_host_matching = config.routes.iter().any(|r| !r.matcher.host.is_empty());
-        AppState { pool, config, in_flight: AtomicU64::new(0), fs_cache, uses_host_matching }
+        // Taken rather than cloned: nothing else needs `config.rate_limit`
+        // once it has become `state.rate_limiter`.
+        let rate_limiter = config.rate_limit.take().map(|rl| RateLimiter::new(rl.requests, rl.period_seconds, rl.user_agent));
+        AppState { pool, config, in_flight: AtomicU64::new(0), fs_cache, uses_host_matching, rate_limiter }
     }
 }
 
@@ -195,6 +203,17 @@ impl Drop for GuardedBody {
     }
 }
 
+/// Shared shape for every early-return rejection in `handle()`: wraps a
+/// fully built response and its access-log entry with the usual guards.
+fn early_reject(
+    resp: Response<ResponseBody>,
+    log: PendingAccessLog,
+    in_flight: InFlightGuard,
+    conn_busy: ConnBusyGuard,
+) -> Result<Response<ResponseBody>, std::convert::Infallible> {
+    Ok(resp.map(|inner| GuardedBody { inner, _guard: in_flight, _conn: conn_busy, log: Some(log), outcome: BodyOutcome::Complete }.boxed()))
+}
+
 async fn handle(
     req: Request<Incoming>,
     state: Arc<AppState>,
@@ -209,44 +228,44 @@ async fn handle(
     // A refcount bump, not a copy. Needed because `req` is moved below, so
     // the path cannot simply borrow from it.
     let uri = req.uri().clone();
+    // Ahead of path decoding/routing/body collection: resolving these needs
+    // no work beyond the headers already in hand, so a client about to be
+    // rate-limited or otherwise rejected never pays for any of that first.
+    let is_trusted_peer = ip_is_trusted_proxy(peer_ip, &state.config.trusted_proxies);
+    let client_ip = resolve_client_ip(peer_ip, is_trusted_peer, req.headers(), |ip| {
+        ip_is_trusted_proxy(ip, &state.config.trusted_proxies)
+    });
+
+    if let Some(limiter) = &state.rate_limiter {
+        // `client_ip` is this limiter's whole identity for a client, so a
+        // `trusted_proxies` entry that forwards a client-chosen
+        // X-Forwarded-For verbatim lets that client rotate past it entirely.
+        let user_agent = req.headers().get(hyper::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if limiter.should_limit(user_agent) && !limiter.check(client_ip) {
+            let mut resp = build_response(StatusCode::TOO_MANY_REQUESTS, b"429 too many requests\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
+            // A fixed value from config rather than the bucket's own precise
+            // refill time: simple, and accurate enough for clients that
+            // honor it.
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&limiter.period_seconds().to_string()) {
+                resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
+            }
+            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rate-limited", worker_pid: 0, php_target: String::new() };
+            return early_reject(resp, log, in_flight, conn_busy);
+        }
+    }
+
     // Decoded once, for routing, the filesystem and PATH_INFO alike.
     // REQUEST_URI keeps the raw form, as every other SAPI reports it.
     let decoded_path = match percent_decode_path(uri.path()) {
         Ok(path) => path,
         Err(reason) => {
-            let resp = build_response(
-                StatusCode::BAD_REQUEST,
-                b"400 invalid path\n".to_vec(),
-                &crate::ipc::data::HeaderBlob::default(),
-            );
+            let resp = build_response(StatusCode::BAD_REQUEST, b"400 invalid path\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
             tracing::debug!(r#type = "controller", ?reason, raw_path = uri.path(), "rejected an undecodable request path");
-            let log = PendingAccessLog {
-                client_ip: peer_ip,
-                method,
-                uri,
-                status: resp.status(),
-                start,
-                action: "rejected",
-                worker_pid: 0,
-                php_target: String::new(),
-            };
-            return Ok(resp.map(|inner| {
-                GuardedBody {
-                    inner,
-                    _guard: in_flight,
-                    _conn: conn_busy,
-                    log: Some(log),
-                    outcome: BodyOutcome::Complete,
-                }
-                .boxed()
-            }));
+            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: String::new() };
+            return early_reject(resp, log, in_flight, conn_busy);
         }
     };
     let path = decoded_path.as_ref();
-    let is_trusted_peer = ip_is_trusted_proxy(peer_ip, &state.config.trusted_proxies);
-    let client_ip = resolve_client_ip(peer_ip, is_trusted_peer, req.headers(), |ip| {
-        ip_is_trusted_proxy(ip, &state.config.trusted_proxies)
-    });
     // Shares the buffer rather than copying the string out.
     let accept_encoding = req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
     let accept_encoding = accept_encoding.as_ref().and_then(|v| v.to_str().ok()).unwrap_or("");
@@ -269,26 +288,8 @@ async fn handle(
     // without repeating the check would silently admit traversal.
     if path_escapes_root(path) {
         let resp = build_response(StatusCode::BAD_REQUEST, b"400 invalid path\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
-        let log = PendingAccessLog {
-            client_ip,
-            method,
-            uri,
-            status: resp.status(),
-            start,
-            action: "rejected",
-            worker_pid: 0,
-            php_target: String::new(),
-        };
-        return Ok(resp.map(|inner| {
-            GuardedBody {
-                inner,
-                _guard: in_flight,
-                _conn: conn_busy,
-                log: Some(log),
-                outcome: BodyOutcome::Complete,
-            }
-            .boxed()
-        }));
+        let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: String::new() };
+        return early_reject(resp, log, in_flight, conn_busy);
     }
 
     let ctx = RequestContext { client_ip, listen_addr, is_trusted_peer };

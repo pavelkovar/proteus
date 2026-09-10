@@ -73,6 +73,7 @@ struct CPhpRequest {
 /// Matches `proteus_php_mod_chunk_kind` in the C header.
 const PROTEUS_PHP_MOD_CHUNK_HEADERS: c_int = 1;
 const PROTEUS_PHP_MOD_CHUNK_BODY: c_int = 2;
+const PROTEUS_PHP_MOD_CHUNK_END: c_int = 3;
 
 /// One event in a response stream: `Headers` first, then any number of
 /// `Body`, then exactly one `End`. Borrows C scratch buffers, so it is valid
@@ -113,63 +114,29 @@ pub struct ExecuteResult {
     pub early_sent: bool,
 }
 
-impl PhpConn {
-    /// Must use `RTLD_GLOBAL`: under the default `RTLD_LOCAL`, `libphp`'s
-    /// symbols are hidden from PHP's own extension `dlopen()`s, which then
-    /// fail with undefined symbols.
-    pub fn load(path: &str) -> std::io::Result<Self> {
-        let to_io_err = |e: libloading::Error| std::io::Error::other(e.to_string());
-        let lib = unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map_err(to_io_err)?;
-        // Deliberately leaked: held for the whole process lifetime, so there
-        // is no earlier point at which unloading would be correct.
-        let lib: &'static Library = Box::leak(Box::new(lib));
-        unsafe {
-            Ok(PhpConn {
-                init: lib.get(b"proteus_php_mod_init").map_err(to_io_err)?,
-                execute_file: lib.get(b"proteus_php_mod_execute_file").map_err(to_io_err)?,
-            })
-        }
-    }
+/// `CPhpRequest` bundled with the `CString`/`CgiVarBuf` storage its raw
+/// pointers borrow from, so the two can't be held apart. Moving this struct
+/// is safe: each field owns a heap allocation, so `c_req`'s pointers stay valid.
+struct PhpRequestFfi {
+    c_req: CPhpRequest,
+    _method: CString,
+    _uri: CString,
+    _query: CString,
+    _content_type: Option<CString>,
+    _cookie: Option<CString>,
+    _authorization: Option<CString>,
+    _body_path: Option<CString>,
+    _vars: CgiVarBuf,
+    /// `c_req.extra_vars` points into this array, not directly into `_vars` -
+    /// both must outlive `c_req`.
+    _extra_var_ptrs: Vec<*const c_char>,
+}
 
-    /// Exactly once, in the prototype, before any `fork()`.
-    pub fn init(&self, admin_entries: &[String], user_entries: &[String]) -> std::io::Result<()> {
-        let to_cstrings = |entries: &[String]| -> Vec<CString> {
-            entries
-                .iter()
-                .map(|e| CString::new(e.as_str()).unwrap_or_default())
-                .collect()
-        };
-        let admin_cstrings = to_cstrings(admin_entries);
-        let user_cstrings = to_cstrings(user_entries);
-        let admin_ptrs: Vec<*const c_char> = admin_cstrings.iter().map(|s| s.as_ptr()).collect();
-        let user_ptrs: Vec<*const c_char> = user_cstrings.iter().map(|s| s.as_ptr()).collect();
-
-        let rc = unsafe {
-            (self.init)(
-                admin_ptrs.as_ptr(),
-                admin_ptrs.len() as c_ulong,
-                user_ptrs.as_ptr(),
-                user_ptrs.len() as c_ulong,
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::other("proteus_php_mod_init failed"))
-        }
-    }
-
-    /// Runs one script, with its own request startup/shutdown pair, and is
-    /// safe to call repeatedly. `on_chunk` fires synchronously and nothing is
-    /// buffered.
-    pub fn execute_file(&self, script_path: &str, req: &PhpRequest<'_>, on_chunk: &mut dyn FnMut(PhpChunk)) -> ExecuteResult {
-        // Unreachable through hyper, but a panic on request-derived data
-        // would take the whole worker down rather than failing one request.
-        let Ok(c_path) = CString::new(script_path) else {
-            on_chunk(PhpChunk::Headers { status: 500, headers: HeaderBlob::default() });
-            on_chunk(PhpChunk::End);
-            return ExecuteResult { early_sent: false };
-        };
+impl PhpRequestFfi {
+    /// `script_path` is passed separately to `execute_file`, not part of
+    /// `CPhpRequest`.
+    fn build(script_path: &str, req: &PhpRequest<'_>) -> Self {
+        // `hyper::Method`/`Uri` both reject raw control bytes, NUL included.
         let c_method = CString::new(req.method.as_ref()).unwrap_or_default();
         let c_uri = CString::new(req.uri.as_ref()).unwrap_or_default();
         let c_query = CString::new(req.query_string.as_ref()).unwrap_or_default();
@@ -223,14 +190,16 @@ impl PhpConn {
         let c_cookie = cookie_value.map(|v| CString::new(v).unwrap_or_default());
         let c_authorization = authorization_value.map(|v| CString::new(v).unwrap_or_default());
 
-        // Exactly one of the inline body and the body path is set.
-        // `c_body_path` is bound here so it outlives `c_req`.
-        let c_body_path;
+        // Exactly one of the inline body and the body path is set. The path
+        // is a server-generated temp filename (php_dispatch.rs), never NUL.
+        let mut c_body_path = None;
         let (body_ptr, body_len, body_file_path_ptr) = match &req.body {
             RequestBody::Inline(bytes) => (bytes.as_ptr() as *const c_char, bytes.len() as c_ulong, std::ptr::null()),
             RequestBody::File { path, len } => {
-                c_body_path = CString::new(path.as_ref()).unwrap_or_default();
-                (std::ptr::null(), *len as c_ulong, c_body_path.as_ptr())
+                let p = CString::new(path.as_ref()).unwrap_or_default();
+                let ptr = p.as_ptr();
+                c_body_path = Some(p);
+                (std::ptr::null(), *len as c_ulong, ptr)
             }
         };
 
@@ -248,6 +217,85 @@ impl PhpConn {
             authorization: c_authorization.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
         };
 
+        PhpRequestFfi {
+            c_req,
+            _method: c_method,
+            _uri: c_uri,
+            _query: c_query,
+            _content_type: c_content_type,
+            _cookie: c_cookie,
+            _authorization: c_authorization,
+            _body_path: c_body_path,
+            _vars: vars,
+            _extra_var_ptrs: extra_var_ptrs,
+        }
+    }
+}
+
+/// A JSON `\0` escape can put a real NUL in a config string.
+/// `unwrap_or_default` would turn that into an empty, no-op C string.
+fn cstrings_or_err(entries: &[String]) -> std::io::Result<Vec<CString>> {
+    entries
+        .iter()
+        .map(|e| CString::new(e.as_str()).map_err(|_| std::io::Error::other(format!("php option {e:?} contains an embedded NUL byte"))))
+        .collect()
+}
+
+impl PhpConn {
+    /// Must use `RTLD_GLOBAL`: under the default `RTLD_LOCAL`, `libphp`'s
+    /// symbols are hidden from PHP's own extension `dlopen()`s, which then
+    /// fail with undefined symbols.
+    pub fn load(path: &str) -> std::io::Result<Self> {
+        let to_io_err = |e: libloading::Error| std::io::Error::other(e.to_string());
+        let lib = unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map_err(to_io_err)?;
+        // Deliberately leaked: held for the whole process lifetime, so there
+        // is no earlier point at which unloading would be correct.
+        let lib: &'static Library = Box::leak(Box::new(lib));
+        unsafe {
+            Ok(PhpConn {
+                init: lib.get(b"proteus_php_mod_init").map_err(to_io_err)?,
+                execute_file: lib.get(b"proteus_php_mod_execute_file").map_err(to_io_err)?,
+            })
+        }
+    }
+
+    /// Exactly once, in the prototype, before any `fork()`.
+    pub fn init(&self, admin_entries: &[String], user_entries: &[String]) -> std::io::Result<()> {
+        let admin_cstrings = cstrings_or_err(admin_entries)?;
+        let user_cstrings = cstrings_or_err(user_entries)?;
+        let admin_ptrs: Vec<*const c_char> = admin_cstrings.iter().map(|s| s.as_ptr()).collect();
+        let user_ptrs: Vec<*const c_char> = user_cstrings.iter().map(|s| s.as_ptr()).collect();
+
+        let rc = unsafe {
+            (self.init)(
+                admin_ptrs.as_ptr(),
+                admin_ptrs.len() as c_ulong,
+                user_ptrs.as_ptr(),
+                user_ptrs.len() as c_ulong,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("proteus_php_mod_init failed"))
+        }
+    }
+
+    /// Runs one script, with its own request startup/shutdown pair, and is
+    /// safe to call repeatedly. `on_chunk` fires synchronously and nothing is
+    /// buffered.
+    pub fn execute_file(&self, script_path: &str, req: &PhpRequest<'_>, on_chunk: &mut dyn FnMut(PhpChunk)) -> ExecuteResult {
+        // Unreachable through hyper, but a panic on request-derived data
+        // would take the whole worker down rather than failing one request.
+        let Ok(c_path) = CString::new(script_path) else {
+            on_chunk(PhpChunk::Headers { status: 500, headers: HeaderBlob::default() });
+            on_chunk(PhpChunk::End);
+            return ExecuteResult { early_sent: false };
+        };
+
+        // Must outlive the FFI call below - see `PhpRequestFfi`.
+        let ffi = PhpRequestFfi::build(script_path, req);
+
         // C sees only the trampoline and an opaque pointer to a local
         // holding the real closure.
         let mut cb_ref: &mut dyn FnMut(PhpChunk) = &mut *on_chunk;
@@ -255,7 +303,7 @@ impl PhpConn {
 
         let mut out_early_sent: c_int = 0;
         let rc = unsafe {
-            (self.execute_file)(c_path.as_ptr(), &c_req, Some(chunk_trampoline), cb_user_data, &mut out_early_sent)
+            (self.execute_file)(c_path.as_ptr(), &ffi.c_req, Some(chunk_trampoline), cb_user_data, &mut out_early_sent)
         };
 
         if rc != 0 {
@@ -286,14 +334,22 @@ unsafe extern "C" fn chunk_trampoline(
     let bytes: &[u8] = if data.is_null() {
         &[]
     } else {
+        // `data_len` always mirrors a buffer size our own C code tracked,
+        // never a value parsed off an external wire.
         unsafe { std::slice::from_raw_parts(data as *const u8, data_len as usize) }
     };
     if kind == PROTEUS_PHP_MOD_CHUNK_HEADERS {
         cb(PhpChunk::Headers { status: status.clamp(100, 599) as u16, headers: parse_headers(bytes) });
     } else if kind == PROTEUS_PHP_MOD_CHUNK_BODY {
         cb(PhpChunk::Body(bytes));
-    } else {
+    } else if kind == PROTEUS_PHP_MOD_CHUNK_END {
         cb(PhpChunk::End);
+    } else {
+        // `kind` is always one of the three constants above - reaching here
+        // means an ABI mismatch, not a normal event. Dropped rather than
+        // guessed as `End`; the request_timeout watchdog kills the worker
+        // once the sequence never completes.
+        tracing::error!(r#type = "prototype", kind, "php-mod sent an unrecognized chunk kind, dropping it");
     }
 }
 

@@ -560,3 +560,37 @@ fn the_cow_encoding_is_byte_identical_to_the_owned_one() {
     };
     assert_eq!(postcard::to_allocvec(&owned).unwrap(), postcard::to_allocvec(&borrowed).unwrap());
 }
+
+/// Nothing in the real system ever writes an empty frame to the request
+/// ring - `write_request_to_ring` is the ring's only writer, and it always
+/// postcard-encodes a real `PhpRequest` - but the ring API itself doesn't
+/// forbid one. Proves the worker-side reader degrades to a clean decode
+/// error rather than a panic, or the silently-wrong `Retire` it used to be.
+#[test]
+fn read_command_from_ring_treats_an_empty_frame_as_a_decode_error_not_a_retire() {
+    use std::alloc::{alloc, Layout};
+    let ring: &'static shm::RequestRing = unsafe {
+        let ptr = alloc(Layout::new::<shm::RequestRing>()) as *mut shm::RequestRing;
+        assert!(!ptr.is_null());
+        shm::RequestRing::init_in_place(ptr);
+        &*ptr
+    };
+    let peer: &'static shm::PeerDeath = unsafe {
+        let ptr = alloc(Layout::new::<shm::PeerDeath>()) as *mut shm::PeerDeath;
+        assert!(!ptr.is_null());
+        shm::PeerDeath::init_in_place(ptr);
+        &*ptr
+    };
+    let efd = shm::create_notify_eventfd().unwrap();
+
+    ring.write_frame(&[], peer, efd.as_raw_fd()).unwrap();
+
+    let mut scratch = Vec::new();
+    let outcome = match read_command_from_ring(ring, peer, &mut scratch, efd.as_raw_fd(), None) {
+        Err(_) => "Err",
+        Ok(Some(WorkerCommand::Retire)) => "Ok(Retire)",
+        Ok(Some(WorkerCommand::Request(_))) => "Ok(Request)",
+        Ok(None) => "Ok(None)",
+    };
+    assert_eq!(outcome, "Err", "an empty request-ring frame must be a decode error, not silently Retire");
+}

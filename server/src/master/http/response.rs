@@ -59,9 +59,22 @@ fn is_framing_header(name: &str) -> bool {
 
 /// Appends rather than inserting, so repeated names such as `Set-Cookie`
 /// all survive.
+///
+/// A script can put arbitrary bytes into a header via `header()`, which only
+/// rejects embedded CR/LF - not, say, other control characters that are
+/// still invalid HTTP grammar. `builder.header()` would silently poison every
+/// header queued after a bad one until `.body()` surfaces one accumulated
+/// error, so a name/value that cannot become valid HTTP is dropped here
+/// instead, individually, before it ever reaches the builder.
 fn apply_headers(mut builder: hyper::http::response::Builder, headers: &HeaderBlob<'_>) -> hyper::http::response::Builder {
     for (name, value) in headers.iter() {
         if is_framing_header(name) {
+            continue;
+        }
+        if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            || hyper::header::HeaderValue::from_bytes(value.as_bytes()).is_err()
+        {
+            tracing::warn!(r#type = "controller", header = name, "dropping a response header that is not valid HTTP");
             continue;
         }
         builder = builder.header(name, value);

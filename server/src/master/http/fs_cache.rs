@@ -4,10 +4,12 @@
 //! TTL-bounded rather than inotify-based, which is unreliable across the
 //! bind-mounted and overlay filesystems this commonly runs on. A change can
 //! therefore take up to `ttl` to be seen.
+//!
+//! Every static-file request touches this cache unconditionally, so its
+//! own concurrent access needs to stay cheap.
 
-use std::collections::HashMap;
+use super::bounded_map::BoundedMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,14 +25,14 @@ struct Entry {
 }
 
 pub(crate) struct FsCache {
-    entries: RwLock<HashMap<PathBuf, Entry>>,
+    entries: BoundedMap<PathBuf, Entry>,
     max_entries: usize,
     ttl: Duration,
 }
 
 impl FsCache {
     pub(crate) fn new(max_entries: usize, ttl: Duration) -> Self {
-        FsCache { entries: RwLock::new(HashMap::new()), max_entries, ttl }
+        FsCache { entries: BoundedMap::new(), max_entries, ttl }
     }
 
     /// `None` means uncached or expired: go and check for real. A zero `ttl`
@@ -39,28 +41,21 @@ impl FsCache {
         if self.ttl.is_zero() {
             return None;
         }
-        let guard = self.entries.read().unwrap();
-        let entry = guard.get(path)?;
+        let entry = self.entries.get(path)?;
         (entry.cached_at.elapsed() < self.ttl).then_some(entry.kind)
     }
 
-    /// Updating an existing key never counts against `max_entries`. Once
-    /// genuinely full, sweeps expired entries once; if that does not free
-    /// room, this path simply goes uncached rather than evicting a live entry
-    /// or growing without bound.
+    /// Updating an existing key never counts against `max_entries`; a
+    /// genuinely full cache goes uncached rather than evicting a live entry.
     pub(crate) fn put(&self, path: PathBuf, kind: FsKind) {
         if self.ttl.is_zero() {
             return;
         }
-        let mut guard = self.entries.write().unwrap();
-        if guard.len() >= self.max_entries && !guard.contains_key(&path) {
-            let ttl = self.ttl;
-            guard.retain(|_, e| e.cached_at.elapsed() < ttl);
-            if guard.len() >= self.max_entries {
-                return;
-            }
+        let ttl = self.ttl;
+        if !self.entries.has_room_for(&path, self.max_entries, |e: &Entry| e.cached_at.elapsed() >= ttl) {
+            return;
         }
-        guard.insert(path, Entry { kind, cached_at: Instant::now() });
+        self.entries.insert(path, Entry { kind, cached_at: Instant::now() });
     }
 }
 

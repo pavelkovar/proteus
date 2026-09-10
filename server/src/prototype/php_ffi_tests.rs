@@ -52,3 +52,38 @@ fn suppressed_request_headers_cover_underscore_framing_and_httpoxy() {
         assert!(!suppressed_request_header(name), "{name} is a legitimate header and must pass through");
     }
 }
+
+#[test]
+fn cstrings_or_err_rejects_an_embedded_nul() {
+    let ok = cstrings_or_err(&["foo=bar".to_string()]).expect("no NUL, should succeed");
+    assert_eq!(ok[0].to_str().unwrap(), "foo=bar");
+
+    let err = cstrings_or_err(&["foo=b\0ar".to_string()]);
+    assert!(
+        err.is_err(),
+        "an embedded NUL must be a real error, not silently become an empty, no-op CString"
+    );
+}
+
+/// `kind` is fully controlled by our own C code; anything outside the three
+/// known constants can only mean an ABI mismatch, and must not be silently
+/// forwarded as `End` (or as anything else).
+#[test]
+fn chunk_trampoline_drops_an_unrecognized_kind_rather_than_treating_it_as_end() {
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut closure = |chunk: PhpChunk| {
+        seen.push(match chunk {
+            PhpChunk::Headers { .. } => "headers",
+            PhpChunk::Body(_) => "body",
+            PhpChunk::End => "end",
+        });
+    };
+    let mut cb_ref: &mut dyn FnMut(PhpChunk) = &mut closure;
+    let user_data = &mut cb_ref as *mut _ as *mut c_void;
+
+    unsafe {
+        chunk_trampoline(99, 0, std::ptr::null(), 0, user_data);
+    }
+
+    assert!(seen.is_empty(), "an unrecognized kind must not be forwarded as any chunk, least of all End: got {seen:?}");
+}

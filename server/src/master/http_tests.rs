@@ -24,6 +24,7 @@ fn test_config(routes: Vec<Route>) -> Config {
         max_body_size: 64 * 1024 * 1024,
         trusted_proxies: Vec::new(),
         connection: Default::default(),
+        rate_limit: None,
     }
 }
 

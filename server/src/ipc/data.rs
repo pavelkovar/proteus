@@ -8,6 +8,7 @@ use crate::ipc::shm;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::os::fd::{OwnedFd, RawFd};
+use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 
 /// A large body streams to a temp file and only its path crosses the ring.
@@ -256,8 +257,10 @@ pub fn read_command_from_ring<'a>(
 ) -> std::io::Result<Option<WorkerCommand<'a>>> {
     match ring.read_frame_until(scratch, peer, notify_efd, deadline) {
         Ok(false) => Ok(Some(WorkerCommand::Retire)),
-        Ok(true) if scratch.is_empty() => Ok(Some(WorkerCommand::Retire)),
-        // Borrows `scratch`, so the command is valid until the next read.
+        // Borrows `scratch`, so the command is valid until the next read. An
+        // empty frame here (never written by the current request-ring
+        // producer) falls through to postcard, which errors on it rather
+        // than being silently read as a retire nothing actually sent.
         Ok(true) => Ok(Some(WorkerCommand::Request(postcard::from_bytes(scratch).map_err(to_io_err)?))),
         Err(shm::RingError::PeerGone) => Ok(None),
         Err(e) => Err(ring_err_to_io(e)),
@@ -362,14 +365,26 @@ pub async fn write_request_to_ring(
 }
 
 /// Master side, async. `Ok(None)` is the trailing worker-done marker.
+///
+/// Reclaims the rings on its way out of that marker, which is the one moment
+/// the peer is provably not writing. Doing it here rather than exposing a
+/// reclaim of its own is what stops a caller from having to get that timing
+/// right - see `Ring::reclaim_if_due`'s safety note for what getting it wrong
+/// costs.
 pub async fn read_response_frame_from_ring(
-    ring: &shm::ResponseRing,
-    peer: &shm::PeerDeath,
+    mapped: &Arc<shm::MappedChannel>,
     scratch: &mut Vec<u8>,
     data_efd: &AsyncFd<OwnedFd>,
 ) -> std::io::Result<Option<ResponseFrame<'static>>> {
-    ring.read_frame_async(scratch, peer, data_efd).await.map_err(ring_err_to_io)?;
+    let channel = mapped.channel();
+    channel.response.read_frame_async(scratch, &channel.peer_death, data_efd).await.map_err(ring_err_to_io)?;
     if scratch.is_empty() {
+        if mapped.reclaim_is_due() {
+            // fallocate is not guaranteed cheap, and it cannot safely overlap
+            // itself, so this is awaited rather than left to run detached.
+            let mapped = Arc::clone(mapped);
+            let _ = tokio::task::spawn_blocking(move || mapped.reclaim_if_due()).await;
+        }
         return Ok(None);
     }
     let frame: ResponseFrame<'_> = postcard::from_bytes(scratch).map_err(to_io_err)?;

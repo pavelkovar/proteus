@@ -71,8 +71,9 @@ enum BodyCollectError {
     /// The body stopped arriving. Must fail the request rather than degrade
     /// to an empty one, which would hand the script a silently truncated body.
     Stalled,
-    /// Treated as an empty body rather than a 500: a client that went away
-    /// is not this server's fault.
+    /// A body-stream read or spill-file write failed. Must fail the request
+    /// rather than degrade to an empty body: PHP must never see a request
+    /// that looks complete but isn't.
     Io,
 }
 
@@ -239,7 +240,17 @@ pub(crate) async fn build_php_request(
             if (uid, gid) != (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw())
                 && let Err(e) = nix::unistd::chown(&path, Some(nix::unistd::Uid::from_raw(uid)), Some(nix::unistd::Gid::from_raw(gid)))
             {
-                tracing::warn!(r#type = "controller", path = %path.display(), uid, gid, error = %e, "failed to chown spilled body file");
+                tracing::warn!(r#type = "controller", path = %path.display(), uid, gid, error = %e, "failed to chown spilled body file, failing the request");
+                let _cleanup = TempBodyFile::new(path);
+                return Err(DispatchResult::new(
+                    ActionBody::Buffered {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        body: b"500 failed to prepare request body\n".to_vec(),
+                        headers: HeaderBlob::default(),
+                    },
+                    "php",
+                    0,
+                ));
             }
             (
                 RequestBody::File { path: Cow::Owned(path.to_string_lossy().into_owned()), len },
@@ -268,7 +279,17 @@ pub(crate) async fn build_php_request(
                 0,
             ));
         }
-        Err(BodyCollectError::Io) => (RequestBody::Inline(Cow::Owned(Vec::new())), None),
+        Err(BodyCollectError::Io) => {
+            return Err(DispatchResult::new(
+                ActionBody::Buffered {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    body: b"500 failed to read request body\n".to_vec(),
+                    headers: HeaderBlob::default(),
+                },
+                "php",
+                0,
+            ));
+        }
     };
 
     Ok((

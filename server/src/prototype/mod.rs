@@ -151,6 +151,10 @@ pub fn run() -> ! {
         match unsafe { fork() }.expect("fork failed") {
             ForkResult::Child => {
                 drop(liveness_prototype_side);
+                // A worker has no use for the prototype's control channel,
+                // and std::process::exit below skips Drop, so nothing else
+                // would ever close it.
+                unsafe { libc::close(CONTROL_FD) };
                 proctitle::set_title(&format!("{}: php worker", crate::APP_NAME));
                 worker::run(liveness_worker_side, mapped_channel, &phpconn, max_requests, notify_efds, prototype_pid, idle_timeout);
                 std::process::exit(0);

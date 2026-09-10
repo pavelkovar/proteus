@@ -34,13 +34,9 @@ static const char *proteus_php_mod_level_name(int syslog_type_int) {
     }
 }
 
-/* PHP's diagnostic channel: one JSON line on stderr, never the response
- * body. The signature is non-const before 8.0. */
-#if PHP_VERSION_ID >= 80000
-static void proteus_php_mod_log_message(const char *message, int syslog_type_int) {
-#else
-static void proteus_php_mod_log_message(char *message, int syslog_type_int) {
-#endif
+/* One JSON line on stderr, matching the Rust side's own log format so both
+ * share one ingestion pipeline. */
+static void proteus_php_mod_log_json(const char *type, const char *level, const char *message) {
     char buf[4096];
     size_t pos = 0;
     struct timespec ts;
@@ -54,9 +50,8 @@ static void proteus_php_mod_log_message(char *message, int syslog_type_int) {
     strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S", &tm_utc);
 
     int n = snprintf(buf, sizeof(buf),
-                      "{\"timestamp\":\"%s.%06ldZ\",\"type\":\"php\",\"level\":\"%s\",\"pid\":%d,\"message\":\"",
-                      time_buf, ts.tv_nsec / 1000,
-                      proteus_php_mod_level_name(syslog_type_int), (int) getpid());
+                      "{\"timestamp\":\"%s.%06ldZ\",\"type\":\"%s\",\"level\":\"%s\",\"pid\":%d,\"message\":\"",
+                      time_buf, ts.tv_nsec / 1000, type, level, (int) getpid());
     pos = (n > 0 && (size_t) n < sizeof(buf)) ? (size_t) n : sizeof(buf) - 1;
 
     for (const unsigned char *p = (const unsigned char *) message;
@@ -92,22 +87,52 @@ static void proteus_php_mod_log_message(char *message, int syslog_type_int) {
     (void) written;
 }
 
+/* PHP's diagnostic channel. The signature is non-const before 8.0. */
+#if PHP_VERSION_ID >= 80000
+static void proteus_php_mod_log_message(const char *message, int syslog_type_int) {
+#else
+static void proteus_php_mod_log_message(char *message, int syslog_type_int) {
+#endif
+    proteus_php_mod_log_json("php", proteus_php_mod_level_name(syslog_type_int), message);
+}
+
 typedef struct {
     char   *buf;
     size_t  len;
     size_t  cap;
 } proteus_php_mod_capture_t;
 
-/* Headers only; the body streams straight through and is never buffered. */
+/* Headers only; the body streams straight through and is never buffered.
+ * Not part of proteus_request_ctx below: buf/cap are kept across requests
+ * to amortize allocation (see proteus_php_mod_capture_shrink), only len
+ * is per-request. */
 static proteus_php_mod_capture_t g_headers;
 
-/* Reset per execute_file() call; one request per thread. g_finished keeps
- * END from firing twice and stops output being forwarded after an early
- * finish. */
-static proteus_php_mod_chunk_fn g_chunk_cb;
-static void *g_chunk_cb_user_data;
-static int g_finished;
-static int g_early_sent;
+/* Everything one PHP request owns, reset in full at the top of every
+ * execute_file() call. Still a single static, not a value threaded through
+ * the SAPI hooks below: those signatures belong to libphp and carry no
+ * user-data parameter. */
+typedef struct {
+    /* body */
+    const char *body;
+    size_t      body_len;
+    size_t      body_pos;
+    FILE       *body_file; /* set instead of body/body_len when spilled to disk */
+    int         body_read_error; /* fread() on body_file hit ferror(), not EOF */
+
+    /* request metadata */
+    const char *const *extra_vars;
+    size_t      extra_var_count;
+    const char *cookie_header;
+
+    /* response / fastcgi_finish_request() state */
+    proteus_php_mod_chunk_fn chunk_cb;
+    void       *chunk_cb_user_data;
+    int         finished;   /* keeps END from firing twice */
+    int         early_sent; /* fastcgi_finish_request() moved END early */
+} proteus_request_ctx;
+
+static proteus_request_ctx g_ctx;
 
 /* On failure the buffer is left untouched, so a bail-out path cannot deref a
  * stale pointer and a retry stays safe. */
@@ -172,8 +197,8 @@ static size_t proteus_php_mod_ub_write(const char *str, size_t str_length) {
     if (!SG(headers_sent)) {
         sapi_send_headers();
     }
-    if (!g_finished && g_chunk_cb) {
-        g_chunk_cb(PROTEUS_PHP_MOD_CHUNK_BODY, 0, str, str_length, g_chunk_cb_user_data);
+    if (!g_ctx.finished && g_ctx.chunk_cb) {
+        g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_BODY, 0, str, str_length, g_ctx.chunk_cb_user_data);
     }
     return str_length;
 }
@@ -194,12 +219,12 @@ static void proteus_php_mod_collect_header(void *data, void *arg) {
 static int proteus_php_mod_send_headers(sapi_headers_struct *sapi_headers) {
     g_headers.len = 0;
     zend_llist_apply_with_argument(&sapi_headers->headers, proteus_php_mod_collect_header, &g_headers);
-    if (g_chunk_cb) {
+    if (g_ctx.chunk_cb) {
         int status = sapi_headers->http_response_code;
         if (status == 0) {
             status = 200;
         }
-        g_chunk_cb(PROTEUS_PHP_MOD_CHUNK_HEADERS, status, g_headers.buf, g_headers.len, g_chunk_cb_user_data);
+        g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_HEADERS, status, g_headers.buf, g_headers.len, g_ctx.chunk_cb_user_data);
     }
     return SAPI_HEADER_SENT_SUCCESSFULLY;
 }
@@ -215,7 +240,7 @@ PHP_FUNCTION(fastcgi_finish_request) {
         return;
     }
 
-    if (g_chunk_cb == NULL || g_finished) {
+    if (g_ctx.chunk_cb == NULL || g_ctx.finished) {
         RETURN_FALSE;
     }
 
@@ -224,9 +249,9 @@ PHP_FUNCTION(fastcgi_finish_request) {
         sapi_send_headers();
     }
 
-    g_early_sent = 1;
-    g_finished = 1;
-    g_chunk_cb(PROTEUS_PHP_MOD_CHUNK_END, 0, NULL, 0, g_chunk_cb_user_data);
+    g_ctx.early_sent = 1;
+    g_ctx.finished = 1;
+    g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_END, 0, NULL, 0, g_ctx.chunk_cb_user_data);
 
     PG(connection_status) = PHP_CONNECTION_ABORTED;
     php_output_set_status(PHP_OUTPUT_DISABLED);
@@ -251,21 +276,10 @@ static zend_module_entry proteus_php_mod_module_entry = {
     STANDARD_MODULE_PROPERTIES
 };
 
-/* One request per thread, so globals suffice. */
-static const char *const *g_extra_vars;
-static size_t g_extra_var_count;
-static const char *g_body;
-static size_t g_body_len;
-static size_t g_body_pos;
-/* Set instead of the inline body when master spilled it to disk. Read
- * incrementally, and closed on every exit path. */
-static FILE *g_body_file;
-static const char *g_cookie_header;
-
 /* php_embed leaves server_context NULL, which suppresses this hook and
  * $_POST parsing entirely unless execute_file sets a dummy non-NULL one. */
 static char *proteus_php_mod_read_cookies(void) {
-    return (char *) g_cookie_header;
+    return (char *) g_ctx.cookie_header;
 }
 
 /* The casts keep this portable across 7.4's non-const
@@ -295,8 +309,8 @@ static void proteus_php_mod_register_variables(zval *track_vars_array) {
         php_register_variable("CONTENT_LENGTH", len_buf, track_vars_array);
     }
 
-    for (size_t i = 0; i < g_extra_var_count; i++) {
-        const char *entry = g_extra_vars[i];
+    for (size_t i = 0; i < g_ctx.extra_var_count; i++) {
+        const char *entry = g_ctx.extra_vars[i];
         const char *eq = strchr(entry, '=');
         if (!eq) {
             continue;
@@ -313,17 +327,23 @@ static void proteus_php_mod_register_variables(zval *track_vars_array) {
 }
 
 /* Tracks position across calls, reading from the spill file when there is
- * one. */
+ * one. read_post()'s return of 0 is core's only "no more data" signal, so
+ * fread() == 0 must not be treated as EOF without checking ferror() too. */
 static size_t proteus_php_mod_read_post(char *buffer, size_t count_bytes) {
-    if (g_body_file) {
-        size_t n = fread(buffer, 1, count_bytes, g_body_file);
+    if (g_ctx.body_file) {
+        size_t n = fread(buffer, 1, count_bytes, g_ctx.body_file);
+        if (n == 0 && ferror(g_ctx.body_file)) {
+            /* Recorded, not acted on: core already treats 0 as "stop", and
+             * the script may already be mid-execution. execute_file logs it. */
+            g_ctx.body_read_error = 1;
+        }
         return n;
     }
-    size_t remaining = g_body_len - g_body_pos;
+    size_t remaining = g_ctx.body_len - g_ctx.body_pos;
     size_t n = count_bytes < remaining ? count_bytes : remaining;
     if (n > 0) {
-        memcpy(buffer, g_body + g_body_pos, n);
-        g_body_pos += n;
+        memcpy(buffer, g_ctx.body + g_ctx.body_pos, n);
+        g_ctx.body_pos += n;
     }
     return n;
 }
@@ -332,24 +352,29 @@ static size_t proteus_php_mod_read_post(char *buffer, size_t count_bytes) {
  * already done by the time php.options are applied, so these directives must
  * be re-invoked explicitly. */
 #if PHP_VERSION_ID < 80500
-typedef void (*proteus_php_mod_disable_one_fn)(char *name, size_t name_length);
+typedef int (*proteus_php_mod_disable_one_fn)(char *name, size_t name_length);
 
-static void proteus_php_mod_disable_list(const char *list, proteus_php_mod_disable_one_fn disable_one) {
+/* Returns 0 if every name in `list` was disabled, -1 if any was not. Still
+ * processes the whole list either way, same as the NUL-drop policy below. */
+static int proteus_php_mod_disable_list(const char *list, proteus_php_mod_disable_one_fn disable_one) {
     if (list == NULL || *list == '\0') {
-        return;
+        return 0;
     }
     char *base = strdup(list);
     if (base == NULL) {
         /* Skip the directive rather than deref NULL. */
-        return;
+        return -1;
     }
+    int failed = 0;
     char *s = NULL;
     char *e = base;
     while (*e) {
         if (*e == ' ' || *e == ',') {
             if (s != NULL) {
                 *e = '\0';
-                disable_one(s, (size_t) (e - s));
+                if (disable_one(s, (size_t) (e - s)) != SUCCESS) {
+                    failed = -1;
+                }
                 s = NULL;
             }
         } else if (s == NULL) {
@@ -357,49 +382,71 @@ static void proteus_php_mod_disable_list(const char *list, proteus_php_mod_disab
         }
         e++;
     }
-    if (s != NULL) {
-        disable_one(s, (size_t) (e - s));
+    if (s != NULL && disable_one(s, (size_t) (e - s)) != SUCCESS) {
+        failed = -1;
     }
     free(base);
+    return failed;
 }
 #endif
 
 /* disable_classes and zend_disable_class() were removed in PHP 8.5. */
 #if PHP_VERSION_ID < 80500
-static void proteus_php_mod_disable_class_one(char *name, size_t name_length) {
-    (void) zend_disable_class(name, name_length);
+static int proteus_php_mod_disable_class_one(char *name, size_t name_length) {
+    int rc = zend_disable_class(name, name_length);
+    if (rc != SUCCESS) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "disable_classes: class '%.*s' was not found, not disabled", (int) name_length, name);
+        proteus_php_mod_log_json("prototype", "ERROR", msg);
+    }
+    return rc;
 }
 
-static void proteus_php_mod_disable_classes(const char *list) {
-    proteus_php_mod_disable_list(list, proteus_php_mod_disable_class_one);
+static int proteus_php_mod_disable_classes(const char *list) {
+    return proteus_php_mod_disable_list(list, proteus_php_mod_disable_class_one);
 }
 #else
-static void proteus_php_mod_disable_classes(const char *list) {
+static int proteus_php_mod_disable_classes(const char *list) {
     (void) list;
+    return 0;
 }
 #endif
 
 #if PHP_VERSION_ID >= 80000
-static void proteus_php_mod_disable_functions(const char *list) {
+/* zend_disable_functions() gives no per-name failure signal; silently
+ * skipping an unknown name is its own intended behaviour, not a failure. */
+static int proteus_php_mod_disable_functions(const char *list) {
     if (list != NULL && *list != '\0') {
         zend_disable_functions(list);
     }
+    return 0;
 }
 #else
-static void proteus_php_mod_disable_function_one(char *name, size_t name_length) {
-    (void) zend_disable_function(name, name_length);
+static int proteus_php_mod_disable_function_one(char *name, size_t name_length) {
+    int rc = zend_disable_function(name, name_length);
+    if (rc != SUCCESS) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "disable_functions: function '%.*s' was not found, not disabled", (int) name_length, name);
+        proteus_php_mod_log_json("prototype", "ERROR", msg);
+    }
+    return rc;
 }
 
-static void proteus_php_mod_disable_functions(const char *list) {
-    proteus_php_mod_disable_list(list, proteus_php_mod_disable_function_one);
+static int proteus_php_mod_disable_functions(const char *list) {
+    return proteus_php_mod_disable_list(list, proteus_php_mod_disable_function_one);
 }
 #endif
 
 /* ZEND_INI_SYSTEM mutates the directive's own `modifiable` flag as a side
  * effect, so a later ini_set() is rejected regardless of its original
  * modifiability. force_change because this is SAPI setup, not an ini_set()
- * emulation. */
-static void proteus_php_mod_apply_ini(const char *const *entries, size_t count, int modify_type) {
+ * emulation.
+ *
+ * Returns 0 if every entry applied cleanly, -1 if anything failed - a
+ * partially-applied, possibly security-relevant configuration must not look
+ * like success to the caller. */
+static int proteus_php_mod_apply_ini(const char *const *entries, size_t count, int modify_type) {
+    int failed = 0;
     for (size_t i = 0; i < count; i++) {
         const char *entry = entries[i];
         const char *eq = strchr(entry, '=');
@@ -412,17 +459,27 @@ static void proteus_php_mod_apply_ini(const char *const *entries, size_t count, 
         zend_string *name = zend_string_init(entry, klen, 0);
         zend_string *value = zend_string_init(val, strlen(val), 0);
         /* Copied internally, so these stay ours to free. */
-        zend_alter_ini_entry_ex(name, value, modify_type, PHP_INI_STAGE_ACTIVATE, 1);
+        if (zend_alter_ini_entry_ex(name, value, modify_type, PHP_INI_STAGE_ACTIVATE, 1) != SUCCESS) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "failed to set php option '%.*s'", (int) klen, entry);
+            proteus_php_mod_log_json("prototype", "ERROR", msg);
+            failed = -1;
+        }
 
         if (klen == strlen("disable_functions") && strncmp(entry, "disable_functions", klen) == 0) {
-            proteus_php_mod_disable_functions(val);
+            if (proteus_php_mod_disable_functions(val) != 0) {
+                failed = -1;
+            }
         } else if (klen == strlen("disable_classes") && strncmp(entry, "disable_classes", klen) == 0) {
-            proteus_php_mod_disable_classes(val);
+            if (proteus_php_mod_disable_classes(val) != 0) {
+                failed = -1;
+            }
         }
 
         zend_string_release(name);
         zend_string_release(value);
     }
+    return failed;
 }
 
 int proteus_php_mod_init(
@@ -461,8 +518,11 @@ int proteus_php_mod_init(
      * itself, even on zend_bailout. */
 
     /* User first, then admin, so admin wins on a key collision. */
-    proteus_php_mod_apply_ini(user_entries, user_count, ZEND_INI_USER);
-    proteus_php_mod_apply_ini(admin_entries, admin_count, ZEND_INI_SYSTEM);
+    int user_ok = proteus_php_mod_apply_ini(user_entries, user_count, ZEND_INI_USER);
+    int admin_ok = proteus_php_mod_apply_ini(admin_entries, admin_count, ZEND_INI_SYSTEM);
+    if (user_ok != 0 || admin_ok != 0) {
+        return -1;
+    }
 
     return 0;
 }
@@ -482,47 +542,55 @@ int proteus_php_mod_execute_file(
         g_headers.buf[0] = '\0';
     }
 
-    g_extra_vars = req->extra_vars;
-    g_extra_var_count = req->extra_var_count;
-    g_body = req->body;
-    g_body_len = req->body_len;
-    g_body_pos = 0;
-    /* Exactly one of the inline body and the spill path is set. A failed
-     * open or ownership check degrades to an empty body. */
-    g_body_file = NULL;
+    /* Whole-struct zero, so a field this function forgets to set below
+     * defaults to zero/NULL rather than carrying over from the last request. */
+    g_ctx = (proteus_request_ctx){0};
+
+    g_ctx.extra_vars = req->extra_vars;
+    g_ctx.extra_var_count = req->extra_var_count;
+    g_ctx.body = req->body;
+    g_ctx.body_len = req->body_len;
+    /* Exactly one of the inline body and the spill path is set. A broken
+     * contract here (open or ownership/type check fails) now fails the
+     * whole request rather than degrading to a merely-empty-looking one. */
     if (req->body_file_path) {
-        g_body_file = fopen(req->body_file_path, "rb");
-        if (g_body_file) {
-            /* The spill path is predictable and the directory shared, so a
-             * sibling worker of the same uid could race a symlink in ahead of
-             * this open. fstat() on the fd actually obtained is bound to the
-             * resolved inode and cannot be swapped afterwards. */
-            struct stat st;
-            if (fstat(fileno(g_body_file), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
-                fprintf(stderr, "[proteus] spilled request body file %s failed ownership/type check, refusing it\n", req->body_file_path);
-                fclose(g_body_file);
-                g_body_file = NULL;
-            }
+        g_ctx.body_file = fopen(req->body_file_path, "rb");
+        if (!g_ctx.body_file) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "fopen(%s) failed for spilled request body, failing the request", req->body_file_path);
+            proteus_php_mod_log_json("worker", "ERROR", msg);
+            proteus_php_mod_capture_shrink(&g_headers);
+            *out_early_sent = 0;
+            return -1;
         }
-        if (!g_body_file) {
-            fprintf(stderr, "[proteus] fopen(%s) failed for spilled request body\n", req->body_file_path);
-            g_body_len = 0;
+        /* The spill path is predictable and the directory shared, so a
+         * sibling worker of the same uid could race a symlink in ahead of
+         * this open. fstat() on the fd actually obtained is bound to the
+         * resolved inode and cannot be swapped afterwards. */
+        struct stat st;
+        if (fstat(fileno(g_ctx.body_file), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "spilled request body file %s failed ownership/type check, failing the request", req->body_file_path);
+            proteus_php_mod_log_json("worker", "ERROR", msg);
+            fclose(g_ctx.body_file);
+            g_ctx.body_file = NULL;
+            proteus_php_mod_capture_shrink(&g_headers);
+            *out_early_sent = 0;
+            return -1;
         }
     }
-    g_cookie_header = req->cookie_header;
-    g_chunk_cb = chunk_cb;
-    g_chunk_cb_user_data = chunk_cb_user_data;
-    g_finished = 0;
-    g_early_sent = 0;
+    g_ctx.cookie_header = req->cookie_header;
+    g_ctx.chunk_cb = chunk_cb;
+    g_ctx.chunk_cb_user_data = chunk_cb_user_data;
 
     SG(request_info).request_method = req->method;
     SG(request_info).request_uri = (char *) req->uri;
     SG(request_info).query_string = (char *) req->query_string;
     SG(request_info).content_type = req->content_type;
-    /* Must be what read_post will actually deliver: the two diverge when the
-     * ownership check rejected a spilled file, and PHP's $_POST parser trusts
-     * CONTENT_LENGTH and would wait for data that never comes. */
-    SG(request_info).content_length = (zend_long) g_body_len;
+    /* Must be what read_post will actually deliver, or PHP's $_POST parser
+     * waits on CONTENT_LENGTH bytes that never come. A rejected spill file
+     * no longer reaches this point at all, so this is always accurate. */
+    SG(request_info).content_length = (zend_long) g_ctx.body_len;
 
     /* Unlocks sapi_activate()'s cookie and $_POST parsing, which php_embed
      * otherwise skips. Never dereferenced. */
@@ -533,9 +601,9 @@ int proteus_php_mod_execute_file(
 
     if (php_request_startup() == FAILURE) {
         *out_early_sent = 0;
-        if (g_body_file) {
-            fclose(g_body_file);
-            g_body_file = NULL;
+        if (g_ctx.body_file) {
+            fclose(g_ctx.body_file);
+            g_ctx.body_file = NULL;
         }
         proteus_php_mod_capture_shrink(&g_headers);
         return -1;
@@ -570,22 +638,26 @@ int proteus_php_mod_execute_file(
     /* A zero-output script reaches HEADERS only here, via
      * php_request_shutdown()'s own sapi_send_headers(). END may already have
      * fired early. */
-    if (!g_finished) {
-        g_finished = 1;
-        if (g_chunk_cb) {
-            g_chunk_cb(PROTEUS_PHP_MOD_CHUNK_END, 0, NULL, 0, g_chunk_cb_user_data);
+    if (!g_ctx.finished) {
+        g_ctx.finished = 1;
+        if (g_ctx.chunk_cb) {
+            g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_END, 0, NULL, 0, g_ctx.chunk_cb_user_data);
         }
     }
 
-    if (g_body_file) {
-        fclose(g_body_file);
-        g_body_file = NULL;
+    if (g_ctx.body_file) {
+        fclose(g_ctx.body_file);
+        g_ctx.body_file = NULL;
+    }
+    if (g_ctx.body_read_error) {
+        /* Too late for an HTTP failure: the script already ran. */
+        proteus_php_mod_log_json("worker", "ERROR", "request body read failed mid-request");
     }
     /* Here rather than at the next call, or an idle worker holds the
      * oversized buffer for exactly as long as it is least worth holding. */
     proteus_php_mod_capture_shrink(&g_headers);
 
-    *out_early_sent = g_early_sent;
+    *out_early_sent = g_ctx.early_sent;
     return 0;
 }
 

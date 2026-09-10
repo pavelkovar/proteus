@@ -112,7 +112,10 @@ fn read_frame_rejects_corrupt_length_prefix_not_panicked() {
     let peer = make_peer_death();
     let efd = make_notify_efd();
 
-    unsafe { ring.raw_write(&9_999u32.to_le_bytes()) };
+    // Straight into the mapping and past `write_pos`, because a hostile peer
+    // is another process scribbling on shared memory, not a caller of this API.
+    unsafe { ring.copy_at(0, &9_999u32.to_le_bytes()) };
+    ring.write_pos.store(LEN_PREFIX as u64, Ordering::Release);
     ring.notify_data_written();
 
     let mut scratch = Vec::new();
@@ -208,6 +211,73 @@ fn create_and_map_existing_channel_share_the_same_memory() {
     master_side.channel().response.write_frame(b"from master", master_peer, efd_raw).unwrap();
     prototype_side.channel().response.read_frame(&mut scratch, proto_peer, efd_raw).unwrap();
     assert_eq!(scratch, b"from master");
+}
+
+/// The invariant this publish scheme exists for: a frame `write_pos` covers is
+/// already there in full.
+///
+/// Two failures to catch, so two checks. An observer spins on `write_pos` and
+/// rejects any value inside a frame - that is the split publish. The reader
+/// verifies every payload byte - that is a publish racing ahead of the copies.
+///
+/// The payload is large on purpose: it stretches the gap between writing the
+/// length and finishing the payload from nanoseconds to microseconds, so a
+/// producer descheduled inside that window is the common case here rather
+/// than a rare one.
+#[tokio::test]
+async fn a_published_frame_is_never_visible_before_its_payload() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    const PAYLOAD: usize = 32 * 1024;
+    const FRAME: u64 = (LEN_PREFIX + PAYLOAD) as u64;
+    const FRAMES: usize = 300;
+
+    // The real pairing only - blocking on both ends deadlocks, see this
+    // module's own note above.
+    let ring: &'static Ring<262144> = make_ring();
+    let peer: &'static PeerDeath = make_peer_death();
+    let data_efd_owned = make_notify_efd();
+    let data_efd_raw = data_efd_owned.as_raw_fd();
+    let data_efd = AsyncFd::new(data_efd_owned).unwrap();
+
+    let done = Arc::new(AtomicBool::new(false));
+    let torn = Arc::new(AtomicBool::new(false));
+    let observer = std::thread::spawn({
+        let (done, torn) = (Arc::clone(&done), Arc::clone(&torn));
+        move || {
+            let mut samples = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                if ring.write_pos.load(Ordering::Acquire) % FRAME != 0 {
+                    torn.store(true, Ordering::Relaxed);
+                }
+                samples += 1;
+            }
+            samples
+        }
+    });
+
+    let writer = std::thread::spawn(move || {
+        for i in 0..FRAMES {
+            ring.write_frame(&[i as u8; PAYLOAD], peer, data_efd_raw).unwrap();
+        }
+    });
+
+    let mut scratch = Vec::new();
+    for i in 0..FRAMES {
+        tokio::time::timeout(Duration::from_secs(10), ring.read_frame_async(&mut scratch, peer, &data_efd))
+            .await
+            .expect("should not hang - see this test's own doc comment")
+            .unwrap();
+        assert_eq!(scratch.len(), PAYLOAD, "frame {i} arrived truncated");
+        assert!(scratch.iter().all(|&b| b == i as u8), "frame {i} was published before its bytes landed");
+    }
+    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+
+    done.store(true, Ordering::Relaxed);
+    let samples = observer.join().unwrap();
+    assert!(samples > FRAMES as u64, "observer sampled {samples} times - too coarse to conclude anything");
+    assert!(!torn.load(Ordering::Relaxed), "write_pos was published inside a frame");
 }
 
 // --- Response-ring reclaim (`fallocate(FALLOC_FL_PUNCH_HOLE)`) ---
@@ -388,6 +458,44 @@ fn reclaim_after_multiple_wraps_frees_the_whole_ring_not_just_the_final_lap() {
     );
 }
 
+/// The one invariant the whole reclaim rests on, checked rather than promised:
+/// a ring with anything unread in it must not be punched, because the writer
+/// may be filling exactly the range that would be freed.
+///
+/// A `debug_assert` would not do - it is compiled out of the very builds that
+/// serve traffic, which is where zeroing live data would actually happen.
+#[test]
+fn reclaim_is_skipped_while_the_writer_still_has_data_in_flight() {
+    let (fd, prototype_side) = create_channel().unwrap();
+    let stat_fd = nix::unistd::dup(&fd).unwrap();
+    let master_side = map_existing_channel(fd).unwrap();
+    let efd = make_notify_efd();
+    let efd_raw = efd.as_raw_fd();
+    let proto_peer = &prototype_side.channel().peer_death;
+    let master_peer = &master_side.channel().peer_death;
+    let blocks = || nix::sys::stat::fstat(&stat_fd).unwrap().st_blocks;
+
+    // Past RECLAIM_THRESHOLD, so only the writer-idle check can stop the punch.
+    const FRAME: [u8; 8192] = [0xAB; 8192];
+    let mut scratch = Vec::new();
+    for _ in 0..10 {
+        prototype_side.channel().response.write_frame(&FRAME, proto_peer, efd_raw).unwrap();
+        master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    }
+
+    // One frame the reader has not taken: the ring is no longer empty.
+    prototype_side.channel().response.write_frame(&FRAME, proto_peer, efd_raw).unwrap();
+    let before = blocks();
+    master_side.reclaim_if_due();
+    assert_eq!(blocks(), before, "a ring with data in flight was punched anyway");
+
+    // Draining it makes the same call proceed, so the skip was the check and
+    // not some unrelated reason to do nothing.
+    master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    master_side.reclaim_if_due();
+    assert!(blocks() < before, "reclaim did not resume once the ring drained");
+}
+
 // --- Master-side async wait path (`*_async`, eventfd-backed) ---
 
 #[tokio::test]
@@ -537,6 +645,67 @@ async fn master_async_write_and_worker_blocking_read_survive_real_contention() {
     }
 
     tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap();
+}
+
+/// `MappedChannel`'s `Send` and `Sync` are hand-written. Every other
+/// concurrency test here shares a bare `Ring`, so nothing exercises the claim
+/// that the mapping itself may cross threads and be used from several at once.
+///
+/// Moving one mapping into a thread covers `Send`; reaching the other from two
+/// at the same time covers `Sync`.
+#[tokio::test]
+async fn a_mapped_channel_survives_being_shared_across_threads() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    const N: usize = 2_000;
+
+    let (fd, worker_side) = create_channel().unwrap();
+    let master_side = Arc::new(map_existing_channel(fd).unwrap());
+    let data_efd_owned = make_notify_efd();
+    let data_efd_raw = data_efd_owned.as_raw_fd();
+    let data_efd = AsyncFd::new(data_efd_owned).unwrap();
+
+    // Send: the whole mapping moves to the writer, exactly as the prototype
+    // hands its own to a forked worker.
+    let writer = std::thread::spawn(move || {
+        let channel = worker_side.channel();
+        for i in 0..N as u32 {
+            channel.response.write_frame(&i.to_le_bytes(), &channel.peer_death, data_efd_raw).unwrap();
+        }
+    });
+
+    // Sync: a second thread holds `&MappedChannel` while the reader below uses
+    // it too, so both are dereferencing the same mapping concurrently.
+    let stop = Arc::new(AtomicBool::new(false));
+    let observer = std::thread::spawn({
+        let (mapped, stop) = (Arc::clone(&master_side), Arc::clone(&stop));
+        move || {
+            let mut seen = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                seen = seen.max(mapped.channel().response.write_pos.load(Ordering::Acquire));
+            }
+            seen
+        }
+    });
+
+    let mut scratch = Vec::new();
+    for i in 0..N as u32 {
+        let channel = master_side.channel();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            channel.response.read_frame_async(&mut scratch, &channel.peer_death, &data_efd),
+        )
+        .await
+        .expect("should not hang - the real pairing, see this module's own note")
+        .unwrap();
+        assert_eq!(scratch.as_slice(), &i.to_le_bytes(), "frame {i} came back wrong");
+    }
+    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+
+    stop.store(true, Ordering::Relaxed);
+    let seen = observer.join().unwrap();
+    assert!(seen > 0, "the observer never saw the mapping advance - it was not really sharing it");
 }
 
 // --- `NotifyEfds::try_clone` (fd-lifetime independence) ---

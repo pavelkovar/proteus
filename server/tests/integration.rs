@@ -499,6 +499,73 @@ async fn php_response_with_one_oversized_header_value_reaches_client_intact() {
     assert!(ordinary.text().await.unwrap().starts_with("PHP response"));
 }
 
+/// `header()` only rejects CR/LF, not every control byte - a reflected one
+/// must not tear the connection down: the bad header is dropped, and
+/// headers around it still arrive.
+#[tokio::test]
+async fn a_script_reflected_control_byte_in_a_header_does_not_break_the_response() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("reflect-header", www.to_str().unwrap(), serde_json::json!({})).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/reflect-header?v=%01", server.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "an invalid reflected header must not fail the whole response");
+    assert_eq!(resp.headers().get("x-before").unwrap(), "still-here");
+    assert!(resp.headers().get("x-reflected").is_none(), "the invalid header itself must be dropped");
+    assert_eq!(
+        resp.headers().get("x-after").unwrap(),
+        "also-here",
+        "a header queued after the bad one must still reach the client"
+    );
+    assert_eq!(resp.text().await.unwrap(), "reflected\n");
+
+    // The same worker's very next response - proves this didn't leave the
+    // ring/worker or the connection in a bad state.
+    let ordinary = client.get(format!("http://127.0.0.1:{}/", server.port)).send().await.unwrap();
+    assert_eq!(ordinary.status(), 200);
+    assert!(ordinary.text().await.unwrap().starts_with("PHP response"));
+}
+
+/// `rate_limit.user_agent` is a filter: only requests whose User-Agent
+/// matches get counted or limited at all, everything else is untouched.
+#[tokio::test]
+async fn rate_limit_only_applies_to_matching_user_agents_and_recovers_with_retry_after() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "rate-limit",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "rate_limit": { "requests": 2, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
+        }),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    // Burst capacity of 2 for a matching User-Agent.
+    for n in 1..=2 {
+        let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (compatible; GPTBot/1.0)").send().await.unwrap();
+        assert_eq!(resp.status(), 200, "request {n} should still be within budget");
+    }
+
+    // The third exceeds the burst.
+    let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (compatible; GPTBot/1.0)").send().await.unwrap();
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "60");
+    assert!(resp.text().await.unwrap().contains("too many requests"));
+
+    // A non-matching User-Agent is never subject to this limiter at all -
+    // exhausting the GPTBot budget above must not have touched it.
+    for _ in 0..5 {
+        let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await.unwrap();
+        assert_eq!(resp.status(), 200, "a non-matching User-Agent must never be rate-limited");
+    }
+}
+
 /// Hitting the pending-headers cap must not simply abandon the response ring
 /// while the worker, still mid-write, blocks forever in an untimed wait with
 /// nothing left to free space or kill it. It is dropped from `/status`
@@ -1812,6 +1879,10 @@ async fn php_receives_a_large_spilled_request_body_correctly() {
 /// The spill path is fully predictable, so creating it without `O_EXCL` would
 /// follow a pre-planted symlink and land request-body bytes in any file master
 /// can write. A file a planted symlink points at must come back untouched.
+///
+/// A blocked spillover must fail the whole request (500), not silently
+/// dispatch it to PHP as an empty body: a request whose body could not be
+/// prepared must never look like a valid, merely-empty one.
 #[tokio::test]
 async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
     let www = fixtures_dir().join("www");
@@ -1833,7 +1904,12 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "must degrade gracefully (empty body), not fail the whole request");
+    assert_eq!(resp.status(), 500, "a blocked spillover must fail the request, not dispatch it as an empty body");
+    let resp_body = resp.text().await.unwrap();
+    assert!(
+        resp_body.contains("failed to read request body"),
+        "must be the server's own synthesized error, not anything PHP-generated: got {resp_body:?}"
+    );
 
     let canary_contents = std::fs::read(&canary).expect("canary file should still exist");
     assert_eq!(canary_contents, b"untouched", "symlink must not have been followed and written through");
@@ -1844,6 +1920,38 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
 
     let _ = std::fs::remove_file(&predicted_path);
     let _ = std::fs::remove_file(&canary);
+}
+
+/// A client that closes its write side mid-body is a real I/O error, not a
+/// stall (distinct from `body_read_timeout`) - must fail the request rather
+/// than dispatch it to PHP looking like a normal, merely short, body.
+#[tokio::test]
+async fn a_request_body_that_disconnects_mid_transfer_fails_the_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let www = fixtures_dir().join("www");
+    let server = start_server("body-disconnect", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    stream
+        .write_all(b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\n")
+        .await
+        .unwrap();
+    stream.write_all(b"short").await.unwrap();
+    // Half-close: the declared 1000 bytes will now never arrive, but the
+    // read side stays open so the server's response can still be read back.
+    stream.shutdown().await.unwrap();
+
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut response))
+        .await
+        .expect("server never responded to the truncated body")
+        .unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 500"), "got: {response}");
+    assert!(
+        response.contains("failed to read request body"),
+        "must be the server's own synthesized error, not anything PHP-generated: got {response}"
+    );
 }
 
 fn list_spilled_body_files() -> std::collections::HashSet<std::path::PathBuf> {

@@ -217,6 +217,17 @@ fn validate_rejects_a_zero_limits_timeout() {
 }
 
 #[test]
+fn validate_rejects_a_zero_limits_requests() {
+    let json = base_config_json("", "").replace(r#""requests": 500"#, r#""requests": 0"#);
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    let errors = validate(&cfg);
+    assert!(
+        errors.iter().any(|e| e.contains("php.limits.requests")),
+        "expected a php.limits.requests error, got: {errors:?}"
+    );
+}
+
+#[test]
 fn validate_rejects_a_zero_queue_timeout() {
     let json = base_config_json("", "").replace(r#""timeout": 5"#, r#""timeout": 0"#);
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
@@ -367,10 +378,13 @@ fn validate_rejects_an_out_of_range_return_status() {
     );
 }
 
-fn minimal_config_json(php_extra: &str) -> String {
+/// `top_level_extra` is spliced in as a sibling of `listen`/`php`, so it
+/// must be its own complete `"key": value,` entries (or empty).
+fn config_json(php_extra: &str, top_level_extra: &str) -> String {
     format!(
         r#"{{
           "listen": ["0.0.0.0:8080"],
+          {top_level_extra}
           "php": {{
             {php_extra}
             "limits": {{ "requests": 500, "timeout": 30 }},
@@ -379,6 +393,10 @@ fn minimal_config_json(php_extra: &str) -> String {
           }}
         }}"#
     )
+}
+
+fn minimal_config_json(php_extra: &str) -> String {
+    config_json(php_extra, "")
 }
 
 #[test]
@@ -517,4 +535,47 @@ fn spawn_timeout_defaults_when_absent() {
     let cfg = parse(&minimal_config_json("")).expect("should parse");
     assert_eq!(cfg.php.processes.spawn_timeout, 30);
     assert!(validate(&cfg).is_empty(), "the default must itself be valid");
+}
+
+fn config_json_with_rate_limit(rate_limit_json: &str) -> String {
+    config_json("", &format!(r#""rate_limit": {rate_limit_json},"#))
+}
+
+#[test]
+fn rate_limit_is_none_when_the_section_is_absent() {
+    let cfg = parse(&minimal_config_json("")).expect("should parse");
+    assert!(cfg.rate_limit.is_none());
+    assert!(validate(&cfg).is_empty());
+}
+
+#[test]
+fn rate_limit_parses_with_and_without_user_agent() {
+    let cfg = parse(&config_json_with_rate_limit(r#"{ "requests": 100, "period_seconds": 60 }"#)).expect("should parse");
+    let rl = cfg.rate_limit.expect("rate_limit should be Some");
+    assert_eq!(rl.requests, 100);
+    assert_eq!(rl.period_seconds, 60);
+    assert!(rl.user_agent.is_empty());
+
+    let cfg = parse(&config_json_with_rate_limit(
+        r#"{ "requests": 100, "period_seconds": 60, "user_agent": ["*GPTBot*", "*ClaudeBot*"] }"#,
+    ))
+    .expect("should parse");
+    assert_eq!(cfg.rate_limit.expect("rate_limit should be Some").user_agent.len(), 2);
+}
+
+#[test]
+fn validate_rejects_a_zero_rate_limit_requests() {
+    let cfg = parse(&config_json_with_rate_limit(r#"{ "requests": 0, "period_seconds": 60 }"#)).expect("should parse");
+    let errors = validate(&cfg);
+    assert!(errors.iter().any(|e| e.contains("rate_limit.requests")), "expected a rate_limit.requests error, got: {errors:?}");
+}
+
+#[test]
+fn validate_rejects_a_zero_rate_limit_period_seconds() {
+    let cfg = parse(&config_json_with_rate_limit(r#"{ "requests": 100, "period_seconds": 0 }"#)).expect("should parse");
+    let errors = validate(&cfg);
+    assert!(
+        errors.iter().any(|e| e.contains("rate_limit.period_seconds")),
+        "expected a rate_limit.period_seconds error, got: {errors:?}"
+    );
 }

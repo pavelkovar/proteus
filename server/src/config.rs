@@ -61,6 +61,25 @@ pub struct Config {
     pub trusted_proxies: Vec<ipnetwork::IpNetwork>,
     #[serde(default)]
     pub connection: ConnectionConfig,
+    /// `None` (the default) disables rate limiting entirely.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+/// Per-client-IP request cap, scoped by `user_agent` so it can target only
+/// known crawlers rather than every visitor.
+#[derive(Debug, Deserialize)]
+pub struct RateLimitConfig {
+    /// Burst capacity: how many requests one client may fire immediately,
+    /// and the ceiling it can never exceed even after refilling.
+    pub requests: u32,
+    /// How long it takes to refill that same capacity from empty; sustained
+    /// throughput settles at `requests / period_seconds`.
+    pub period_seconds: u64,
+    /// Same matching rules as `match.uri`/`match.method`/`match.host`.
+    /// Empty matches every client; non-empty limits only matching ones.
+    #[serde(default)]
+    pub user_agent: Vec<MatchPattern>,
 }
 
 /// Caps on what one client can tie up before ever reaching a worker.
@@ -175,26 +194,26 @@ pub struct RouteMatch {
 
 impl RouteMatch {
     pub(crate) fn matches(&self, path: &str, method: &str, host: &str) -> bool {
-        Self::field_matches(&self.uri, path)
-            && Self::field_matches(&self.method, method)
-            && Self::field_matches(&self.host, host)
+        matches_any(&self.uri, path) && matches_any(&self.method, method) && matches_any(&self.host, host)
     }
+}
 
-    fn field_matches(patterns: &[MatchPattern], value: &str) -> bool {
-        let mut has_positive = false;
-        let mut positive_matched = false;
-        for pattern in patterns {
-            if let MatchPattern::Not(inner) = pattern {
-                if inner.matches(value) {
-                    return false;
-                }
-            } else {
-                has_positive = true;
-                positive_matched = positive_matched || pattern.matches(value);
+/// Matches if no non-negated pattern exists or one hits, and no negated
+/// pattern hits.
+pub(crate) fn matches_any(patterns: &[MatchPattern], value: &str) -> bool {
+    let mut has_positive = false;
+    let mut positive_matched = false;
+    for pattern in patterns {
+        if let MatchPattern::Not(inner) = pattern {
+            if inner.matches(value) {
+                return false;
             }
+        } else {
+            has_positive = true;
+            positive_matched = positive_matched || pattern.matches(value);
         }
-        !has_positive || positive_matched
     }
+    !has_positive || positive_matched
 }
 
 /// `~pattern` is a regex, which is linear-time and so safe on hostile input;
@@ -523,6 +542,9 @@ pub fn validate(cfg: &Config) -> Vec<String> {
     if cfg.php.limits.timeout == 0 {
         errors.push("php.limits.timeout must be at least 1 (0 would time out every request immediately)".to_string());
     }
+    if cfg.php.limits.requests == 0 {
+        errors.push("php.limits.requests must be at least 1 (0 would recycle every worker after its first request)".to_string());
+    }
     if cfg.php.user.is_some() != cfg.php.group.is_some() {
         errors.push(
             "php.user and php.group must be set together or not at all (a half-drop would leave the other \
@@ -543,6 +565,14 @@ pub fn validate(cfg: &Config) -> Vec<String> {
         errors.push(
             "php.processes.spawn_timeout must be at least 1 (0 would fail every worker spawn immediately)".to_string(),
         );
+    }
+    if let Some(rate_limit) = &cfg.rate_limit {
+        if rate_limit.requests == 0 {
+            errors.push("rate_limit.requests must be at least 1 (0 would reject every matching request immediately)".to_string());
+        }
+        if rate_limit.period_seconds == 0 {
+            errors.push("rate_limit.period_seconds must be at least 1 (0 would never refill)".to_string());
+        }
     }
     for route in &cfg.routes {
         validate_action(&route.action, &cfg.php.targets, &mut errors);

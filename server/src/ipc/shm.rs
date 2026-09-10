@@ -33,6 +33,9 @@ const WAITING: u32 = 1;
 /// through the only wake coming for it. `peer_death` remains the authority.
 const DEAD: u32 = 2;
 
+/// Little-endian frame length, ahead of every payload.
+const LEN_PREFIX: usize = 4;
+
 /// A `Ring` sits on the master<->worker trust boundary, where a
 /// peer-triggered panic would take down the whole process. Errors, never
 /// panics; both variants are fatal to the channel.
@@ -174,7 +177,8 @@ pub struct Ring<const CAPACITY: usize> {
     /// only on the parking path.
     space_state: AtomicU32,
     data_state: AtomicU32,
-    /// How far `reclaim_if_due` has punched. Reader-only, like `read_pos`.
+    /// How far `reclaim_if_due` has punched. Master owns it on both rings, so
+    /// on the request ring a different process writes it than writes `read_pos`.
     reclaimed_pos: AtomicU64,
     _pad_state: [u8; CACHE_LINE - 2 * size_of::<AtomicU32>() - size_of::<AtomicU64>()],
     /// Mutated through `&Ring` by design, so it cannot be a bare array:
@@ -200,12 +204,16 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// every wrapped access corrupts silently rather than failing visibly.
     const _CAPACITY_IS_POWER_OF_TWO: () = assert!(CAPACITY.is_power_of_two());
 
+    /// Bounds every frame, so `raw_write_frame`'s `u32` length cannot truncate.
+    const _CAPACITY_FITS_A_U32_LENGTH: () = assert!(CAPACITY <= u32::MAX as usize);
+
     const MASK: u64 = (CAPACITY as u64) - 1;
 
     pub fn init_in_place(ptr: *mut Ring<CAPACITY>) {
         // An associated const in a generic impl is evaluated only where it
         // is named; without this the assert never fires.
         () = Self::_CAPACITY_IS_POWER_OF_TWO;
+        () = Self::_CAPACITY_FITS_A_U32_LENGTH;
         unsafe {
             (*ptr).write_pos = AtomicU64::new(0);
             (*ptr).read_pos = AtomicU64::new(0);
@@ -419,22 +427,29 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// Punches out the range consumed since the last reclaim. `file_offset`
     /// is `buf`'s offset within the memfd, not within the ring.
     ///
-    /// # Caller's safety burden (not enforced here)
+    /// # Caller's safety burden
     /// The writer must be provably done with this ring - between responses,
     /// never mid-write. The instant `read_pos` moves the writer may start
     /// filling the freed space, and punching it then zeroes live data. An
     /// earlier version reclaimed per frame and corrupted streamed responses.
+    ///
+    /// The empty-ring check below rejects the obvious violations, but it is a
+    /// snapshot: only the protocol makes this safe.
     fn reclaim_if_due(&self, fd: &OwnedFd, file_offset: u64) {
-        let read_pos = self.read_pos.load(Ordering::Relaxed); // reader-only
-        // Tripwire for the rule above: an active writer is write_pos > read_pos.
-        debug_assert_eq!(
-            self.write_pos.load(Ordering::Relaxed),
-            read_pos,
-            "reclaim_if_due called while the writer could still be active"
-        );
+        // Relaxed suffices because the position only grows: a stale read
+        // punches less than it could, never more. On the request ring this is
+        // the peer's write, not ours.
+        let read_pos = self.read_pos.load(Ordering::Relaxed);
         let reclaimed = self.reclaimed_pos.load(Ordering::Relaxed);
         let consumed = read_pos - reclaimed;
         if consumed < Self::RECLAIM_THRESHOLD {
+            return;
+        }
+        // Checked in release too, not merely asserted: punching a range the
+        // writer may be filling zeroes live data, while skipping costs only
+        // residency. A necessary condition, not a proof - see the safety note.
+        if self.write_pos.load(Ordering::Relaxed) != read_pos {
+            tracing::warn!(r#type = "controller", "skipped a ring reclaim: the writer is not idle");
             return;
         }
 
@@ -459,11 +474,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         self.reclaimed_pos.store(read_pos, Ordering::Relaxed);
     }
 
+    /// Copies without publishing; the caller advances `write_pos` once the
+    /// whole frame is in place.
+    ///
     /// # Safety
-    /// Single-producer only - concurrent callers would race `write_pos`.
-    unsafe fn raw_write(&self, data: &[u8]) {
-        let w = self.write_pos.load(Ordering::Relaxed);
-        let start = (w & Self::MASK) as usize;
+    /// Single-producer only, and the range must be free space already waited for.
+    unsafe fn copy_at(&self, pos: u64, data: &[u8]) {
+        let start = (pos & Self::MASK) as usize;
         let len = data.len();
         let base = self.buf.get() as *mut u8;
         unsafe {
@@ -475,7 +492,24 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
                 std::ptr::copy_nonoverlapping(data.as_ptr().add(first), base, len - first);
             }
         }
-        self.write_pos.store(w + len as u64, Ordering::Release);
+    }
+
+    /// Advances `write_pos` once per frame, so a reader never observes a
+    /// length prefix without the payload behind it.
+    ///
+    /// # Safety
+    /// Single-producer only - concurrent callers would race `write_pos` - and
+    /// `LEN_PREFIX + payload.len()` bytes of space must already have been
+    /// waited for.
+    unsafe fn raw_write_frame(&self, payload: &[u8]) {
+        debug_assert!(payload.len() <= CAPACITY - LEN_PREFIX, "caller must reject an oversized frame");
+        let w = self.write_pos.load(Ordering::Relaxed);
+        unsafe {
+            self.copy_at(w, &(payload.len() as u32).to_le_bytes());
+            self.copy_at(w + LEN_PREFIX as u64, payload);
+        }
+        // Release: publishes both copies above to whoever reads this frame.
+        self.write_pos.store(w + (LEN_PREFIX + payload.len()) as u64, Ordering::Release);
     }
 
     /// # Safety
@@ -524,14 +558,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// Blocking, so worker-side only. Waits for the whole frame's space up
     /// front, so a reader never sees a partially-written frame.
     pub fn write_frame(&self, payload: &[u8], peer: &PeerDeath, notify_efd: RawFd) -> Result<(), RingError> {
-        if payload.len() > CAPACITY - 4 {
+        if payload.len() > CAPACITY - LEN_PREFIX {
             return Err(RingError::FrameTooLarge);
         }
-        let total = 4 + payload.len();
+        let total = LEN_PREFIX + payload.len();
         self.wait_for_space(total, peer)?;
         unsafe {
-            self.raw_write(&(payload.len() as u32).to_le_bytes());
-            self.raw_write(payload);
+            self.raw_write_frame(payload);
         }
         self.notify_data_written_eventfd(notify_efd);
         Ok(())
@@ -552,13 +585,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         notify_efd: RawFd,
         deadline: Option<std::time::Instant>,
     ) -> Result<bool, RingError> {
-        if !self.wait_for_data_until(4, peer, deadline)? {
+        if !self.wait_for_data_until(LEN_PREFIX, peer, deadline)? {
             return Ok(false);
         }
         let mut len_buf = [0u8; 4];
         unsafe { self.raw_read(&mut len_buf) };
         let len = u32::from_le_bytes(len_buf) as usize;
-        if len > CAPACITY - 4 {
+        if len > CAPACITY - LEN_PREFIX {
             return Err(RingError::FrameTooLarge);
         }
         self.wait_for_data(len, peer)?;
@@ -574,14 +607,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         peer: &PeerDeath,
         space_efd: &AsyncFd<OwnedFd>,
     ) -> Result<(), RingError> {
-        if payload.len() > CAPACITY - 4 {
+        if payload.len() > CAPACITY - LEN_PREFIX {
             return Err(RingError::FrameTooLarge);
         }
-        let total = 4 + payload.len();
+        let total = LEN_PREFIX + payload.len();
         self.wait_for_space_async(total, peer, space_efd).await?;
         unsafe {
-            self.raw_write(&(payload.len() as u32).to_le_bytes());
-            self.raw_write(payload);
+            self.raw_write_frame(payload);
         }
         // The reader here is always a worker, so always a futex waiter.
         self.notify_data_written();
@@ -594,11 +626,11 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         peer: &PeerDeath,
         data_efd: &AsyncFd<OwnedFd>,
     ) -> Result<(), RingError> {
-        self.wait_for_data_async(4, peer, data_efd).await?;
+        self.wait_for_data_async(LEN_PREFIX, peer, data_efd).await?;
         let mut len_buf = [0u8; 4];
         unsafe { self.raw_read(&mut len_buf) };
         let len = u32::from_le_bytes(len_buf) as usize;
-        if len > CAPACITY - 4 {
+        if len > CAPACITY - LEN_PREFIX {
             return Err(RingError::FrameTooLarge);
         }
         self.wait_for_data_async(len, peer, data_efd).await?;
@@ -676,16 +708,17 @@ impl MappedChannel {
         unsafe { self.ptr.as_ref() }
     }
 
-    /// No-op on a worker's mapping. Both rings go together: `Ring::reclaim_if_due`'s
-    /// safety note admits only one point, and it is the same for both.
-    pub fn reclaim_if_due(&self) {
+    /// No-op on a worker's mapping. One moment serves both rings, but not for
+    /// one reason: master is the response ring's reader and the request ring's
+    /// writer, and at the done marker it is neither reading nor about to write.
+    pub(in crate::ipc) fn reclaim_if_due(&self) {
         if let Some(fd) = &self.fd {
             self.channel().reclaim_response(fd);
             self.channel().reclaim_request(fd);
         }
     }
 
-    pub fn reclaim_is_due(&self) -> bool {
+    pub(in crate::ipc) fn reclaim_is_due(&self) -> bool {
         self.fd.is_some()
             && (self.channel().response.is_reclaim_due() || self.channel().request.is_reclaim_due())
     }
