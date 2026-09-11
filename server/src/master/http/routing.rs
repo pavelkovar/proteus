@@ -11,12 +11,84 @@ use crate::master::pool_manager::BodyStream;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
-use std::path::PathBuf;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::FromRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 /// Below this the hint costs more than it buys: the kernel's own default
 /// readahead window already covers a file this small.
 const MIN_READ_AHEAD: u64 = 128 * 1024;
+
+/// Latched off the first time the kernel rejects the call itself: without
+/// it every request would spend a syscall that cannot start succeeding.
+static OPENAT2_USABLE: AtomicBool = AtomicBool::new(true);
+
+/// `open` that gives up instead of waiting when the path is not already in
+/// the kernel's lookup cache - the bargain `pread_nowait` makes for reads.
+///
+/// `None` means "hand it to the blocking pool". Every other error is the
+/// real answer and comes back as `Some(Err(..))`, so a miss is not opened
+/// twice.
+pub(crate) fn open_cached(path: &Path) -> Option<std::io::Result<std::fs::File>> {
+    if !OPENAT2_USABLE.load(Relaxed) {
+        return None;
+    }
+    // An interior NUL names no file; let the fallback raise the error.
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // Zeroed rather than built field by field: `open_how` is the kernel's
+    // extensible-struct ABI, where an unset field must read as zero.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_CACHED;
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            std::ptr::from_ref(&how),
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if rc >= 0 {
+        return Some(Ok(unsafe { std::fs::File::from_raw_fd(rc as libc::c_int) }));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EAGAIN) => None,
+        // No `openat2` (pre-5.6), no `RESOLVE_CACHED` (pre-5.12), or a
+        // seccomp profile that refuses the call.
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::E2BIG) => {
+            OPENAT2_USABLE.store(false, Relaxed);
+            tracing::warn!(
+                r#type = "controller",
+                error = %err,
+                "openat2(RESOLVE_CACHED) unavailable, every static open now goes through the blocking pool"
+            );
+            None
+        }
+        _ => Some(Err(err)),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn openat2_usable_for_test() -> bool {
+    OPENAT2_USABLE.load(Relaxed)
+}
+
+/// Whatever opened the fd, this decides what it promises.
+pub(crate) fn stat_and_advise(
+    file: std::fs::File,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let meta = file.metadata()?;
+    // Every path this fd takes reads it in order, whole file or range.
+    if !meta.is_dir() && meta.len() > MIN_READ_AHEAD {
+        let _ = posix_fadvise(&file, 0, 0, PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL);
+    }
+    Ok((file, meta))
+}
 
 /// Finds the matching route only; walking a `fallback` chain is separate.
 #[derive(Debug, PartialEq)]
@@ -214,25 +286,16 @@ pub(crate) async fn dispatch_action(
                 // open and stat share one `spawn_blocking`; separate
                 // `tokio::fs` calls would each be their own trip through the
                 // blocking pool.
-                let stat_result = {
-                    let candidate = candidate.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let file = std::fs::File::open(&candidate)?;
-                        let meta = file.metadata()?;
-                        // Every path this fd takes reads it in order, whole
-                        // file or range.
-                        if !meta.is_dir() && meta.len() > MIN_READ_AHEAD {
-                            let _ = posix_fadvise(
-                                &file,
-                                0,
-                                0,
-                                PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
-                            );
-                        }
-                        Ok::<_, std::io::Error>((file, meta))
-                    })
-                    .await
-                    .expect("blocking task panicked")
+                let stat_result = match open_cached(&candidate) {
+                    Some(opened) => opened.and_then(stat_and_advise),
+                    None => {
+                        let candidate = candidate.clone();
+                        tokio::task::spawn_blocking(move || {
+                            std::fs::File::open(&candidate).and_then(stat_and_advise)
+                        })
+                        .await
+                        .expect("blocking task panicked")
+                    }
                 };
                 let (opened, kind) = match stat_result {
                     Ok((_file, meta)) if meta.is_dir() => (None, FsKind::Dir),
@@ -320,15 +383,27 @@ fn resolve_script_mode(root: &str, script: &str, url_path: &str) -> ResolvedScri
     }
 }
 
-/// Cached `metadata()`; only which file to hand the worker matters here.
-async fn stat_kind(fs_cache: &FsCache, path: &std::path::Path) -> FsKind {
-    if let Some(kind) = fs_cache.get(path) {
-        return kind;
-    }
-    let kind = match tokio::fs::metadata(path).await {
+pub(crate) fn kind_of(meta: std::io::Result<std::fs::Metadata>) -> FsKind {
+    match meta {
         Ok(m) if m.is_dir() => FsKind::Dir,
         Ok(_) => FsKind::File,
         Err(_) => FsKind::Missing,
+    }
+}
+
+/// Cached `metadata()`; only which file to hand the worker matters here.
+///
+/// A warm dentry is answered inline, but `open` demands read permission
+/// where `stat` does not. Only a success or a genuine absence is therefore
+/// conclusive; anything else must still ask the real `stat`.
+pub(crate) async fn stat_kind(fs_cache: &FsCache, path: &std::path::Path) -> FsKind {
+    if let Some(kind) = fs_cache.get(path) {
+        return kind;
+    }
+    let kind = match open_cached(path) {
+        Some(Ok(file)) => kind_of(file.metadata()),
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => FsKind::Missing,
+        _ => kind_of(tokio::fs::metadata(path).await),
     };
     fs_cache.put(path.to_path_buf(), kind);
     kind

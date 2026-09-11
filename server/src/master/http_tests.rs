@@ -1,4 +1,5 @@
 use super::compression::*;
+use super::fs_cache::{FsCache, FsKind};
 use super::*;
 use crate::config::{
     Config, Limits, MatchPattern, PhpConfig, Processes, QueueConfig, Route, RouteActionConfig,
@@ -479,6 +480,82 @@ fn extension_gate_admits_only_exact_listed_extensions() {
 #[test]
 fn extension_gate_refuses_everything_when_the_list_is_empty() {
     assert!(!extension_is_listed("/r/index.php", &[]));
+}
+
+fn temp_path(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("proteus-openat2-{}-{name}", std::process::id()))
+}
+
+/// A file just written has a warm dentry, which is the whole point: the open
+/// is answered inline and the blocking pool is never involved.
+#[test]
+fn open_cached_answers_a_warm_dentry_inline() {
+    let path = temp_path("warm");
+    std::fs::write(&path, b"x").unwrap();
+    let result = open_cached(&path);
+    let _ = std::fs::remove_file(&path);
+    match result {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => panic!("a readable file must open, got {e}"),
+        // Only legitimate when the kernel has no RESOLVE_CACHED at all.
+        None => assert!(!openat2_usable_for_test(), "a warm dentry must not defer"),
+    }
+}
+
+/// The errno distinction that keeps a miss from being opened twice: a
+/// genuinely absent file is an answer, not a reason to consult the pool.
+#[test]
+fn open_cached_reports_a_missing_file_rather_than_deferring_it() {
+    let path = temp_path("missing");
+    let _ = std::fs::remove_file(&path);
+    match open_cached(&path) {
+        Some(Err(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound),
+        Some(Ok(_)) => panic!("a file that does not exist must not open"),
+        None => assert!(
+            !openat2_usable_for_test(),
+            "ENOENT is the real answer and must not be deferred to the blocking pool"
+        ),
+    }
+}
+
+/// `open()` succeeds on a directory, so the caller - not this helper - is
+/// what keeps one from being streamed as a body.
+#[test]
+fn open_cached_opens_a_directory_which_stat_then_classifies() {
+    let dir = temp_path("dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = open_cached(&dir);
+    let _ = std::fs::remove_dir(&dir);
+    if let Some(Ok(file)) = result {
+        let (_, meta) = stat_and_advise(file).unwrap();
+        assert!(meta.is_dir());
+    }
+}
+
+/// The inline path and the `stat` fallback must classify identically, or
+/// which one answered would change what the worker is handed.
+#[tokio::test]
+async fn stat_kind_classifies_the_same_however_it_was_answered() {
+    let cache = FsCache::new(64, std::time::Duration::from_secs(60));
+    let dir = temp_path("statkind");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("script.php");
+    std::fs::write(&file, b"<?php").unwrap();
+    let absent = dir.join("nope.php");
+
+    assert_eq!(stat_kind(&cache, &file).await, FsKind::File);
+    assert_eq!(stat_kind(&cache, &dir).await, FsKind::Dir);
+    assert_eq!(stat_kind(&cache, &absent).await, FsKind::Missing);
+
+    // Same verdicts with the fast path out of the picture.
+    let cold = FsCache::new(64, std::time::Duration::from_secs(60));
+    assert_eq!(kind_of(std::fs::metadata(&file)), FsKind::File);
+    assert_eq!(kind_of(std::fs::metadata(&dir)), FsKind::Dir);
+    assert_eq!(kind_of(std::fs::metadata(&absent)), FsKind::Missing);
+    assert_eq!(stat_kind(&cold, &file).await, FsKind::File);
+
+    let _ = std::fs::remove_file(&file);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
