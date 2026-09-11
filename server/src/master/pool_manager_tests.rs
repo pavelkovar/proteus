@@ -31,6 +31,7 @@ fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         drop_privileges: false,
+        no_new_privs: true,
         options: PhpOptions::default(),
         environment: HashMap::new(),
         respawn_backoff: Mutex::new(RespawnBackoff::default()),

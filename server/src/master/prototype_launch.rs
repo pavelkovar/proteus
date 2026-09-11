@@ -39,6 +39,7 @@ pub fn spawn(
     drop_to: Option<(u32, u32)>,
     options: &PhpOptions,
     environment: &HashMap<String, String>,
+    no_new_privs: bool,
 ) -> std::io::Result<(UnixSeqpacket, std::process::Child)> {
     let (master_end, prototype_end) = UnixSeqpacket::pair()?;
     let prototype_fd = prototype_end.into_raw_fd();
@@ -69,6 +70,11 @@ pub fn spawn(
     }
     unsafe {
         cmd.pre_exec(move || {
+            // Survives this `execve` and every `fork` below it, so one call
+            // here covers the prototype and every worker it goes on to make.
+            if no_new_privs && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             // Both sources move clear of the target range before either
             // dup2. In place it is order-dependent: if the OS handed us
             // CONTROL_FD for the config pipe, the first dup2 would close the

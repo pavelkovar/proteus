@@ -1072,6 +1072,72 @@ async fn script_extensions_is_configurable_without_widening_the_rest() {
     assert_eq!(png.status(), 404, "listing phtml must not admit png too");
 }
 
+/// Read back from the live worker rather than asserted at the call site: the
+/// flag has to survive the prototype's `execve` and the `fork` that makes the
+/// worker, and only `/proc` can say that it did.
+#[tokio::test]
+async fn workers_run_with_no_new_privs_by_default() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("nnp", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    let body = reqwest::get(format!("http://127.0.0.1:{}/", server.port))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let pid: u32 = body
+        .split("worker pid=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|d| d.parse().ok())
+        .unwrap_or_else(|| panic!("no worker pid in response: {body}"));
+
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("NoNewPrivs:"))
+        .unwrap_or_else(|| panic!("kernel reports no NoNewPrivs field for pid {pid}"));
+    assert_eq!(
+        line.split_whitespace().nth(1),
+        Some("1"),
+        "worker {pid} did not inherit PR_SET_NO_NEW_PRIVS: {line}"
+    );
+}
+
+/// The escape hatch has to actually reach the worker, or an operator whose
+/// `mail()` needs a setgid helper has no way out.
+#[tokio::test]
+async fn no_new_privs_can_be_turned_off() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "nnp-off",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "no_new_privs": false } }),
+    )
+    .await;
+
+    let body = reqwest::get(format!("http://127.0.0.1:{}/", server.port))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let pid: u32 = body
+        .split("worker pid=")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|d| d.parse().ok())
+        .unwrap();
+
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let line = status
+        .lines()
+        .find(|l| l.starts_with("NoNewPrivs:"))
+        .unwrap();
+    assert_eq!(line.split_whitespace().nth(1), Some("0"), "got: {line}");
+}
+
 /// Hitting the pending-headers cap must not simply abandon the response ring
 /// while the worker, still mid-write, blocks forever in an untimed wait with
 /// nothing left to free space or kill it. It is dropped from `/status`

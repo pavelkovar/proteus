@@ -108,6 +108,7 @@ pub struct PoolManager {
     /// False means keeping master's own identity, which requires skipping
     /// the `uid`/`gid` calls entirely rather than passing master's own.
     drop_privileges: bool,
+    no_new_privs: bool,
     options: PhpOptions,
     environment: HashMap<String, String>,
     /// tokio mutex: held across `.await`. Not hot-path - only touched after
@@ -312,6 +313,7 @@ impl PoolManager {
             drop_to,
             &cfg.php.options,
             &cfg.php.environment,
+            cfg.php.no_new_privs,
         )
         .expect("failed to spawn prototype");
         tracing::info!(
@@ -353,6 +355,7 @@ impl PoolManager {
             uid,
             gid,
             drop_privileges: drop_to.is_some(),
+            no_new_privs: cfg.php.no_new_privs,
             options: PhpOptions {
                 admin: cfg.php.options.admin.clone(),
                 user: cfg.php.options.user.clone(),
@@ -391,6 +394,7 @@ impl PoolManager {
         let options = self.options.clone();
         let environment = self.environment.clone();
         let idle_timeout = self.idle_timeout;
+        let no_new_privs = self.no_new_privs;
         let spawn_result = tokio::task::spawn_blocking(move || {
             prototype_launch::spawn(
                 &php_mod_path,
@@ -399,6 +403,7 @@ impl PoolManager {
                 drop_to,
                 &options,
                 &environment,
+                no_new_privs,
             )
         })
         .await

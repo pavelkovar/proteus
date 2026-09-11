@@ -34,6 +34,7 @@ fn test_config(routes: Vec<Route>) -> Config {
                 timeout: 5,
             },
             shutdown: Default::default(),
+            no_new_privs: true,
         },
         status: Default::default(),
         compression: Default::default(),

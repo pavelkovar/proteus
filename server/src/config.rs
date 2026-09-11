@@ -374,6 +374,16 @@ pub struct PhpConfig {
     pub queue: QueueConfig,
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// Refuses privilege gained through `execve`: a setuid binary a script
+    /// shells out to runs as the worker instead. Costs nothing a PHP
+    /// application normally does; the exception is an MTA submission helper
+    /// such as `postdrop`, which `mail()` needs to be setgid.
+    #[serde(default = "default_true")]
+    pub no_new_privs: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `Serialize` because it crosses `exec()`, which leaves the new process no
