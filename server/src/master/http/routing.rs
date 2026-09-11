@@ -5,7 +5,7 @@ use super::AppState;
 use super::fs_cache::{FsCache, FsKind};
 use super::php_dispatch::{build_php_request, dispatch_php};
 use super::proxy::ClientIdentity;
-use crate::config::{Config, RouteActionConfig};
+use crate::config::{Config, RouteActionConfig, extension_is_listed};
 use crate::ipc::data::HeaderBlob;
 use crate::master::pool_manager::BodyStream;
 use hyper::body::Incoming;
@@ -343,6 +343,7 @@ async fn resolve_index_target(
     root: &str,
     url_path: &str,
     index: &str,
+    allowed: &[String],
 ) -> Option<ResolvedScript> {
     let root_path = std::path::Path::new(root);
     let rel = url_path.trim_start_matches('/');
@@ -385,12 +386,12 @@ async fn resolve_index_target(
         FsKind::Missing => {}
     }
 
-    // Longest ".php"-suffixed prefix wins.
+    // Longest executable-suffixed prefix wins.
     let segments: Vec<&str> = rel.split('/').collect();
     for cut in (1..segments.len()).rev() {
         // Suffix check first, before building a join for a cut that cannot
         // match.
-        if !segments[cut - 1].ends_with(".php") {
+        if !extension_is_listed(segments[cut - 1], allowed) {
             continue;
         }
         let prefix = segments[..cut].join("/");
@@ -413,11 +414,15 @@ async fn resolve_script(state: &AppState, name: &str, url_path: &str) -> Option<
     let target = state.config.php.targets.get(name).unwrap_or_else(|| {
         panic!("route referenced php target {name:?}, missing from php.targets - config::validate should have caught this at startup")
     });
-    match &target.script {
+    let allowed = &state.config.php.script_extensions;
+    let resolved = match &target.script {
         Some(script) => Some(resolve_script_mode(&target.root, script, url_path)),
         None => {
             let index = target.index.as_deref().unwrap_or("index.php");
-            resolve_index_target(&state.fs_cache, &target.root, url_path, index).await
+            resolve_index_target(&state.fs_cache, &target.root, url_path, index, allowed).await
         }
-    }
+    };
+    // Past every branch on purpose: a branch resolving a client-named file
+    // cannot forget a check it does not perform itself.
+    resolved.filter(|r| extension_is_listed(&r.script_path, allowed))
 }

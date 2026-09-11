@@ -1,0 +1,2 @@
+not really a png
+<?php echo "PHP-EXECUTED\n"; ?>

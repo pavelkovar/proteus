@@ -999,6 +999,79 @@ async fn one_keep_alive_connection_resolves_each_request_forwarded_client() {
     );
 }
 
+/// `index` mode resolves the script from the URL, so an ungated target hands
+/// the interpreter any regular file under `root`: an uploaded `.png` is
+/// remote code execution, and a file without PHP in it is echoed verbatim.
+#[tokio::test]
+async fn only_configured_script_extensions_reach_the_interpreter() {
+    let www = fixtures_dir().join("uploads-www");
+    let server = start_server(
+        "ext-gate",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "routes": [ { "match": {}, "action": "php", "target": "default" } ],
+            "php": { "targets": { "default": {
+                "root": www.to_str().unwrap(), "script": null, "index": "index.php"
+            } } }
+        }),
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{}", server.port);
+
+    let app = reqwest::get(format!("{base}/")).await.unwrap();
+    assert_eq!(app.status(), 200);
+    assert!(
+        app.text().await.unwrap().contains("APP OK"),
+        "the real entrypoint must still run"
+    );
+
+    for path in ["/uploads/avatar.png", "/.env", "/uploads/note.txt"] {
+        let resp = reqwest::get(format!("{base}{path}")).await.unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 404, "{path} must not resolve to a script");
+        assert!(
+            !body.contains("PHP-EXECUTED"),
+            "{path} was executed as PHP: {body}"
+        );
+        assert!(
+            !body.contains("hunter2"),
+            "{path} leaked its contents: {body}"
+        );
+    }
+}
+
+/// The gate is a configured list, not a hardcoded `.php`, so a legacy app can
+/// opt an extension in - and opting one in must not open the rest.
+#[tokio::test]
+async fn script_extensions_is_configurable_without_widening_the_rest() {
+    let www = fixtures_dir().join("uploads-www");
+    let server = start_server(
+        "ext-gate-phtml",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "routes": [ { "match": {}, "action": "php", "target": "default" } ],
+            "php": {
+                "script_extensions": ["php", "phtml"],
+                "targets": { "default": {
+                    "root": www.to_str().unwrap(), "script": null, "index": "index.php"
+                } }
+            }
+        }),
+    )
+    .await;
+    let base = format!("http://127.0.0.1:{}", server.port);
+
+    let legacy = reqwest::get(format!("{base}/legacy.phtml")).await.unwrap();
+    assert_eq!(legacy.status(), 200);
+    assert!(legacy.text().await.unwrap().contains("PHTML-EXECUTED"));
+
+    let png = reqwest::get(format!("{base}/uploads/avatar.png"))
+        .await
+        .unwrap();
+    assert_eq!(png.status(), 404, "listing phtml must not admit png too");
+}
+
 /// Hitting the pending-headers cap must not simply abandon the response ring
 /// while the worker, still mid-write, blocks forever in an untimed wait with
 /// nothing left to free space or kill it. It is dropped from `/status`

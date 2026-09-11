@@ -151,6 +151,10 @@ impl Default for ConnectionConfig {
     }
 }
 
+fn default_script_extensions() -> Vec<String> {
+    vec!["php".to_string()]
+}
+
 fn default_max_body_size() -> usize {
     64 * 1024 * 1024 // 64 MiB
 }
@@ -358,6 +362,12 @@ pub struct PhpConfig {
     /// ZEND_INI_SYSTEM (admin) / ZEND_INI_USER (user), applied by php-mod.
     #[serde(default)]
     pub options: PhpOptions,
+    /// Extensions a request may execute, as PHP-FPM's
+    /// `security.limit_extensions`. Without it an uploaded `.png` holding PHP
+    /// is remote code execution, and any file under a target's root is
+    /// readable through the interpreter that echoes it.
+    #[serde(default = "default_script_extensions")]
+    pub script_extensions: Vec<String>,
     pub limits: Limits,
     pub processes: Processes,
     #[serde(default)]
@@ -623,6 +633,32 @@ pub fn validate(cfg: &Config) -> Vec<String> {
             );
         }
     }
+    if cfg.php.script_extensions.is_empty() {
+        errors.push(
+            "php.script_extensions must list at least one extension (an empty list can never run a script)"
+                .to_string(),
+        );
+    }
+    for ext in &cfg.php.script_extensions {
+        if ext.is_empty() || ext.starts_with('.') || ext.contains('/') {
+            errors.push(format!(
+                "php.script_extensions entry {ext:?} must be a bare extension such as \"php\", without a leading dot or any path separator"
+            ));
+        }
+    }
+    // Caught here rather than as a puzzling 404 on every request.
+    for (name, target) in &cfg.php.targets {
+        for (field, value) in [("script", &target.script), ("index", &target.index)] {
+            if let Some(value) = value
+                && !extension_is_listed(value, &cfg.php.script_extensions)
+            {
+                errors.push(format!(
+                    "php.targets.{name}.{field} {value:?} does not end in one of php.script_extensions ({:?}), so it could never be executed",
+                    cfg.php.script_extensions
+                ));
+            }
+        }
+    }
     for net in &cfg.trusted_proxies {
         if net.prefix() == 0 {
             errors.push(format!(
@@ -636,6 +672,19 @@ pub fn validate(cfg: &Config) -> Vec<String> {
         validate_action(&route.action, &cfg.php.targets, &mut errors);
     }
     errors
+}
+
+/// The single gate deciding what may be executed, shared by request
+/// resolution and this validation so the two cannot drift apart.
+///
+/// Case-sensitive, so `.PHP` is refused: a case-insensitive filesystem
+/// reaches the same file either way, and an upload filter that only rejected
+/// `php` must not be undone here.
+pub fn extension_is_listed(path: &str, allowed: &[String]) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| allowed.iter().any(|a| a == ext))
 }
 
 /// A target may be named at any depth of a `fallback` chain.

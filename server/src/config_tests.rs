@@ -268,6 +268,55 @@ fn validate_accepts_a_narrow_trusted_proxies_entry() {
     assert_eq!(validate(&cfg), Vec::<String>::new());
 }
 
+/// An operator writing `".php"` or an empty entry gets a startup error, not a
+/// gate that quietly matches nothing.
+#[test]
+fn validate_rejects_malformed_script_extensions() {
+    for bad in [r#"[".php"]"#, r#"[""]"#, r#"["php/x"]"#] {
+        let json = base_config_json("", "").replace(
+            r#""limits""#,
+            &format!(r#""script_extensions": {bad}, "limits""#),
+        );
+        let cfg: Config = serde_json::from_str(&json).expect("should parse");
+        let errors = validate(&cfg);
+        assert!(
+            errors.iter().any(|e| e.contains("script_extensions")),
+            "expected an error for {bad}, got: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_rejects_an_empty_script_extensions_list() {
+    let json =
+        base_config_json("", "").replace(r#""limits""#, r#""script_extensions": [], "limits""#);
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    assert!(
+        validate(&cfg)
+            .iter()
+            .any(|e| e.contains("script_extensions"))
+    );
+}
+
+/// A target naming a script the gate would refuse can never serve a request,
+/// so it is a startup error rather than a 404 on every hit.
+#[test]
+fn validate_rejects_a_target_script_the_gate_would_refuse() {
+    let json = base_config_json("", r#""api": { "root": "/var/www", "script": "app.inc" }"#);
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    let errors = validate(&cfg);
+    assert!(
+        errors.iter().any(|e| e.contains("script_extensions")),
+        "got: {errors:?}"
+    );
+}
+
+#[test]
+fn script_extensions_defaults_to_php_only() {
+    let cfg: Config = serde_json::from_str(&base_config_json("", "")).expect("should parse");
+    assert_eq!(cfg.php.script_extensions, vec!["php".to_string()]);
+}
+
 #[test]
 fn validate_rejects_a_zero_queue_timeout() {
     let json = base_config_json("", "").replace(r#""timeout": 5"#, r#""timeout": 0"#);

@@ -2,7 +2,7 @@ use super::compression::*;
 use super::*;
 use crate::config::{
     Config, Limits, MatchPattern, PhpConfig, Processes, QueueConfig, Route, RouteActionConfig,
-    RouteMatch,
+    RouteMatch, extension_is_listed,
 };
 use hyper::HeaderMap;
 use std::net::IpAddr;
@@ -17,6 +17,7 @@ fn test_config(routes: Vec<Route>) -> Config {
             user: Some("phpapp".into()),
             group: Some("phpapp".into()),
             options: Default::default(),
+            script_extensions: vec!["php".to_string()],
             limits: Limits {
                 requests: 500,
                 timeout: 30,
@@ -449,6 +450,35 @@ fn match_route_ands_host_with_uri_and_method() {
         match_route(&cfg, "/api/widgets", "GET", "other.example.test"),
         RouteDecision::NoMatch
     );
+}
+
+/// The names an attacker reaches for when a gate compares suffixes by hand:
+/// a dotfile has no extension at all, and a trailing dot or space is a
+/// different file that a sloppy `ends_with` would wave through.
+#[test]
+fn extension_gate_admits_only_exact_listed_extensions() {
+    let allowed = vec!["php".to_string()];
+    for ok in ["/r/index.php", "/r/a.b/c.php", "/r/..php"] {
+        assert!(extension_is_listed(ok, &allowed), "{ok} should be allowed");
+    }
+    for bad in [
+        "/r/uploads/avatar.png",
+        "/r/.env",
+        "/r/README",
+        "/r/a.PHP",
+        "/r/a.pHp",
+        "/r/a.php.",
+        "/r/a.php ",
+        "/r/a.phtml",
+        "/r/a.php.txt",
+    ] {
+        assert!(!extension_is_listed(bad, &allowed), "{bad} must be refused");
+    }
+}
+
+#[test]
+fn extension_gate_refuses_everything_when_the_list_is_empty() {
+    assert!(!extension_is_listed("/r/index.php", &[]));
 }
 
 #[test]
