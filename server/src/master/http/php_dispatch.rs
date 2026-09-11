@@ -207,7 +207,7 @@ pub(crate) async fn build_php_request(
     resolved: ResolvedScript,
     ctx: RequestContext<'_>,
     max_body_size: usize,
-) -> Result<(PhpRequest<'static>, Option<TempBodyFile>), DispatchResult> {
+) -> Result<(PhpRequest<'static>, Option<TempBodyFile>), Box<DispatchResult>> {
     let RequestContext {
         client_ip,
         listen_addr,
@@ -275,7 +275,7 @@ pub(crate) async fn build_php_request(
             {
                 tracing::warn!(r#type = "controller", path = %path.display(), uid, gid, error = %e, "failed to chown spilled body file, failing the request");
                 let _cleanup = TempBodyFile::new(path);
-                return Err(DispatchResult::new(
+                return Err(Box::new(DispatchResult::new(
                     ActionBody::Buffered {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
                         body: b"500 failed to prepare request body\n".to_vec(),
@@ -283,7 +283,7 @@ pub(crate) async fn build_php_request(
                     },
                     "php",
                     0,
-                ));
+                )));
             }
             (
                 RequestBody::File {
@@ -294,7 +294,7 @@ pub(crate) async fn build_php_request(
             )
         }
         Err(BodyCollectError::TooLarge) => {
-            return Err(DispatchResult::new(
+            return Err(Box::new(DispatchResult::new(
                 ActionBody::Buffered {
                     status: StatusCode::PAYLOAD_TOO_LARGE,
                     body: b"413 request body exceeds the configured limit\n".to_vec(),
@@ -302,10 +302,10 @@ pub(crate) async fn build_php_request(
                 },
                 "php",
                 0,
-            ));
+            )));
         }
         Err(BodyCollectError::Stalled) => {
-            return Err(DispatchResult::new(
+            return Err(Box::new(DispatchResult::new(
                 ActionBody::Buffered {
                     status: StatusCode::REQUEST_TIMEOUT,
                     body: b"408 request body stopped arriving\n".to_vec(),
@@ -313,10 +313,10 @@ pub(crate) async fn build_php_request(
                 },
                 "php",
                 0,
-            ));
+            )));
         }
         Err(BodyCollectError::Io) => {
-            return Err(DispatchResult::new(
+            return Err(Box::new(DispatchResult::new(
                 ActionBody::Buffered {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     body: b"500 failed to read request body\n".to_vec(),
@@ -324,7 +324,7 @@ pub(crate) async fn build_php_request(
                 },
                 "php",
                 0,
-            ));
+            )));
         }
     };
 

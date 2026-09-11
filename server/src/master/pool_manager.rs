@@ -33,10 +33,10 @@ impl TempBodyFile {
 }
 
 fn remove_temp_body(path: &std::path::Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "failed to remove temp body file");
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "failed to remove temp body file");
     }
 }
 

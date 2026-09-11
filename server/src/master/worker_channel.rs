@@ -238,8 +238,8 @@ async fn io_task(
                     // A worker that fails mid-run still writes this marker
                     // straight past End; without the flush its collected
                     // headers would be silently dropped.
-                    if let Some((status, headers)) = pending_headers.take() {
-                        if response_tx
+                    if let Some((status, headers)) = pending_headers.take()
+                        && response_tx
                             .send(Ok(Some(ResponseFrame::Headers {
                                 status,
                                 headers,
@@ -247,9 +247,8 @@ async fn io_task(
                             })))
                             .await
                             .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                     if response_tx.send(Ok(None)).await.is_err() {
                         return;
@@ -257,8 +256,8 @@ async fn io_task(
                     continue 'commands;
                 }
                 Ok(Some(frame)) => {
-                    if let Some((status, headers)) = pending_headers.take() {
-                        if response_tx
+                    if let Some((status, headers)) = pending_headers.take()
+                        && response_tx
                             .send(Ok(Some(ResponseFrame::Headers {
                                 status,
                                 headers,
@@ -266,9 +265,8 @@ async fn io_task(
                             })))
                             .await
                             .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                     if response_tx.send(Ok(Some(frame))).await.is_err() {
                         return;

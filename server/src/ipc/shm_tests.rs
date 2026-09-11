@@ -279,7 +279,7 @@ async fn a_published_frame_is_never_visible_before_its_payload() {
         move || {
             let mut samples = 0u64;
             while !done.load(Ordering::Relaxed) {
-                if ring.write_pos.load(Ordering::Acquire) % FRAME != 0 {
+                if !ring.write_pos.load(Ordering::Acquire).is_multiple_of(FRAME) {
                     torn.store(true, Ordering::Relaxed);
                 }
                 samples += 1;

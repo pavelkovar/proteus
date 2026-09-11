@@ -111,6 +111,15 @@ pub(crate) fn build_response(
         .unwrap()
 }
 
+/// The compression-negotiation inputs shared by every response builder, as
+/// one `Copy` struct rather than positional args.
+#[derive(Clone, Copy)]
+pub(crate) struct CompressionParams<'a> {
+    pub(crate) accept_encoding: &'a str,
+    pub(crate) min_size_bytes: usize,
+    pub(crate) mime_types: &'a [String],
+}
+
 /// `meta` must come from the same `stat` that opened `file`; an fd stays
 /// valid regardless of what happens to the path afterwards.
 ///
@@ -127,12 +136,15 @@ pub(crate) async fn build_static_response(
     meta: &std::fs::Metadata,
     candidate: &std::path::Path,
     path: &str,
-    accept_encoding: &str,
-    min_size_bytes: usize,
-    mime_types: &[String],
+    compression: CompressionParams<'_>,
     cond: &ConditionalHeaders,
     is_head: bool,
 ) -> Response<ResponseBody> {
+    let CompressionParams {
+        accept_encoding,
+        min_size_bytes,
+        mime_types,
+    } = compression;
     let len = meta.len();
     let mime = guess_mime_type(candidate.to_str().unwrap_or(path));
     let content_type = mime.essence_str();
@@ -241,10 +253,13 @@ pub(crate) fn build_php_stream_response(
     status: StatusCode,
     headers: &HeaderBlob<'_>,
     body: BodyStream,
-    accept_encoding: &str,
-    min_size_bytes: usize,
-    mime_types: &[String],
+    compression: CompressionParams<'_>,
 ) -> Response<ResponseBody> {
+    let CompressionParams {
+        accept_encoding,
+        min_size_bytes,
+        mime_types,
+    } = compression;
     // The Content-Length is a size hint only - see `stream_size_gate`.
     let script = script_headers(headers);
     let builder = apply_headers(Response::builder().status(status), headers);

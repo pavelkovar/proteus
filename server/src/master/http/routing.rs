@@ -154,7 +154,7 @@ impl ActionBody {
     }
 }
 
-/// `worker_pid` is 0 and `php_target` empty for non-PHP outcomes; a real pid
+/// `worker_pid` is 0 and `php_target` `None` for non-PHP outcomes; a real pid
 /// is never 0.
 pub(crate) struct DispatchResult {
     pub(crate) action_body: ActionBody,
@@ -290,7 +290,7 @@ pub(crate) async fn dispatch_action(
                         Ok((php_request, body_cleanup)) => {
                             dispatch_php(state, php_request, body_cleanup).await
                         }
-                        Err(early_response) => early_response,
+                        Err(early_response) => *early_response,
                     },
                     None => DispatchResult::new(ActionBody::not_found(), "php-no-script", 0),
                 };

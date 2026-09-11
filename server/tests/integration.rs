@@ -124,11 +124,12 @@ fn next_port() -> u16 {
 fn merge_json(base: &mut serde_json::Value, patch: serde_json::Value) {
     if let (Some(base_map), Some(patch_map)) = (base.as_object_mut(), patch.as_object()) {
         for (k, v) in patch_map {
-            if let Some(existing) = base_map.get_mut(k) {
-                if existing.is_object() && v.is_object() {
-                    merge_json(existing, v.clone());
-                    continue;
-                }
+            if let Some(existing) = base_map.get_mut(k)
+                && existing.is_object()
+                && v.is_object()
+            {
+                merge_json(existing, v.clone());
+                continue;
             }
             base_map.insert(k.clone(), v.clone());
         }

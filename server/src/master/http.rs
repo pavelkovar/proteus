@@ -252,9 +252,9 @@ async fn handle(
     let client_ip = resolve_client_ip(peer, req.headers(), &state.config.trusted_proxies);
 
     if let Some(limiter) = &state.rate_limiter {
-        // `client_ip` is this limiter's whole identity for a client, so a
-        // `trusted_proxies` entry that forwards a client-chosen
-        // X-Forwarded-For verbatim lets that client rotate past it entirely.
+        // The residual risk the gate cannot cover: a trusted proxy that
+        // forwards a client-chosen X-Forwarded-For verbatim lets that client
+        // rotate past this limiter entirely.
         let user_agent = req
             .headers()
             .get(hyper::header::USER_AGENT)
@@ -393,14 +393,17 @@ async fn handle(
             meta,
             candidate,
         } => {
+            let compression = CompressionParams {
+                accept_encoding,
+                min_size_bytes: min_size,
+                mime_types,
+            };
             build_static_response(
                 file,
                 &meta,
                 &candidate,
                 path,
-                accept_encoding,
-                min_size,
-                mime_types,
+                compression,
                 &conditional,
                 method == Method::HEAD,
             )
@@ -410,14 +413,14 @@ async fn handle(
             status,
             headers,
             body,
-        } => build_php_stream_response(
-            status,
-            &headers,
-            body,
-            accept_encoding,
-            min_size,
-            mime_types,
-        ),
+        } => {
+            let compression = CompressionParams {
+                accept_encoding,
+                min_size_bytes: min_size,
+                mime_types,
+            };
+            build_php_stream_response(status, &headers, body, compression)
+        }
         ActionBody::Buffered {
             status,
             body,

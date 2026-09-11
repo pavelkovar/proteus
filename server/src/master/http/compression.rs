@@ -172,7 +172,7 @@ pub(crate) fn with_content_encoding(
 /// A streaming encoder. CPU-bound and blocking; never drive it from a
 /// tokio worker thread.
 enum SyncEncoder {
-    Brotli(brotli::CompressorWriter<bytes::buf::Writer<BytesMut>>),
+    Brotli(Box<brotli::CompressorWriter<bytes::buf::Writer<BytesMut>>>),
     Zstd(zstd::stream::write::Encoder<'static, bytes::buf::Writer<BytesMut>>),
     Gzip(flate2::write::GzEncoder<bytes::buf::Writer<BytesMut>>),
 }
@@ -209,12 +209,12 @@ impl SyncEncoder {
         let level = encoding.level(size_hint);
         let window_log = window_log_for(size_hint);
         match encoding {
-            Encoding::Brotli => SyncEncoder::Brotli(brotli::CompressorWriter::new(
+            Encoding::Brotli => SyncEncoder::Brotli(Box::new(brotli::CompressorWriter::new(
                 BytesMut::with_capacity(INITIAL_SINK_CAPACITY).writer(),
                 4096,
                 level as u32,
                 window_log,
-            )),
+            ))),
             Encoding::Zstd => {
                 let mut enc = zstd::stream::write::Encoder::new(
                     BytesMut::with_capacity(INITIAL_SINK_CAPACITY).writer(),
