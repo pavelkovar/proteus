@@ -30,7 +30,9 @@ fn substitute_env(text: &str) -> Result<String, String> {
             (Ok(v), _) => v,
             (Err(_), Some(default)) => default.to_string(),
             (Err(_), None) => {
-                return Err(format!("environment variable {name:?} is not set (referenced as \"${{{body}}}\" in config)"))
+                return Err(format!(
+                    "environment variable {name:?} is not set (referenced as \"${{{body}}}\" in config)"
+                ));
             }
         };
         out.push_str(&value);
@@ -174,10 +176,14 @@ pub enum RouteActionConfig {
         fallback: Option<Box<RouteActionConfig>>,
     },
 
-    Php { target: Arc<str> },
+    Php {
+        target: Arc<str>,
+    },
     /// Bare status, no body. `u16` so a bad value fails `validate` with a
     /// real message rather than a byte-offset parse error.
-    Return { status: u16 },
+    Return {
+        status: u16,
+    },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -197,7 +203,9 @@ pub struct RouteMatch {
 
 impl RouteMatch {
     pub(crate) fn matches(&self, path: &str, method: &str, host: &str) -> bool {
-        matches_any(&self.uri, path) && matches_any(&self.method, method) && matches_any(&self.host, host)
+        matches_any(&self.uri, path)
+            && matches_any(&self.method, method)
+            && matches_any(&self.host, host)
     }
 }
 
@@ -228,7 +236,12 @@ pub enum MatchPattern {
     /// Matches anything.
     Any,
     /// `min_length` lets a short value be rejected in O(1).
-    Glob { leading: bool, trailing: bool, parts: Vec<String>, min_length: usize },
+    Glob {
+        leading: bool,
+        trailing: bool,
+        parts: Vec<String>,
+        min_length: usize,
+    },
     Regex(regex::Regex),
     Not(Box<MatchPattern>),
 }
@@ -240,7 +253,12 @@ impl MatchPattern {
             MatchPattern::Any => true,
             MatchPattern::Regex(re) => re.is_match(value),
             MatchPattern::Not(inner) => !inner.matches(value),
-            MatchPattern::Glob { leading, trailing, parts, min_length } => {
+            MatchPattern::Glob {
+                leading,
+                trailing,
+                parts,
+                min_length,
+            } => {
                 if value.len() < *min_length {
                     return false;
                 }
@@ -276,7 +294,8 @@ impl TryFrom<String> for MatchPattern {
             return Err("empty match pattern (use \"*\" to match everything)".to_string());
         }
         if let Some(rest) = s.strip_prefix('!') {
-            return MatchPattern::try_from(rest.to_string()).map(|p| MatchPattern::Not(Box::new(p)));
+            return MatchPattern::try_from(rest.to_string())
+                .map(|p| MatchPattern::Not(Box::new(p)));
         }
         if let Some(pattern) = s.strip_prefix('~') {
             // ASCII-only, which drops the sizeable `unicode-*` features from
@@ -295,9 +314,18 @@ impl TryFrom<String> for MatchPattern {
         }
         let leading = s.starts_with('*');
         let trailing = s.ends_with('*');
-        let parts: Vec<String> = s.split('*').filter(|p| !p.is_empty()).map(String::from).collect();
+        let parts: Vec<String> = s
+            .split('*')
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect();
         let min_length = parts.iter().map(String::len).sum();
-        Ok(MatchPattern::Glob { leading, trailing, parts, min_length })
+        Ok(MatchPattern::Glob {
+            leading,
+            trailing,
+            parts,
+            min_length,
+        })
     }
 }
 
@@ -306,7 +334,9 @@ impl<'de> Deserialize<'de> for MatchPattern {
     where
         D: serde::Deserializer<'de>,
     {
-        String::deserialize(deserializer)?.try_into().map_err(serde::de::Error::custom)
+        String::deserialize(deserializer)?
+            .try_into()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -415,7 +445,10 @@ fn default_queue_timeout() -> u64 {
 
 impl Default for QueueConfig {
     fn default() -> Self {
-        QueueConfig { max_depth: default_queue_max_depth(), timeout: default_queue_timeout() }
+        QueueConfig {
+            max_depth: default_queue_max_depth(),
+            timeout: default_queue_timeout(),
+        }
     }
 }
 
@@ -435,7 +468,9 @@ fn default_shutdown_grace_period_seconds() -> u64 {
 // present and the field missing, not when the whole object is absent.
 impl Default for ShutdownConfig {
     fn default() -> Self {
-        ShutdownConfig { grace_period_seconds: default_shutdown_grace_period_seconds() }
+        ShutdownConfig {
+            grace_period_seconds: default_shutdown_grace_period_seconds(),
+        }
     }
 }
 
@@ -517,7 +552,10 @@ pub struct FsCacheConfig {
 
 impl Default for FsCacheConfig {
     fn default() -> Self {
-        FsCacheConfig { ttl_ms: default_fs_cache_ttl_ms(), max_entries: default_fs_cache_max_entries() }
+        FsCacheConfig {
+            ttl_ms: default_fs_cache_ttl_ms(),
+            max_entries: default_fs_cache_max_entries(),
+        }
     }
 }
 
@@ -543,7 +581,10 @@ pub fn validate(cfg: &Config) -> Vec<String> {
     }
     // 0 here times out immediately rather than disabling.
     if cfg.php.limits.timeout == 0 {
-        errors.push("php.limits.timeout must be at least 1 (0 would time out every request immediately)".to_string());
+        errors.push(
+            "php.limits.timeout must be at least 1 (0 would time out every request immediately)"
+                .to_string(),
+        );
     }
     if cfg.php.limits.requests == 0 {
         errors.push("php.limits.requests must be at least 1 (0 would recycle every worker after its first request)".to_string());
@@ -556,7 +597,10 @@ pub fn validate(cfg: &Config) -> Vec<String> {
         );
     }
     if cfg.php.queue.timeout == 0 {
-        errors.push("php.queue.timeout must be at least 1 (0 would time out every request immediately)".to_string());
+        errors.push(
+            "php.queue.timeout must be at least 1 (0 would time out every request immediately)"
+                .to_string(),
+        );
     }
     if cfg.connection.header_read_timeout == 0 {
         errors.push(
@@ -574,7 +618,9 @@ pub fn validate(cfg: &Config) -> Vec<String> {
             errors.push("rate_limit.requests must be at least 1 (0 would reject every matching request immediately)".to_string());
         }
         if rate_limit.period_seconds == 0 {
-            errors.push("rate_limit.period_seconds must be at least 1 (0 would never refill)".to_string());
+            errors.push(
+                "rate_limit.period_seconds must be at least 1 (0 would never refill)".to_string(),
+            );
         }
     }
     for net in &cfg.trusted_proxies {
@@ -593,18 +639,29 @@ pub fn validate(cfg: &Config) -> Vec<String> {
 }
 
 /// A target may be named at any depth of a `fallback` chain.
-fn validate_action(action: &RouteActionConfig, targets: &HashMap<String, Target>, errors: &mut Vec<String>) {
+fn validate_action(
+    action: &RouteActionConfig,
+    targets: &HashMap<String, Target>,
+    errors: &mut Vec<String>,
+) {
     match action {
         RouteActionConfig::Php { target } => {
             if !targets.contains_key(&**target) {
-                errors.push(format!("route target {target:?} is not defined in php.targets"));
+                errors.push(format!(
+                    "route target {target:?} is not defined in php.targets"
+                ));
             }
         }
-        RouteActionConfig::Static { fallback: Some(next), .. } => validate_action(next, targets, errors),
+        RouteActionConfig::Static {
+            fallback: Some(next),
+            ..
+        } => validate_action(next, targets, errors),
         RouteActionConfig::Static { fallback: None, .. } => {}
         RouteActionConfig::Return { status } => {
             if hyper::StatusCode::from_u16(*status).is_err() {
-                errors.push(format!("route return status {status} is not a valid HTTP status code (100-999)"));
+                errors.push(format!(
+                    "route return status {status} is not a valid HTTP status code (100-999)"
+                ));
             }
         }
     }

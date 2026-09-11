@@ -60,8 +60,17 @@ impl Bucket {
             let credited = refilled - tokens as u64;
             let spent = (credited as u128 * period_secs as u128 / capacity as u128) as u64;
             let new_last_secs = last_secs + spent;
-            let (new_tokens, allowed) = if refilled >= 1 { (refilled as u32 - 1, true) } else { (0, false) };
-            match self.0.compare_exchange_weak(current, pack(new_last_secs, new_tokens), Relaxed, Relaxed) {
+            let (new_tokens, allowed) = if refilled >= 1 {
+                (refilled as u32 - 1, true)
+            } else {
+                (0, false)
+            };
+            match self.0.compare_exchange_weak(
+                current,
+                pack(new_last_secs, new_tokens),
+                Relaxed,
+                Relaxed,
+            ) {
                 Ok(_) => return allowed,
                 Err(actual) => current = actual,
             }
@@ -95,15 +104,32 @@ impl RateLimiter {
     /// Real construction path; `new` fixes the tracking cap to the
     /// production constant, tests exercise a small cap directly so the
     /// eviction-when-full path is reachable without filling 64K IPs.
-    fn with_shape(requests: u32, period_seconds: u64, user_agent: Vec<MatchPattern>, max_tracked: usize) -> Self {
+    fn with_shape(
+        requests: u32,
+        period_seconds: u64,
+        user_agent: Vec<MatchPattern>,
+        max_tracked: usize,
+    ) -> Self {
         // Above this the burst count no longer fits TOKEN_BITS - an encoding
         // limit, not a policy one, so clamped rather than rejected, but
         // logged since the configured value is then not what's enforced.
         let capacity = requests.min(TOKEN_MASK as u32);
         if capacity != requests {
-            tracing::warn!(r#type = "controller", requests, capacity, "rate_limit.requests exceeds the encodable maximum, clamped");
+            tracing::warn!(
+                r#type = "controller",
+                requests,
+                capacity,
+                "rate_limit.requests exceeds the encodable maximum, clamped"
+            );
         }
-        RateLimiter { map: BoundedMap::new(), epoch: Instant::now(), capacity, period_secs: period_seconds, user_agent, max_tracked: max_tracked.max(1) }
+        RateLimiter {
+            map: BoundedMap::new(),
+            epoch: Instant::now(),
+            capacity,
+            period_secs: period_seconds,
+            user_agent,
+            max_tracked: max_tracked.max(1),
+        }
     }
 
     /// Whether `user_agent` is subject to this limiter at all, checked
@@ -133,7 +159,9 @@ impl RateLimiter {
         // Rare path: first sighting of this client (or it was swept below).
         // Fails open rather than evicting a client actively being limited
         // if the table is still full even after sweeping idle entries.
-        if !self.map.has_room_for(&client, self.max_tracked, |bucket| bucket.is_full(now_secs, self.capacity, self.period_secs)) {
+        if !self.map.has_room_for(&client, self.max_tracked, |bucket| {
+            bucket.is_full(now_secs, self.capacity, self.period_secs)
+        }) {
             return true;
         }
         self.map

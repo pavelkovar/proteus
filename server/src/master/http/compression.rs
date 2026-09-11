@@ -5,8 +5,8 @@ use bytes::{BufMut as _, Bytes, BytesMut};
 use http_body::Frame;
 use http_body_util::{BodyExt, StreamBody};
 use std::io::Write as _;
-use tokio_stream::{Stream, StreamExt as _};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{Stream, StreamExt as _};
 
 /// Caps how much of a bursty `source` is folded into one encode round
 /// trip, trading total-time overhead against time-to-first-byte.
@@ -100,7 +100,12 @@ impl AcceptedEncodings {
 /// Whether a body may be compressed at all, independent of what the client
 /// accepts - so it can also answer whether to send `Vary: Accept-Encoding`.
 /// An empty `mime_types` means no restriction.
-pub(crate) fn compression_eligible(body_len: usize, min_size_bytes: usize, content_type: &str, mime_types: &[String]) -> bool {
+pub(crate) fn compression_eligible(
+    body_len: usize,
+    min_size_bytes: usize,
+    content_type: &str,
+    mime_types: &[String],
+) -> bool {
     if body_len < min_size_bytes {
         return false;
     }
@@ -128,12 +133,17 @@ pub(crate) fn pick_encoding(
 /// Picks the server's most-preferred acceptable coding - a server-side
 /// priority list gated by client vetoes, not the client's highest `q`.
 /// Takes `eligible` already computed, since `Vary` needs the same answer.
-pub(crate) fn pick_encoding_when_eligible(eligible: bool, accept_encoding: &str) -> Option<Encoding> {
+pub(crate) fn pick_encoding_when_eligible(
+    eligible: bool,
+    accept_encoding: &str,
+) -> Option<Encoding> {
     if !eligible {
         return None;
     }
     let accepted = AcceptedEncodings::parse(accept_encoding);
-    [Encoding::Zstd, Encoding::Brotli, Encoding::Gzip].into_iter().find(|&e| accepted.accepts(e))
+    [Encoding::Zstd, Encoding::Brotli, Encoding::Gzip]
+        .into_iter()
+        .find(|&e| accepted.accepts(e))
 }
 
 /// The `(body_len, min_size_bytes)` pair to gate a streamed response on.
@@ -142,14 +152,20 @@ pub(crate) fn pick_encoding_when_eligible(eligible: bool, accept_encoding: &str)
 /// buffered for, since finding the size out would cost time-to-first-byte.
 /// `declared_len` is a hint only: never used for framing, so a wrong value
 /// can mis-pick compression but cannot corrupt the response.
-pub(crate) fn stream_size_gate(declared_len: Option<usize>, min_size_bytes: usize) -> (usize, usize) {
+pub(crate) fn stream_size_gate(
+    declared_len: Option<usize>,
+    min_size_bytes: usize,
+) -> (usize, usize) {
     match declared_len {
         Some(len) => (len, min_size_bytes),
         None => (usize::MAX, 0),
     }
 }
 
-pub(crate) fn with_content_encoding(builder: hyper::http::response::Builder, encoding: Encoding) -> hyper::http::response::Builder {
+pub(crate) fn with_content_encoding(
+    builder: hyper::http::response::Builder,
+    encoding: Encoding,
+) -> hyper::http::response::Builder {
     builder.header(hyper::header::CONTENT_ENCODING, encoding.header_value())
 }
 
@@ -200,8 +216,11 @@ impl SyncEncoder {
                 window_log,
             )),
             Encoding::Zstd => {
-                let mut enc = zstd::stream::write::Encoder::new(BytesMut::with_capacity(INITIAL_SINK_CAPACITY).writer(), level)
-                    .expect("zstd encoder init is infallible for an in-memory sink");
+                let mut enc = zstd::stream::write::Encoder::new(
+                    BytesMut::with_capacity(INITIAL_SINK_CAPACITY).writer(),
+                    level,
+                )
+                .expect("zstd encoder init is infallible for an in-memory sink");
                 enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
                     .expect("WindowLog is a valid zstd parameter at this encoder stage");
                 SyncEncoder::Zstd(enc)
@@ -268,7 +287,11 @@ fn poll_next_now<S: Stream<Item = std::io::Result<Bytes>>>(
 /// may itself need the blocking pool, and a slow client would pin the
 /// thread for the length of the download - together enough to starve the
 /// pool for every other user in the process.
-pub(crate) fn compressed_body<S>(source: S, encoding: Encoding, size_hint: Option<u64>) -> ResponseBody
+pub(crate) fn compressed_body<S>(
+    source: S,
+    encoding: Encoding,
+    size_hint: Option<u64>,
+) -> ResponseBody
 where
     S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
 {
@@ -320,7 +343,10 @@ where
                 let produced = encoder.flush_and_drain()?;
                 Ok((encoder, produced))
             };
-            match tokio::task::spawn_blocking(encode).await.expect("compression task panicked") {
+            match tokio::task::spawn_blocking(encode)
+                .await
+                .expect("compression task panicked")
+            {
                 Ok((enc, produced)) => {
                     encoder = enc;
                     if !produced.is_empty() && out_tx.send(Ok(produced)).await.is_err() {
@@ -338,7 +364,10 @@ where
             }
         }
 
-        match tokio::task::spawn_blocking(move || encoder.finish()).await.expect("compression task panicked") {
+        match tokio::task::spawn_blocking(move || encoder.finish())
+            .await
+            .expect("compression task panicked")
+        {
             Ok(tail) if !tail.is_empty() => {
                 let _ = out_tx.send(Ok(tail)).await;
             }

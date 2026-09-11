@@ -2,7 +2,7 @@
 //! cross this boundary.
 
 use crate::ipc::data::{HeaderBlob, PhpRequest, RequestBody};
-use libloading::os::unix::{Library, Symbol, RTLD_GLOBAL, RTLD_NOW};
+use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW, Symbol};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
@@ -16,7 +16,10 @@ struct CgiVarBuf {
 
 impl CgiVarBuf {
     fn with_capacity(byte_capacity: usize) -> Self {
-        CgiVarBuf { buf: Vec::with_capacity(byte_capacity), offsets: Vec::new() }
+        CgiVarBuf {
+            buf: Vec::with_capacity(byte_capacity),
+            offsets: Vec::new(),
+        }
     }
 
     /// Takes `fmt::Arguments` so a value needing formatting still writes
@@ -25,7 +28,9 @@ impl CgiVarBuf {
         let start = self.buf.len();
         self.buf.extend_from_slice(key.as_bytes());
         self.buf.push(b'=');
-        self.buf.write_fmt(value).expect("Vec<u8> writes are infallible");
+        self.buf
+            .write_fmt(value)
+            .expect("Vec<u8> writes are infallible");
         self.finish_entry(start);
     }
 
@@ -51,7 +56,10 @@ impl CgiVarBuf {
 
     /// Invalidated by the next `push`, which may reallocate.
     fn pointers(&self) -> Vec<*const c_char> {
-        self.offsets.iter().map(|&off| unsafe { self.buf.as_ptr().add(off).cast() }).collect()
+        self.offsets
+            .iter()
+            .map(|&off| unsafe { self.buf.as_ptr().add(off).cast() })
+            .collect()
     }
 }
 
@@ -63,11 +71,11 @@ struct CPhpRequest {
     content_type: *const c_char, // may be null
     extra_vars: *const *const c_char,
     extra_var_count: c_ulong,
-    body: *const c_char,           // null if body_file_path is set instead
+    body: *const c_char, // null if body_file_path is set instead
     body_len: c_ulong,
     body_file_path: *const c_char, // null if body/body_len are used instead
-    cookie_header: *const c_char, // may be null
-    authorization: *const c_char, // may be null
+    cookie_header: *const c_char,  // may be null
+    authorization: *const c_char,  // may be null
 }
 
 /// Matches `proteus_php_mod_chunk_kind` in the C header.
@@ -79,22 +87,20 @@ const PROTEUS_PHP_MOD_CHUNK_END: c_int = 3;
 /// `Body`, then exactly one `End`. Borrows C scratch buffers, so it is valid
 /// only for the duration of the callback receiving it.
 pub enum PhpChunk<'a> {
-    Headers { status: u16, headers: HeaderBlob<'static> },
+    Headers {
+        status: u16,
+        headers: HeaderBlob<'static>,
+    },
     Body(&'a [u8]),
     End,
 }
 
 /// Matches `proteus_php_mod_chunk_fn` in the C header. `data` is valid only
 /// for the duration of the call.
-type ChunkFn =
-    unsafe extern "C" fn(c_int, c_int, *const c_char, c_ulong, *mut c_void);
+type ChunkFn = unsafe extern "C" fn(c_int, c_int, *const c_char, c_ulong, *mut c_void);
 
-type InitFn = unsafe extern "C" fn(
-    *const *const c_char,
-    c_ulong,
-    *const *const c_char,
-    c_ulong,
-) -> c_int;
+type InitFn =
+    unsafe extern "C" fn(*const *const c_char, c_ulong, *const *const c_char, c_ulong) -> c_int;
 type ExecuteFileFn = unsafe extern "C" fn(
     *const c_char,
     *const CPhpRequest,
@@ -194,7 +200,11 @@ impl PhpRequestFfi {
         // is a server-generated temp filename (php_dispatch.rs), never NUL.
         let mut c_body_path = None;
         let (body_ptr, body_len, body_file_path_ptr) = match &req.body {
-            RequestBody::Inline(bytes) => (bytes.as_ptr() as *const c_char, bytes.len() as c_ulong, std::ptr::null()),
+            RequestBody::Inline(bytes) => (
+                bytes.as_ptr() as *const c_char,
+                bytes.len() as c_ulong,
+                std::ptr::null(),
+            ),
             RequestBody::File { path, len } => {
                 let p = CString::new(path.as_ref()).unwrap_or_default();
                 let ptr = p.as_ptr();
@@ -207,14 +217,18 @@ impl PhpRequestFfi {
             method: c_method.as_ptr(),
             uri: c_uri.as_ptr(),
             query_string: c_query.as_ptr(),
-            content_type: c_content_type.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            content_type: c_content_type
+                .as_ref()
+                .map_or(std::ptr::null(), |s| s.as_ptr()),
             extra_vars: extra_var_ptrs.as_ptr(),
             extra_var_count: extra_var_ptrs.len() as c_ulong,
             body: body_ptr,
             body_len,
             body_file_path: body_file_path_ptr,
             cookie_header: c_cookie.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
-            authorization: c_authorization.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            authorization: c_authorization
+                .as_ref()
+                .map_or(std::ptr::null(), |s| s.as_ptr()),
         };
 
         PhpRequestFfi {
@@ -237,7 +251,11 @@ impl PhpRequestFfi {
 fn cstrings_or_err(entries: &[String]) -> std::io::Result<Vec<CString>> {
     entries
         .iter()
-        .map(|e| CString::new(e.as_str()).map_err(|_| std::io::Error::other(format!("php option {e:?} contains an embedded NUL byte"))))
+        .map(|e| {
+            CString::new(e.as_str()).map_err(|_| {
+                std::io::Error::other(format!("php option {e:?} contains an embedded NUL byte"))
+            })
+        })
         .collect()
 }
 
@@ -247,14 +265,17 @@ impl PhpConn {
     /// fail with undefined symbols.
     pub fn load(path: &str) -> std::io::Result<Self> {
         let to_io_err = |e: libloading::Error| std::io::Error::other(e.to_string());
-        let lib = unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map_err(to_io_err)?;
+        let lib =
+            unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map_err(to_io_err)?;
         // Deliberately leaked: held for the whole process lifetime, so there
         // is no earlier point at which unloading would be correct.
         let lib: &'static Library = Box::leak(Box::new(lib));
         unsafe {
             Ok(PhpConn {
                 init: lib.get(b"proteus_php_mod_init").map_err(to_io_err)?,
-                execute_file: lib.get(b"proteus_php_mod_execute_file").map_err(to_io_err)?,
+                execute_file: lib
+                    .get(b"proteus_php_mod_execute_file")
+                    .map_err(to_io_err)?,
             })
         }
     }
@@ -284,11 +305,19 @@ impl PhpConn {
     /// Runs one script, with its own request startup/shutdown pair, and is
     /// safe to call repeatedly. `on_chunk` fires synchronously and nothing is
     /// buffered.
-    pub fn execute_file(&self, script_path: &str, req: &PhpRequest<'_>, on_chunk: &mut dyn FnMut(PhpChunk)) -> ExecuteResult {
+    pub fn execute_file(
+        &self,
+        script_path: &str,
+        req: &PhpRequest<'_>,
+        on_chunk: &mut dyn FnMut(PhpChunk),
+    ) -> ExecuteResult {
         // Unreachable through hyper, but a panic on request-derived data
         // would take the whole worker down rather than failing one request.
         let Ok(c_path) = CString::new(script_path) else {
-            on_chunk(PhpChunk::Headers { status: 500, headers: HeaderBlob::default() });
+            on_chunk(PhpChunk::Headers {
+                status: 500,
+                headers: HeaderBlob::default(),
+            });
             on_chunk(PhpChunk::End);
             return ExecuteResult { early_sent: false };
         };
@@ -303,18 +332,29 @@ impl PhpConn {
 
         let mut out_early_sent: c_int = 0;
         let rc = unsafe {
-            (self.execute_file)(c_path.as_ptr(), &ffi.c_req, Some(chunk_trampoline), cb_user_data, &mut out_early_sent)
+            (self.execute_file)(
+                c_path.as_ptr(),
+                &ffi.c_req,
+                Some(chunk_trampoline),
+                cb_user_data,
+                &mut out_early_sent,
+            )
         };
 
         if rc != 0 {
             // request_startup() failed, so the callback never fired;
             // synthesize a response rather than emitting no chunks at all.
-            on_chunk(PhpChunk::Headers { status: 500, headers: HeaderBlob::default() });
+            on_chunk(PhpChunk::Headers {
+                status: 500,
+                headers: HeaderBlob::default(),
+            });
             on_chunk(PhpChunk::End);
             return ExecuteResult { early_sent: false };
         }
 
-        ExecuteResult { early_sent: out_early_sent != 0 }
+        ExecuteResult {
+            early_sent: out_early_sent != 0,
+        }
     }
 }
 
@@ -339,7 +379,10 @@ unsafe extern "C" fn chunk_trampoline(
         unsafe { std::slice::from_raw_parts(data as *const u8, data_len as usize) }
     };
     if kind == PROTEUS_PHP_MOD_CHUNK_HEADERS {
-        cb(PhpChunk::Headers { status: status.clamp(100, 599) as u16, headers: parse_headers(bytes) });
+        cb(PhpChunk::Headers {
+            status: status.clamp(100, 599) as u16,
+            headers: parse_headers(bytes),
+        });
     } else if kind == PROTEUS_PHP_MOD_CHUNK_BODY {
         cb(PhpChunk::Body(bytes));
     } else if kind == PROTEUS_PHP_MOD_CHUNK_END {
@@ -349,7 +392,11 @@ unsafe extern "C" fn chunk_trampoline(
         // means an ABI mismatch, not a normal event. Dropped rather than
         // guessed as `End`; the request_timeout watchdog kills the worker
         // once the sequence never completes.
-        tracing::error!(r#type = "prototype", kind, "php-mod sent an unrecognized chunk kind, dropping it");
+        tracing::error!(
+            r#type = "prototype",
+            kind,
+            "php-mod sent an unrecognized chunk kind, dropping it"
+        );
     }
 }
 

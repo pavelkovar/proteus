@@ -28,8 +28,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -53,8 +53,18 @@ impl AppState {
         let uses_host_matching = config.routes.iter().any(|r| !r.matcher.host.is_empty());
         // Taken rather than cloned: nothing else needs `config.rate_limit`
         // once it has become `state.rate_limiter`.
-        let rate_limiter = config.rate_limit.take().map(|rl| RateLimiter::new(rl.requests, rl.period_seconds, rl.user_agent));
-        AppState { pool, config, in_flight: AtomicU64::new(0), fs_cache, uses_host_matching, rate_limiter }
+        let rate_limiter = config
+            .rate_limit
+            .take()
+            .map(|rl| RateLimiter::new(rl.requests, rl.period_seconds, rl.user_agent));
+        AppState {
+            pool,
+            config,
+            in_flight: AtomicU64::new(0),
+            fs_cache,
+            uses_host_matching,
+            rate_limiter,
+        }
     }
 }
 
@@ -96,7 +106,6 @@ impl Drop for ConnBusyGuard {
         self.0.request_finished();
     }
 }
-
 
 type ResponseBody = BoxBody<Bytes, std::io::Error>;
 
@@ -210,7 +219,16 @@ fn early_reject(
     in_flight: InFlightGuard,
     conn_busy: ConnBusyGuard,
 ) -> Result<Response<ResponseBody>, std::convert::Infallible> {
-    Ok(resp.map(|inner| GuardedBody { inner, _guard: in_flight, _conn: conn_busy, log: Some(log), outcome: BodyOutcome::Complete }.boxed()))
+    Ok(resp.map(|inner| {
+        GuardedBody {
+            inner,
+            _guard: in_flight,
+            _conn: conn_busy,
+            log: Some(log),
+            outcome: BodyOutcome::Complete,
+        }
+        .boxed()
+    }))
 }
 
 async fn handle(
@@ -237,16 +255,35 @@ async fn handle(
         // `client_ip` is this limiter's whole identity for a client, so a
         // `trusted_proxies` entry that forwards a client-chosen
         // X-Forwarded-For verbatim lets that client rotate past it entirely.
-        let user_agent = req.headers().get(hyper::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let user_agent = req
+            .headers()
+            .get(hyper::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         if limiter.should_limit(user_agent) && !limiter.check(client_ip) {
-            let mut resp = build_response(StatusCode::TOO_MANY_REQUESTS, b"429 too many requests\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
+            let mut resp = build_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                b"429 too many requests\n".to_vec(),
+                &crate::ipc::data::HeaderBlob::default(),
+            );
             // A fixed value from config rather than the bucket's own precise
             // refill time: simple, and accurate enough for clients that
             // honor it.
-            if let Ok(value) = hyper::header::HeaderValue::from_str(&limiter.period_seconds().to_string()) {
+            if let Ok(value) =
+                hyper::header::HeaderValue::from_str(&limiter.period_seconds().to_string())
+            {
                 resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
             }
-            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rate-limited", worker_pid: 0, php_target: None };
+            let log = PendingAccessLog {
+                client_ip,
+                method,
+                uri,
+                status: resp.status(),
+                start,
+                action: "rate-limited",
+                worker_pid: 0,
+                php_target: None,
+            };
             return early_reject(resp, log, in_flight, conn_busy);
         }
     }
@@ -256,47 +293,106 @@ async fn handle(
     let decoded_path = match percent_decode_path(uri.path()) {
         Ok(path) => path,
         Err(reason) => {
-            let resp = build_response(StatusCode::BAD_REQUEST, b"400 invalid path\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
-            tracing::debug!(r#type = "controller", ?reason, raw_path = uri.path(), "rejected an undecodable request path");
-            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: None };
+            let resp = build_response(
+                StatusCode::BAD_REQUEST,
+                b"400 invalid path\n".to_vec(),
+                &crate::ipc::data::HeaderBlob::default(),
+            );
+            tracing::debug!(
+                r#type = "controller",
+                ?reason,
+                raw_path = uri.path(),
+                "rejected an undecodable request path"
+            );
+            let log = PendingAccessLog {
+                client_ip,
+                method,
+                uri,
+                status: resp.status(),
+                start,
+                action: "rejected",
+                worker_pid: 0,
+                php_target: None,
+            };
             return early_reject(resp, log, in_flight, conn_busy);
         }
     };
     let path = decoded_path.as_ref();
     // Shares the buffer rather than copying the string out.
     let accept_encoding = req.headers().get(hyper::header::ACCEPT_ENCODING).cloned();
-    let accept_encoding = accept_encoding.as_ref().and_then(|v| v.to_str().ok()).unwrap_or("");
+    let accept_encoding = accept_encoding
+        .as_ref()
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
     let min_size = state.config.compression.min_size_bytes;
 
     // Skipped unless some route matches on it.
     let host_for_matching = if state.uses_host_matching {
-        resolve_server_name_port(req.headers(), is_trusted_peer, listen_addr).0.to_ascii_lowercase()
+        resolve_server_name_port(req.headers(), is_trusted_peer, listen_addr)
+            .0
+            .to_ascii_lowercase()
     } else {
         String::new()
     };
     let decision = match_route(&state.config, path, method.as_str(), &host_for_matching);
     // Only Static consults these.
-    let is_static_route = matches!(&decision, RouteDecision::Matched { action: RouteActionConfig::Static { .. }, .. });
-    let conditional = if is_static_route { ConditionalHeaders::from_headers(req.headers()) } else { ConditionalHeaders::default() };
+    let is_static_route = matches!(
+        &decision,
+        RouteDecision::Matched {
+            action: RouteActionConfig::Static { .. },
+            ..
+        }
+    );
+    let conditional = if is_static_route {
+        ConditionalHeaders::from_headers(req.headers())
+    } else {
+        ConditionalHeaders::default()
+    };
 
     let mime_types = &state.config.compression.mime_types;
 
     // Once, before any routing, rather than per match arm: a new arm added
     // without repeating the check would silently admit traversal.
     if path_escapes_root(path) {
-        let resp = build_response(StatusCode::BAD_REQUEST, b"400 invalid path\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
-        let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: None };
+        let resp = build_response(
+            StatusCode::BAD_REQUEST,
+            b"400 invalid path\n".to_vec(),
+            &crate::ipc::data::HeaderBlob::default(),
+        );
+        let log = PendingAccessLog {
+            client_ip,
+            method,
+            uri,
+            status: resp.status(),
+            start,
+            action: "rejected",
+            worker_pid: 0,
+            php_target: None,
+        };
         return early_reject(resp, log, in_flight, conn_busy);
     }
 
-    let ctx = RequestContext { client_ip, listen_addr, is_trusted_peer };
-    let DispatchResult { action_body, log_action, worker_pid, php_target } = match decision {
+    let ctx = RequestContext {
+        client_ip,
+        listen_addr,
+        is_trusted_peer,
+    };
+    let DispatchResult {
+        action_body,
+        log_action,
+        worker_pid,
+        php_target,
+    } = match decision {
         RouteDecision::Matched { action } => dispatch_action(&state, action, req, path, ctx).await,
         RouteDecision::NoMatch => DispatchResult::new(ActionBody::not_found(), "none", 0),
     };
 
     let resp = match action_body {
-        ActionBody::StaticFile { file, meta, candidate } => {
+        ActionBody::StaticFile {
+            file,
+            meta,
+            candidate,
+        } => {
             build_static_response(
                 file,
                 &meta,
@@ -310,10 +406,23 @@ async fn handle(
             )
             .await
         }
-        ActionBody::PhpStream { status, headers, body } => {
-            build_php_stream_response(status, &headers, body, accept_encoding, min_size, mime_types)
-        }
-        ActionBody::Buffered { status, body, headers } => build_response(status, body, &headers),
+        ActionBody::PhpStream {
+            status,
+            headers,
+            body,
+        } => build_php_stream_response(
+            status,
+            &headers,
+            body,
+            accept_encoding,
+            min_size,
+            mime_types,
+        ),
+        ActionBody::Buffered {
+            status,
+            body,
+            headers,
+        } => build_response(status, body, &headers),
     };
     let log = PendingAccessLog {
         client_ip,
@@ -328,7 +437,14 @@ async fn handle(
     // `Aborted` until proven otherwise, so a body dropped before its end
     // records the client hanging up.
     Ok(resp.map(|inner| {
-        GuardedBody { inner, _guard: in_flight, _conn: conn_busy, log: Some(log), outcome: BodyOutcome::Aborted }.boxed()
+        GuardedBody {
+            inner,
+            _guard: in_flight,
+            _conn: conn_busy,
+            log: Some(log),
+            outcome: BodyOutcome::Aborted,
+        }
+        .boxed()
     }))
 }
 
@@ -348,7 +464,11 @@ struct ConnState {
 
 impl ConnState {
     fn new() -> Self {
-        ConnState { in_flight: AtomicU64::new(0), last_finished_ms: AtomicU64::new(0), epoch: Instant::now() }
+        ConnState {
+            in_flight: AtomicU64::new(0),
+            last_finished_ms: AtomicU64::new(0),
+            epoch: Instant::now(),
+        }
     }
 
     fn request_started(&self) {
@@ -356,7 +476,8 @@ impl ConnState {
     }
 
     fn request_finished(&self) {
-        self.last_finished_ms.store(self.epoch.elapsed().as_millis() as u64, Relaxed);
+        self.last_finished_ms
+            .store(self.epoch.elapsed().as_millis() as u64, Relaxed);
         self.in_flight.fetch_sub(1, Relaxed);
     }
 
@@ -398,8 +519,11 @@ fn set_nodelay_or_log(stream: &TcpStream) {
 
 /// Deliberately a separate listener from public traffic.
 async fn serve_status(listen: String, state: Arc<AppState>) {
-    let header_read_timeout = std::time::Duration::from_secs(state.config.connection.header_read_timeout);
-    let listener = TcpListener::bind(&listen).await.expect("status bind failed");
+    let header_read_timeout =
+        std::time::Duration::from_secs(state.config.connection.header_read_timeout);
+    let listener = TcpListener::bind(&listen)
+        .await
+        .expect("status bind failed");
     tracing::info!(r#type = "controller", %listen, "status endpoint listening");
     loop {
         let (stream, _peer) = match listener.accept().await {
@@ -437,7 +561,7 @@ async fn serve_status(listen: String, state: Arc<AppState>) {
 /// SIGTERM (systemd/docker/k8s graceful stop) or SIGINT (Ctrl-C) - same
 /// drain either way.
 async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     tokio::select! {
@@ -457,9 +581,13 @@ pub async fn serve(state: Arc<AppState>) {
     // Zero means no cap, expressed as a huge permit count so the acquire
     // path stays branchless.
     let conn_cap = state.config.connection.max;
-    let connection_slots =
-        Arc::new(tokio::sync::Semaphore::new(if conn_cap == 0 { tokio::sync::Semaphore::MAX_PERMITS } else { conn_cap }));
-    let header_read_timeout = std::time::Duration::from_secs(state.config.connection.header_read_timeout);
+    let connection_slots = Arc::new(tokio::sync::Semaphore::new(if conn_cap == 0 {
+        tokio::sync::Semaphore::MAX_PERMITS
+    } else {
+        conn_cap
+    }));
+    let header_read_timeout =
+        std::time::Duration::from_secs(state.config.connection.header_read_timeout);
     let idle_timeout = std::time::Duration::from_secs(state.config.connection.idle_timeout);
 
     for listen in &state.config.listen {
@@ -509,13 +637,15 @@ pub async fn serve(state: Arc<AppState>) {
                             async move { handle(req, state, peer_identity, &listen_addr, conn).await }
                         })
                     };
-                    let mut connection = std::pin::pin!(hyper::server::conn::http1::Builder::new()
-                        // hyper is runtime-agnostic: without a timer
-                        // installed, any timeout it is asked to honour panics
-                        // the connection task rather than being ignored.
-                        .timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(header_read_timeout)
-                        .serve_connection(io, service));
+                    let mut connection = std::pin::pin!(
+                        hyper::server::conn::http1::Builder::new()
+                            // hyper is runtime-agnostic: without a timer
+                            // installed, any timeout it is asked to honour panics
+                            // the connection task rather than being ignored.
+                            .timer(hyper_util::rt::TokioTimer::new())
+                            .header_read_timeout(header_read_timeout)
+                            .serve_connection(io, service)
+                    );
                     let result = if idle_timeout.is_zero() {
                         connection.as_mut().await
                     } else {
@@ -541,7 +671,8 @@ pub async fn serve(state: Arc<AppState>) {
     shutdown.notify_waiters();
 
     // 0 exits immediately.
-    let grace_period = std::time::Duration::from_secs(state.config.php.shutdown.grace_period_seconds);
+    let grace_period =
+        std::time::Duration::from_secs(state.config.php.shutdown.grace_period_seconds);
     let deadline = tokio::time::Instant::now() + grace_period;
     while state.in_flight.load(Relaxed) > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -555,7 +686,10 @@ pub async fn serve(state: Arc<AppState>) {
             "grace period elapsed with request(s) still in flight, exiting anyway"
         );
     } else {
-        tracing::info!(r#type = "controller", "all in-flight requests finished, exiting cleanly");
+        tracing::info!(
+            r#type = "controller",
+            "all in-flight requests finished, exiting cleanly"
+        );
     }
     // Exiting closes our end of their sockets, which they already treat as
     // the signal to exit.

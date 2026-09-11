@@ -1,4 +1,4 @@
-use super::super::proxy::{resolve_client_ip, Peer};
+use super::super::proxy::{Peer, resolve_client_ip};
 use super::*;
 use hyper::HeaderMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -33,7 +33,10 @@ fn a_direct_client_rotating_x_forwarded_for_cannot_escape_its_bucket() {
         })
         .count();
 
-    assert_eq!(allowed, BURST as usize, "a direct client must exhaust one shared bucket no matter what it forwards");
+    assert_eq!(
+        allowed, BURST as usize,
+        "a direct client must exhaust one shared bucket no matter what it forwards"
+    );
 }
 
 /// The other half of the contract: a real proxy deployment must still limit
@@ -46,7 +49,10 @@ fn two_clients_behind_one_trusted_proxy_keep_separate_buckets() {
 
     assert!(limiter.check(first));
     assert!(!limiter.check(first), "first client's burst is exhausted");
-    assert!(limiter.check(second), "a second client behind the same proxy must have its own budget");
+    assert!(
+        limiter.check(second),
+        "a second client behind the same proxy must have its own budget"
+    );
 }
 
 #[test]
@@ -56,7 +62,10 @@ fn burst_is_allowed_then_the_next_request_is_rejected() {
     assert!(limiter.check(client));
     assert!(limiter.check(client));
     assert!(limiter.check(client));
-    assert!(!limiter.check(client), "a fourth request within the burst must be rejected");
+    assert!(
+        !limiter.check(client),
+        "a fourth request within the burst must be rejected"
+    );
 }
 
 #[test]
@@ -64,10 +73,16 @@ fn tokens_refill_over_time() {
     let limiter = RateLimiter::new(1, 1, Vec::new());
     let client = ip(2);
     assert!(limiter.check(client));
-    assert!(!limiter.check(client), "burst of 1 must be exhausted after one request");
+    assert!(
+        !limiter.check(client),
+        "burst of 1 must be exhausted after one request"
+    );
 
     std::thread::sleep(Duration::from_millis(1500));
-    assert!(limiter.check(client), "a full period later, the token must have refilled");
+    assert!(
+        limiter.check(client),
+        "a full period later, the token must have refilled"
+    );
 }
 
 /// A client checking faster than one refill interval must still eventually
@@ -92,7 +107,10 @@ fn frequent_polling_still_recovers_instead_of_stalling_forever() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(recovered, "a client polling faster than the refill interval must still eventually recover");
+    assert!(
+        recovered,
+        "a client polling faster than the refill interval must still eventually recover"
+    );
 }
 
 #[test]
@@ -114,7 +132,10 @@ fn should_limit_empty_patterns_matches_every_user_agent() {
 
 #[test]
 fn should_limit_only_matches_configured_patterns() {
-    let patterns: Vec<MatchPattern> = vec!["*GPTBot*".to_string().try_into().unwrap(), "*ClaudeBot*".to_string().try_into().unwrap()];
+    let patterns: Vec<MatchPattern> = vec![
+        "*GPTBot*".to_string().try_into().unwrap(),
+        "*ClaudeBot*".to_string().try_into().unwrap(),
+    ];
     let limiter = RateLimiter::new(1, 60, patterns);
     assert!(limiter.should_limit("Mozilla/5.0 (compatible; GPTBot/1.0)"));
     assert!(limiter.should_limit("ClaudeBot/1.0"));
@@ -137,11 +158,20 @@ fn a_full_tracking_table_of_active_clients_fails_open_rather_than_evicting_one()
     // sweep-eligible.
 
     let third = ip(12);
-    assert!(limiter.check(third), "a full tracking table must fail open rather than block a client it cannot track");
+    assert!(
+        limiter.check(third),
+        "a full tracking table must fail open rather than block a client it cannot track"
+    );
 
     // Neither original client was evicted to make room for the fail-open one.
-    assert!(!limiter.check(first), "an actively-limited client must never be evicted to make room");
-    assert!(!limiter.check(second), "an actively-limited client must never be evicted to make room");
+    assert!(
+        !limiter.check(first),
+        "an actively-limited client must never be evicted to make room"
+    );
+    assert!(
+        !limiter.check(second),
+        "an actively-limited client must never be evicted to make room"
+    );
 }
 
 /// A tracking table with an idle entry must sweep it to make room for a new
@@ -158,7 +188,10 @@ fn eviction_sweeps_an_idle_entry_to_make_room_for_a_new_ip() {
     std::thread::sleep(Duration::from_millis(1500));
 
     let second = ip(14);
-    assert!(limiter.check(second), "the idle entry must be swept to make room for a new IP");
+    assert!(
+        limiter.check(second),
+        "the idle entry must be swept to make room for a new IP"
+    );
     assert!(
         !limiter.check(second),
         "second must be a real, tracked bucket (denies its own very next request) - a fail-open pass-through would keep allowing it"
@@ -170,8 +203,8 @@ fn eviction_sweeps_an_idle_entry_to_make_room_for_a_new_ip() {
 /// loop must not lose an update under real contention.
 #[test]
 fn concurrent_hammering_never_exceeds_the_burst_capacity() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const CAPACITY: u32 = 50;
     const THREADS: usize = 16;
@@ -198,5 +231,9 @@ fn concurrent_hammering_never_exceeds_the_burst_capacity() {
         h.join().unwrap();
     }
 
-    assert_eq!(allowed.load(Ordering::Relaxed), CAPACITY as usize, "exactly the burst capacity must have been let through, never more");
+    assert_eq!(
+        allowed.load(Ordering::Relaxed),
+        CAPACITY as usize,
+        "exactly the burst capacity must have been let through, never more"
+    );
 }

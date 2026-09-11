@@ -36,7 +36,11 @@ fn parse_range_end_clamps_to_the_last_byte() {
 #[test]
 fn parse_range_start_past_eof_is_unsatisfiable() {
     assert_eq!(parse_range("bytes=1000-1005", 1000), Some(Err(())));
-    assert_eq!(parse_range("bytes=0-99", 0), Some(Err(())), "nothing to range over in an empty file");
+    assert_eq!(
+        parse_range("bytes=0-99", 0),
+        Some(Err(())),
+        "nothing to range over in an empty file"
+    );
 }
 
 #[test]
@@ -68,8 +72,16 @@ fn parse_range_malformed_syntax_is_ignored_the_same_way_regardless_of_file_lengt
     // identical garbage gets a different outcome purely from the file's
     // length.
     for garbage in ["bytes=-", "bytes=abc-def", "bytes="] {
-        assert_eq!(parse_range(garbage, 0), None, "garbage {garbage:?} against an empty file");
-        assert_eq!(parse_range(garbage, 1000), None, "garbage {garbage:?} against a non-empty file");
+        assert_eq!(
+            parse_range(garbage, 0),
+            None,
+            "garbage {garbage:?} against an empty file"
+        );
+        assert_eq!(
+            parse_range(garbage, 1000),
+            None,
+            "garbage {garbage:?} against a non-empty file"
+        );
     }
 }
 
@@ -119,12 +131,20 @@ async fn file_body_fails_rather_than_truncating_a_file_shorter_than_promised() {
         }
     }
 
-    assert_eq!(collected, content, "everything the file did hold must still arrive");
     assert_eq!(
-        failure.expect("a file shorter than promised must fail the stream").kind(),
+        collected, content,
+        "everything the file did hold must still arrive"
+    );
+    assert_eq!(
+        failure
+            .expect("a file shorter than promised must fail the stream")
+            .kind(),
         std::io::ErrorKind::UnexpectedEof
     );
-    assert!(stream.next().await.is_none(), "a failed stream must stay ended");
+    assert!(
+        stream.next().await.is_none(),
+        "a failed stream must stay ended"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -146,7 +166,11 @@ async fn file_body_stops_at_the_promised_length_when_the_file_grew() {
         collected.extend_from_slice(&item.expect("a longer file must not fail the stream"));
     }
 
-    assert_eq!(collected.len() as u64, promised, "must send exactly what the header promised");
+    assert_eq!(
+        collected.len() as u64,
+        promised,
+        "must send exactly what the header promised"
+    );
     assert_eq!(collected, content[..promised as usize]);
     std::fs::remove_file(&path).ok();
 }

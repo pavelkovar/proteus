@@ -5,13 +5,13 @@
 pub mod php_ffi;
 
 use crate::config::PhpOptions;
-use crate::ipc::{control, shm, CONFIG_FD, CONTROL_FD};
+use crate::ipc::{CONFIG_FD, CONTROL_FD, control, shm};
 use crate::proctitle;
 use crate::worker;
-use nix::sys::socket::{getsockopt, sockopt, socketpair, AddressFamily, SockFlag, SockType};
-use nix::unistd::{fork, ForkResult};
-use serde::{Deserialize, Serialize};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, getsockopt, socketpair, sockopt};
+use nix::unistd::{ForkResult, fork};
 use php_ffi::PhpConn;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::fd::{BorrowedFd, FromRawFd};
@@ -61,7 +61,8 @@ pub fn run() -> ! {
     crate::logging::init(false);
     proctitle::set_title(&format!("{}: php prototype", crate::APP_NAME));
     control::clear_nonblocking(CONTROL_FD).expect("clear_nonblocking on control fd failed");
-    control::set_recv_timeout(CONTROL_FD, ZOMBIE_REAP_INTERVAL).expect("set_recv_timeout on control fd failed");
+    control::set_recv_timeout(CONTROL_FD, ZOMBIE_REAP_INTERVAL)
+        .expect("set_recv_timeout on control fd failed");
 
     // Blocks until EOF, which is how master delimits the payload.
     let mut config_bytes = Vec::new();
@@ -80,7 +81,11 @@ pub fn run() -> ! {
     let idle_timeout =
         (idle_timeout_seconds > 0).then(|| std::time::Duration::from_secs(idle_timeout_seconds));
 
-    tracing::info!(r#type = "prototype", pid = std::process::id(), "loading php-mod: {php_mod_path}");
+    tracing::info!(
+        r#type = "prototype",
+        pid = std::process::id(),
+        "loading php-mod: {php_mod_path}"
+    );
 
     // Before any fork(), so every worker inherits them. Reaches getenv()
     // but deliberately not $_ENV, which would import the whole environment
@@ -99,8 +104,13 @@ pub fn run() -> ! {
     let admin_entries = to_entries(&proto_options.admin);
 
     let phpconn = PhpConn::load(&php_mod_path).expect("dlopen php-mod failed");
-    phpconn.init(&admin_entries, &to_entries(&proto_options.user)).expect("proteus_php_mod_init failed");
-    tracing::debug!(r#type = "prototype", "PHP embed SAPI + OPcache/APCu initialized, entering fork-server loop");
+    phpconn
+        .init(&admin_entries, &to_entries(&proto_options.user))
+        .expect("proteus_php_mod_init failed");
+    tracing::debug!(
+        r#type = "prototype",
+        "PHP embed SAPI + OPcache/APCu initialized, entering fork-server loop"
+    );
 
     let mut control_stream = unsafe { StdUnixStream::from_raw_fd(CONTROL_FD) };
 
@@ -110,7 +120,10 @@ pub fn run() -> ! {
         let cmd = match control::recv_command(&mut control_stream) {
             Ok(Some(cmd)) => cmd,
             Ok(None) => {
-                tracing::info!(r#type = "prototype", "control channel closed by master, exiting");
+                tracing::info!(
+                    r#type = "prototype",
+                    "control channel closed by master, exiting"
+                );
                 break;
             }
             // The reap wakeup, with no SPAWN pending.
@@ -129,7 +142,8 @@ pub fn run() -> ! {
         // Mapped before the fork so the child inherits it. Failing loudly
         // beats a silent `continue`, which would hang the master already
         // blocked on WORKER_READY; a crashed prototype is respawned anyway.
-        let (channel_fd, mapped_channel) = shm::create_channel().expect("failed to create worker data channel");
+        let (channel_fd, mapped_channel) =
+            shm::create_channel().expect("failed to create worker data channel");
         // Crash detection only: master watches its end for EOF.
         let (liveness_prototype_side, liveness_worker_side) = socketpair(
             AddressFamily::Unix,
@@ -141,8 +155,10 @@ pub fn run() -> ! {
         // Master parks on these rather than the ring's futex word. Created
         // pre-fork, for the reason above.
         let notify_efds = shm::NotifyEfds {
-            req_space: shm::create_notify_eventfd().expect("failed to create request-space eventfd"),
-            resp_data: shm::create_notify_eventfd().expect("failed to create response-data eventfd"),
+            req_space: shm::create_notify_eventfd()
+                .expect("failed to create request-space eventfd"),
+            resp_data: shm::create_notify_eventfd()
+                .expect("failed to create response-data eventfd"),
         };
 
         // Before the fork, where this is still the value `die_with_parent`
@@ -156,15 +172,28 @@ pub fn run() -> ! {
                 // would ever close it.
                 unsafe { libc::close(CONTROL_FD) };
                 proctitle::set_title(&format!("{}: php worker", crate::APP_NAME));
-                worker::run(liveness_worker_side, mapped_channel, &phpconn, max_requests, notify_efds, prototype_pid, idle_timeout);
+                worker::run(
+                    liveness_worker_side,
+                    mapped_channel,
+                    &phpconn,
+                    max_requests,
+                    notify_efds,
+                    prototype_pid,
+                    idle_timeout,
+                );
                 std::process::exit(0);
             }
             ForkResult::Parent { child } => {
                 drop(liveness_worker_side);
                 // Unmaps only this view; the worker keeps its own.
                 drop(mapped_channel);
-                let fds = control::WorkerReadyFds { channel: channel_fd, liveness: liveness_prototype_side, notify: notify_efds };
-                if let Err(e) = control::send_worker_ready(&mut control_stream, child.as_raw(), fds) {
+                let fds = control::WorkerReadyFds {
+                    channel: channel_fd,
+                    liveness: liveness_prototype_side,
+                    notify: notify_efds,
+                };
+                if let Err(e) = control::send_worker_ready(&mut control_stream, child.as_raw(), fds)
+                {
                     tracing::error!(r#type = "prototype", error = %e, "send_worker_ready failed");
                 }
             }

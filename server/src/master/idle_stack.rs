@@ -48,11 +48,18 @@ fn unpack(head: u64) -> (u32, u32) {
 
 impl<T> IdleStack<T> {
     pub(crate) fn new(capacity: usize) -> Self {
-        assert!(capacity < NONE as usize, "pool capacity must fit in a u32 slot index");
+        assert!(
+            capacity < NONE as usize,
+            "pool capacity must fit in a u32 slot index"
+        );
         let slots: Box<[Slot<T>]> = (0..capacity)
             .map(|i| Slot {
                 value: UnsafeCell::new(None),
-                next: AtomicU32::new(if i + 1 == capacity { NONE } else { i as u32 + 1 }),
+                next: AtomicU32::new(if i + 1 == capacity {
+                    NONE
+                } else {
+                    i as u32 + 1
+                }),
             })
             .collect();
         IdleStack {
@@ -102,7 +109,9 @@ impl<T> IdleStack<T> {
         let mut current = head.load(Ordering::Relaxed);
         loop {
             let (generation, top) = unpack(current);
-            self.slots[index as usize].next.store(top, Ordering::Relaxed);
+            self.slots[index as usize]
+                .next
+                .store(top, Ordering::Relaxed);
             // Release: publishes both the `next` store above and the payload
             // `push` wrote before calling.
             match head.compare_exchange_weak(

@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 #[test]
 fn pops_in_lifo_order() {
@@ -10,7 +10,10 @@ fn pops_in_lifo_order() {
         assert!(stack.push_new(i).is_none());
     }
     assert_eq!(stack.len(), 4);
-    assert_eq!((0..4).map(|_| stack.pop().unwrap().1).collect::<Vec<_>>(), vec![3, 2, 1, 0]);
+    assert_eq!(
+        (0..4).map(|_| stack.pop().unwrap().1).collect::<Vec<_>>(),
+        vec![3, 2, 1, 0]
+    );
     assert!(stack.pop().is_none());
     assert_eq!(stack.len(), 0);
 }
@@ -49,7 +52,11 @@ fn slots_are_reused_after_popping() {
 fn an_empty_stack_pops_none() {
     let stack: IdleStack<u32> = IdleStack::new(0);
     assert!(stack.pop().is_none());
-    assert_eq!(stack.push_new(1), Some(1), "a zero-capacity stack can hold nothing");
+    assert_eq!(
+        stack.push_new(1),
+        Some(1),
+        "a zero-capacity stack can hold nothing"
+    );
 }
 
 /// Every value must come out exactly once: a duplicate hands two requests
@@ -111,7 +118,11 @@ fn concurrent_push_pop_neither_duplicates_nor_loses_a_value() {
         remaining.push(v);
     }
     remaining.sort_unstable();
-    assert_eq!(remaining, (0..THREADS).collect::<Vec<_>>(), "values were duplicated or lost");
+    assert_eq!(
+        remaining,
+        (0..THREADS).collect::<Vec<_>>(),
+        "values were duplicated or lost"
+    );
     assert_eq!(stack.len(), 0, "len drifted from the real contents");
 }
 
@@ -139,7 +150,10 @@ fn len_tracks_contents_under_concurrency() {
         h.join().unwrap();
     }
     let drained = std::iter::from_fn(|| stack.pop()).count();
-    assert_eq!(drained, 0, "threads should have drained everything they pushed");
+    assert_eq!(
+        drained, 0,
+        "threads should have drained everything they pushed"
+    );
     assert_eq!(stack.len(), 0);
 }
 
@@ -162,5 +176,9 @@ fn dropping_the_stack_drops_the_values_it_still_holds() {
         }
         assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
-    assert_eq!(drops.load(Ordering::Relaxed), 3, "values left in the stack were leaked, not dropped");
+    assert_eq!(
+        drops.load(Ordering::Relaxed),
+        3,
+        "values left in the stack were leaked, not dropped"
+    );
 }

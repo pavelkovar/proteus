@@ -40,13 +40,14 @@ fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
     }
 }
 
-
 /// A zero max takes the unbounded branch and must never reject, however many
 /// slots are held at once.
 #[test]
 fn queue_depth_guard_with_zero_max_never_rejects() {
     let counter = AtomicU64::new(0);
-    let guards: Vec<_> = (0..10_000).map(|_| QueueDepthGuard::try_new(&counter, 0).expect("max=0 must never reject")).collect();
+    let guards: Vec<_> = (0..10_000)
+        .map(|_| QueueDepthGuard::try_new(&counter, 0).expect("max=0 must never reject"))
+        .collect();
     assert_eq!(counter.load(Relaxed), 10_000);
     drop(guards);
     assert_eq!(counter.load(Relaxed), 0);
@@ -58,10 +59,14 @@ fn queue_depth_guard_rejects_once_a_real_cap_is_reached() {
     let counter = AtomicU64::new(0);
     let first = QueueDepthGuard::try_new(&counter, 2).expect("slot 1 of 2");
     let second = QueueDepthGuard::try_new(&counter, 2).expect("slot 2 of 2");
-    assert!(QueueDepthGuard::try_new(&counter, 2).is_none(), "a 3rd slot must be rejected at max=2");
+    assert!(
+        QueueDepthGuard::try_new(&counter, 2).is_none(),
+        "a 3rd slot must be rejected at max=2"
+    );
 
     drop(first);
-    let _third = QueueDepthGuard::try_new(&counter, 2).expect("a freed slot must be admitted again");
+    let _third =
+        QueueDepthGuard::try_new(&counter, 2).expect("a freed slot must be admitted again");
     drop(second);
 }
 
@@ -76,14 +81,19 @@ async fn queue_depth_guard_releases_its_slot_when_the_waiting_future_is_cancelle
     let counter_task = Arc::clone(&counter);
     let semaphore_task = Arc::clone(&semaphore);
     let task = tokio::spawn(async move {
-        let guard = QueueDepthGuard::try_new(&counter_task, 0).expect("unlimited depth always admits");
+        let guard =
+            QueueDepthGuard::try_new(&counter_task, 0).expect("unlimited depth always admits");
         let _permit = semaphore_task.acquire_owned().await;
         drop(guard); // unreachable: the semaphore never yields a permit
     });
 
     // Let it park on the await before cancelling.
     tokio::task::yield_now().await;
-    assert_eq!(counter.load(Relaxed), 1, "guard should have incremented the counter before parking");
+    assert_eq!(
+        counter.load(Relaxed),
+        1,
+        "guard should have incremented the counter before parking"
+    );
 
     task.abort();
     let _ = task.await;
@@ -100,8 +110,16 @@ fn respawn_backoff_delay_grows_and_caps() {
     assert_eq!(respawn_backoff_delay(0), Duration::from_secs(1));
     assert_eq!(respawn_backoff_delay(1), Duration::from_secs(2));
     assert_eq!(respawn_backoff_delay(3), Duration::from_secs(8));
-    assert_eq!(respawn_backoff_delay(6), Duration::from_secs(60), "caps at 64s -> 60s cap");
-    assert_eq!(respawn_backoff_delay(20), Duration::from_secs(60), "stays capped for large inputs");
+    assert_eq!(
+        respawn_backoff_delay(6),
+        Duration::from_secs(60),
+        "caps at 64s -> 60s cap"
+    );
+    assert_eq!(
+        respawn_backoff_delay(20),
+        Duration::from_secs(60),
+        "stays capped for large inputs"
+    );
 }
 
 /// That a real process actually dies, not merely that `kill()` did not error.
@@ -120,7 +138,10 @@ fn sigkill_actually_terminates_the_process() {
         if let Ok(Some(_)) = child.try_wait() {
             return;
         }
-        assert!(Instant::now() < deadline, "process pid={pid} was not terminated by sigkill()");
+        assert!(
+            Instant::now() < deadline,
+            "process pid={pid} was not terminated by sigkill()"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -136,11 +157,19 @@ fn worker_meta_tracks_state_and_request_count_without_the_pool_lock() {
 
     meta.mark_busy(Instant::now(), pool_started);
     assert_eq!(meta.state_str(), "busy");
-    assert_eq!(meta.request_count.load(Relaxed), 1, "each dispatch counts exactly once");
+    assert_eq!(
+        meta.request_count.load(Relaxed),
+        1,
+        "each dispatch counts exactly once"
+    );
 
     meta.mark_idle(Instant::now(), pool_started);
     assert_eq!(meta.state_str(), "idle");
-    assert_eq!(meta.request_count.load(Relaxed), 1, "returning to idle must not count as another request");
+    assert_eq!(
+        meta.request_count.load(Relaxed),
+        1,
+        "returning to idle must not count as another request"
+    );
 
     meta.mark_busy(Instant::now(), pool_started);
     assert_eq!(meta.request_count.load(Relaxed), 2);
@@ -170,8 +199,15 @@ fn worker_meta_counts_are_exact_under_concurrent_updates() {
         h.join().unwrap();
     }
 
-    assert_eq!(meta.request_count.load(Relaxed), (THREADS * PER_THREAD) as u32);
-    assert_eq!(meta.state_str(), "idle", "the last write of every thread was mark_idle");
+    assert_eq!(
+        meta.request_count.load(Relaxed),
+        (THREADS * PER_THREAD) as u32
+    );
+    assert_eq!(
+        meta.state_str(),
+        "idle",
+        "the last write of every thread was mark_idle"
+    );
 }
 
 /// A respawn may replace a prototype that is still running but no longer
@@ -179,19 +215,32 @@ fn worker_meta_counts_are_exact_under_concurrent_updates() {
 /// orphan it: alive, holding its PHP heap, referenced and reaped by nobody.
 #[tokio::test]
 async fn replacing_a_still_running_prototype_kills_and_reaps_it() {
-    let old = std::process::Command::new("sleep").arg("100").spawn().unwrap();
+    let old = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
     let old_pid = old.id() as i32;
     let pool = make_test_pool_manager(old);
 
-    let replacement = std::process::Command::new("sleep").arg("100").spawn().unwrap();
+    let replacement = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
     let new_pid = replacement.id();
     pool.replace_prototype_child(replacement);
 
     // Signal 0 probes existence without sending anything. Already reaped, so
     // ESRCH rather than a zombie still answering.
     let alive = kill(Pid::from_raw(old_pid), None).is_ok();
-    assert!(!alive, "the replaced prototype pid={old_pid} is still around - it was orphaned, not killed and reaped");
-    assert_eq!(pool.prototype_child.lock().unwrap().pid(), new_pid, "the new child must be the tracked one");
+    assert!(
+        !alive,
+        "the replaced prototype pid={old_pid} is still around - it was orphaned, not killed and reaped"
+    );
+    assert_eq!(
+        pool.prototype_child.lock().unwrap().pid(),
+        new_pid,
+        "the new child must be the tracked one"
+    );
     reap_tracked_prototype(&pool);
 }
 
@@ -206,7 +255,12 @@ fn reap_tracked_prototype(pool: &PoolManager) {
 /// succeeds on a zombie, so it cannot tell a survivor from a fresh corpse.
 fn proc_state(pid: i32) -> Option<char> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    stat.rsplit_once(')')?.1.split_whitespace().next()?.chars().next()
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
 }
 
 /// A reaped pid may already belong to something else, so it must never be
@@ -214,7 +268,10 @@ fn proc_state(pid: i32) -> Option<char> {
 /// which stands in for whatever the kernel handed the number to next.
 #[tokio::test]
 async fn a_reaped_prototype_pid_is_never_signalled_again() {
-    let squatter = std::process::Command::new("sleep").arg("100").spawn().unwrap();
+    let squatter = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
     let squatter_pid = squatter.id() as i32;
     let pool = make_test_pool_manager(squatter);
     pool.prototype_child.lock().unwrap().mark_reaped();
@@ -233,7 +290,11 @@ async fn a_reaped_prototype_pid_is_never_signalled_again() {
     let pid = Pid::from_raw(squatter_pid);
     let _ = kill(pid, Signal::SIGKILL);
     let _ = waitpid(pid, None);
-    assert_ne!(state, Some('Z'), "a reaped pid was signalled - a recycled number would have taken the hit");
+    assert_ne!(
+        state,
+        Some('Z'),
+        "a reaped pid was signalled - a recycled number would have taken the hit"
+    );
 }
 
 /// The already-dead case must stay a plain reap: no signal to a pid the OS
@@ -249,7 +310,10 @@ async fn replacing_an_already_exited_prototype_just_reaps_it() {
     // Already reaped above; hand the pool a fresh handle to that same state.
     let pool = make_test_pool_manager(old);
 
-    let replacement = std::process::Command::new("sleep").arg("100").spawn().unwrap();
+    let replacement = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
     pool.replace_prototype_child(replacement);
 
     assert!(

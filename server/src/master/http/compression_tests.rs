@@ -32,7 +32,10 @@ impl Stream for FakeBlockingSource {
 }
 
 async fn drain(body: ResponseBody) -> Bytes {
-    body.collect().await.expect("body stream errored").to_bytes()
+    body.collect()
+        .await
+        .expect("body stream errored")
+        .to_bytes()
 }
 
 /// A single blocking thread reproduces the nested-`spawn_blocking` deadlock
@@ -46,7 +49,10 @@ fn compressed_body_does_not_deadlock_when_source_itself_needs_a_blocking_thread(
         .unwrap();
 
     let result = rt.block_on(async {
-        let source = FakeBlockingSource { remaining: 20, pending: None };
+        let source = FakeBlockingSource {
+            remaining: 20,
+            pending: None,
+        };
         let body = compressed_body(source, Encoding::Gzip, None);
         tokio::time::timeout(std::time::Duration::from_secs(5), drain(body)).await
     });
@@ -67,20 +73,41 @@ fn window_log_covers_the_body_and_stays_in_zstds_accepted_range() {
     assert_eq!(window_log_for(Some(1 << 12)), 13);
     assert_eq!(window_log_for(Some((1 << 12) + 1)), 13);
     assert_eq!(window_log_for(Some(200_000)), 18);
-    assert_eq!(window_log_for(Some(64 << 20)), WINDOW_LOG_MAX, "clamped, not grown");
-    assert_eq!(window_log_for(Some(0)), WINDOW_LOG_MIN, "zstd rejects anything smaller");
+    assert_eq!(
+        window_log_for(Some(64 << 20)),
+        WINDOW_LOG_MAX,
+        "clamped, not grown"
+    );
+    assert_eq!(
+        window_log_for(Some(0)),
+        WINDOW_LOG_MIN,
+        "zstd rejects anything smaller"
+    );
     assert_eq!(window_log_for(None), WINDOW_LOG_MAX);
 }
 
 fn zstd_roundtrip(body_len: usize, size_hint: Option<u64>) -> Vec<u8> {
-    let payload: Vec<u8> = (0..body_len).map(|i| b"the quick brown fox "[i % 20]).collect();
-    let chunks: Vec<std::io::Result<Bytes>> =
-        payload.chunks(4096).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let payload: Vec<u8> = (0..body_len)
+        .map(|i| b"the quick brown fox "[i % 20])
+        .collect();
+    let chunks: Vec<std::io::Result<Bytes>> = payload
+        .chunks(4096)
+        .map(|c| Ok(Bytes::copy_from_slice(c)))
+        .collect();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let compressed = rt.block_on(async {
-        drain(compressed_body(tokio_stream::iter(chunks), Encoding::Zstd, size_hint)).await
+        drain(compressed_body(
+            tokio_stream::iter(chunks),
+            Encoding::Zstd,
+            size_hint,
+        ))
+        .await
     });
-    let decoded = zstd::stream::decode_all(&compressed[..]).expect("emitted frame is not valid zstd");
+    let decoded =
+        zstd::stream::decode_all(&compressed[..]).expect("emitted frame is not valid zstd");
     assert_eq!(decoded, payload, "compressed body does not round-trip");
     compressed.to_vec()
 }
@@ -105,7 +132,10 @@ fn sizing_the_window_to_a_small_body_does_not_cost_compression() {
     let len = 4000;
     let sized = zstd_roundtrip(len, Some(len as u64)).len();
     let widest = zstd_roundtrip(len, Some(u64::from(u32::MAX))).len();
-    assert!(sized <= widest, "sized window produced {sized} bytes vs {widest} at the max window");
+    assert!(
+        sized <= widest,
+        "sized window produced {sized} bytes vs {widest} at the max window"
+    );
 }
 
 // --- streamed-response size gate ---
@@ -130,12 +160,21 @@ fn stream_size_gate_applies_the_minimum_when_the_script_declared_a_length() {
     let mime = vec!["text/html".to_string()];
 
     let (body_len, min) = stream_size_gate(Some(200), 1024);
-    assert!(!compression_eligible(body_len, min, "text/html", &mime), "200 bytes is below the 1024 minimum");
-    assert_eq!(pick_encoding(body_len, "gzip", min, "text/html", &mime), None);
+    assert!(
+        !compression_eligible(body_len, min, "text/html", &mime),
+        "200 bytes is below the 1024 minimum"
+    );
+    assert_eq!(
+        pick_encoding(body_len, "gzip", min, "text/html", &mime),
+        None
+    );
 
     let (body_len, min) = stream_size_gate(Some(4096), 1024);
     assert!(compression_eligible(body_len, min, "text/html", &mime));
-    assert_eq!(pick_encoding(body_len, "gzip", min, "text/html", &mime), Some(Encoding::Gzip));
+    assert_eq!(
+        pick_encoding(body_len, "gzip", min, "text/html", &mime),
+        Some(Encoding::Gzip)
+    );
 }
 
 /// The declared length is a hint, never trusted for framing, so a wrong
@@ -145,11 +184,17 @@ fn a_wrong_declared_length_can_only_mis_decide_compression() {
     let mime = vec!["text/html".to_string()];
     // Understated: a big response goes out uncompressed. Wasteful, not wrong.
     let (body_len, min) = stream_size_gate(Some(1), 1024);
-    assert_eq!(pick_encoding(body_len, "gzip", min, "text/html", &mime), None);
+    assert_eq!(
+        pick_encoding(body_len, "gzip", min, "text/html", &mime),
+        None
+    );
     // Overstated: a tiny response gets compressed - exactly the no-hint
     // behaviour, so no regression against it.
     let (body_len, min) = stream_size_gate(Some(999_999), 1024);
-    assert_eq!(pick_encoding(body_len, "gzip", min, "text/html", &mime), Some(Encoding::Gzip));
+    assert_eq!(
+        pick_encoding(body_len, "gzip", min, "text/html", &mime),
+        Some(Encoding::Gzip)
+    );
 }
 
 // --- Accept-Encoding negotiation edge cases ---

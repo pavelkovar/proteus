@@ -5,8 +5,13 @@ use std::os::fd::AsFd;
 /// everything.
 #[test]
 fn is_seqpacket_socket_accepts_a_real_seqpacket_pair() {
-    let (a, _b) = socketpair(AddressFamily::Unix, SockType::SeqPacket, None, SockFlag::empty())
-        .expect("socketpair failed");
+    let (a, _b) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::empty(),
+    )
+    .expect("socketpair failed");
     assert!(is_seqpacket_socket(a.as_fd()));
 }
 
@@ -14,7 +19,12 @@ fn is_seqpacket_socket_accepts_a_real_seqpacket_pair() {
 /// practice nothing open on that fd at all.
 #[test]
 fn is_seqpacket_socket_rejects_a_stream_socket() {
-    let (a, _b) = socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::empty())
-        .expect("socketpair failed");
+    let (a, _b) = socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::empty(),
+    )
+    .expect("socketpair failed");
     assert!(!is_seqpacket_socket(a.as_fd()));
 }

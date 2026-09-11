@@ -86,7 +86,11 @@ async fn start_server(name: &str, php_root: &str, overrides: serde_json::Value) 
         .spawn()
         .expect("failed to spawn server binary");
 
-    let server = TestServer { child, port, status_port };
+    let server = TestServer {
+        child,
+        port,
+        status_port,
+    };
 
     let client = reqwest::Client::new();
     // Generous, because every server here forks a prototype and its spare
@@ -158,14 +162,26 @@ async fn head_request_matches_get_headers_with_an_empty_body() {
 
     for (path, accept_encoding) in [("/hello.txt", "identity"), ("/big.txt", "gzip")] {
         let url = format!("http://127.0.0.1:{}{path}", server.port);
-        let get_resp = client.get(&url).header("Accept-Encoding", accept_encoding).send().await.unwrap();
+        let get_resp = client
+            .get(&url)
+            .header("Accept-Encoding", accept_encoding)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(get_resp.status(), 200);
         let get_headers = get_resp.headers().clone();
         let get_body_len = get_resp.bytes().await.unwrap().len();
-        assert!(get_body_len > 0, "sanity: GET {path} must actually have a body");
+        assert!(
+            get_body_len > 0,
+            "sanity: GET {path} must actually have a body"
+        );
 
-        let head_resp =
-            client.head(&url).header("Accept-Encoding", accept_encoding).send().await.unwrap();
+        let head_resp = client
+            .head(&url)
+            .header("Accept-Encoding", accept_encoding)
+            .send()
+            .await
+            .unwrap();
         assert_eq!(head_resp.status(), 200);
         for header in ["content-type", "content-encoding", "etag", "content-length"] {
             assert_eq!(
@@ -175,7 +191,11 @@ async fn head_request_matches_get_headers_with_an_empty_body() {
             );
         }
         let head_body = head_resp.bytes().await.unwrap();
-        assert!(head_body.is_empty(), "HEAD {path} must have an empty body, got {} bytes", head_body.len());
+        assert!(
+            head_body.is_empty(),
+            "HEAD {path} must have an empty body, got {} bytes",
+            head_body.len()
+        );
     }
 }
 
@@ -185,10 +205,16 @@ async fn head_request_matches_get_headers_with_an_empty_body() {
 #[tokio::test]
 async fn large_static_file_streams_correctly() {
     let root = std::env::temp_dir().join(format!("streaming-test-{}", next_port()));
-    tokio::fs::create_dir_all(root.join("public")).await.unwrap();
+    tokio::fs::create_dir_all(root.join("public"))
+        .await
+        .unwrap();
     // Not zeros: corruption goes unnoticed against an all-zero file.
-    let content: Vec<u8> = (0..6 * 1024 * 1024).map(|i: usize| (i % 251) as u8).collect();
-    tokio::fs::write(root.join("public/big.bin"), &content).await.unwrap();
+    let content: Vec<u8> = (0..6 * 1024 * 1024)
+        .map(|i: usize| (i % 251) as u8)
+        .collect();
+    tokio::fs::write(root.join("public/big.bin"), &content)
+        .await
+        .unwrap();
 
     let server = start_server("streaming", root.to_str().unwrap(), serde_json::json!({})).await;
     let resp = reqwest::Client::new()
@@ -199,14 +225,25 @@ async fn large_static_file_streams_correctly() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(
-        resp.headers().get("content-length").unwrap().to_str().unwrap(),
+        resp.headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         content.len().to_string(),
         "streaming still knows the exact size upfront - a stat(), not a full read"
     );
-    assert!(resp.headers().get("content-encoding").is_none(), "Accept-Encoding: identity must not compress");
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "Accept-Encoding: identity must not compress"
+    );
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.len(), content.len());
-    assert_eq!(body.as_ref(), content.as_slice(), "streamed content must match the source file exactly");
+    assert_eq!(
+        body.as_ref(),
+        content.as_slice(),
+        "streamed content must match the source file exactly"
+    );
 
     let _ = tokio::fs::remove_dir_all(&root).await;
 }
@@ -217,12 +254,21 @@ async fn large_static_file_streams_correctly() {
 #[tokio::test]
 async fn large_static_file_streams_compressed_when_accepted() {
     let root = std::env::temp_dir().join(format!("streaming-compressed-test-{}", next_port()));
-    tokio::fs::create_dir_all(root.join("public")).await.unwrap();
+    tokio::fs::create_dir_all(root.join("public"))
+        .await
+        .unwrap();
     // Must be genuinely compressible, or the test proves nothing.
     let content = "the quick brown fox jumps over the lazy dog\n".repeat(200_000);
-    tokio::fs::write(root.join("public/big.txt"), &content).await.unwrap();
+    tokio::fs::write(root.join("public/big.txt"), &content)
+        .await
+        .unwrap();
 
-    let server = start_server("streaming-compressed", root.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "streaming-compressed",
+        root.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::builder().no_gzip().build().unwrap(); // inspect the raw header/body ourselves
     let resp = client
         .get(format!("http://127.0.0.1:{}/big.txt", server.port))
@@ -232,7 +278,10 @@ async fn large_static_file_streams_compressed_when_accepted() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("content-encoding").unwrap(), "zstd");
-    assert!(resp.headers().get("content-length").is_none(), "compressed streaming size isn't known upfront");
+    assert!(
+        resp.headers().get("content-length").is_none(),
+        "compressed streaming size isn't known upfront"
+    );
 
     let compressed = resp.bytes().await.unwrap();
     let decoded = String::from_utf8(zstd::decode_all(compressed.as_ref()).unwrap()).unwrap();
@@ -246,87 +295,197 @@ async fn large_static_file_streams_compressed_when_accepted() {
 #[tokio::test]
 async fn static_file_range_and_conditional_requests() {
     let root = std::env::temp_dir().join(format!("range-test-{}", next_port()));
-    tokio::fs::create_dir_all(root.join("public")).await.unwrap();
+    tokio::fs::create_dir_all(root.join("public"))
+        .await
+        .unwrap();
     let content: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
-    tokio::fs::write(root.join("public/data.txt"), &content).await.unwrap();
+    tokio::fs::write(root.join("public/data.txt"), &content)
+        .await
+        .unwrap();
 
     let server = start_server("range", root.to_str().unwrap(), serde_json::json!({})).await;
     let client = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/data.txt", server.port);
 
     // Uncompressed, so the ETag must be strong.
-    let plain = client.get(&url).header("Accept-Encoding", "identity").send().await.unwrap();
+    let plain = client
+        .get(&url)
+        .header("Accept-Encoding", "identity")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(plain.status(), 200);
     assert_eq!(plain.headers().get("accept-ranges").unwrap(), "bytes");
     assert_eq!(plain.headers().get("vary").unwrap(), "Accept-Encoding");
-    let etag = plain.headers().get("etag").unwrap().to_str().unwrap().to_string();
-    assert!(!etag.starts_with("W/"), "identity response must carry a strong ETag: {etag}");
-    let last_modified = plain.headers().get("last-modified").unwrap().to_str().unwrap().to_string();
+    let etag = plain
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !etag.starts_with("W/"),
+        "identity response must carry a strong ETag: {etag}"
+    );
+    let last_modified = plain
+        .headers()
+        .get("last-modified")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
 
     // No Vary: a range is always identity bytes, so claiming it varies only
     // makes a cache partition ranges for nothing.
-    let ranged = client.get(&url).header("Range", "bytes=100-199").send().await.unwrap();
+    let ranged = client
+        .get(&url)
+        .header("Range", "bytes=100-199")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(ranged.status(), 206);
-    assert_eq!(*ranged.headers().get("content-range").unwrap(), format!("bytes 100-199/{}", content.len()));
+    assert_eq!(
+        *ranged.headers().get("content-range").unwrap(),
+        format!("bytes 100-199/{}", content.len())
+    );
     assert_eq!(ranged.headers().get("content-length").unwrap(), "100");
     assert!(ranged.headers().get("vary").is_none());
     let body = ranged.bytes().await.unwrap();
     assert_eq!(body.as_ref(), &content[100..200]);
 
-
-    let suffix = client.get(&url).header("Range", "bytes=-50").send().await.unwrap();
+    let suffix = client
+        .get(&url)
+        .header("Range", "bytes=-50")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(suffix.status(), 206);
     let start = content.len() - 50;
-    assert_eq!(*suffix.headers().get("content-range").unwrap(), format!("bytes {start}-{}/{}", content.len() - 1, content.len()));
+    assert_eq!(
+        *suffix.headers().get("content-range").unwrap(),
+        format!("bytes {start}-{}/{}", content.len() - 1, content.len())
+    );
     assert_eq!(suffix.bytes().await.unwrap().as_ref(), &content[start..]);
 
     // Still Vary'd: a 304 stands in for whatever 200 would have been.
-    let not_modified = client.get(&url).header("If-None-Match", &etag).header("Accept-Encoding", "identity").send().await.unwrap();
+    let not_modified = client
+        .get(&url)
+        .header("If-None-Match", &etag)
+        .header("Accept-Encoding", "identity")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(not_modified.status(), 304);
-    assert_eq!(not_modified.headers().get("vary").unwrap(), "Accept-Encoding");
+    assert_eq!(
+        not_modified.headers().get("vary").unwrap(),
+        "Accept-Encoding"
+    );
     assert!(not_modified.bytes().await.unwrap().is_empty());
 
     // Compares no ETags, so the encoding it would negotiate is irrelevant.
-    let not_modified2 = client.get(&url).header("If-Modified-Since", &last_modified).send().await.unwrap();
+    let not_modified2 = client
+        .get(&url)
+        .header("If-Modified-Since", &last_modified)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(not_modified2.status(), 304);
-    assert_eq!(not_modified2.headers().get("vary").unwrap(), "Accept-Encoding");
+    assert_eq!(
+        not_modified2.headers().get("vary").unwrap(),
+        "Accept-Encoding"
+    );
 
     // Out-of-bounds Range: 416, not a silent full/200 response. No Vary,
     // same reasoning as the 206 case above.
-    let unsatisfiable = client.get(&url).header("Range", "bytes=999999-9999999").send().await.unwrap();
+    let unsatisfiable = client
+        .get(&url)
+        .header("Range", "bytes=999999-9999999")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(unsatisfiable.status(), 416);
-    assert_eq!(*unsatisfiable.headers().get("content-range").unwrap(), format!("bytes */{}", content.len()));
+    assert_eq!(
+        *unsatisfiable.headers().get("content-range").unwrap(),
+        format!("bytes */{}", content.len())
+    );
     assert!(unsatisfiable.headers().get("vary").is_none());
 
     // If-Range with a still-current etag: Range is honored, same as if
     // If-Range weren't sent at all.
-    let if_range_fresh = client.get(&url).header("Range", "bytes=100-199").header("If-Range", &etag).send().await.unwrap();
+    let if_range_fresh = client
+        .get(&url)
+        .header("Range", "bytes=100-199")
+        .header("If-Range", &etag)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(if_range_fresh.status(), 206);
-    assert_eq!(if_range_fresh.bytes().await.unwrap().as_ref(), &content[100..200]);
+    assert_eq!(
+        if_range_fresh.bytes().await.unwrap().as_ref(),
+        &content[100..200]
+    );
 
     // If-Range with a stale etag: the precondition fails, so Range is
     // ignored entirely and the full representation comes back as 200 -
     // not a 206 of the wrong bytes, and not a 412/416 either.
-    let if_range_stale = client.get(&url).header("Range", "bytes=100-199").header("If-Range", "W/\"stale-0\"").send().await.unwrap();
+    let if_range_stale = client
+        .get(&url)
+        .header("Range", "bytes=100-199")
+        .header("If-Range", "W/\"stale-0\"")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(if_range_stale.status(), 200);
-    assert_eq!(if_range_stale.bytes().await.unwrap().as_ref(), content.as_slice());
+    assert_eq!(
+        if_range_stale.bytes().await.unwrap().as_ref(),
+        content.as_slice()
+    );
 
     // No Accept-Ranges: a range is meaningless against an on-the-fly
     // compressed representation. The ETag keeps its opaque tag but is
     // weakened rather than made encoding-specific.
     let no_gzip_client = reqwest::Client::builder().no_gzip().build().unwrap();
-    let compressed = no_gzip_client.get(&url).header("Accept-Encoding", "gzip").send().await.unwrap();
-    assert_eq!(compressed.headers().get("content-encoding").unwrap(), "gzip");
+    let compressed = no_gzip_client
+        .get(&url)
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        compressed.headers().get("content-encoding").unwrap(),
+        "gzip"
+    );
     assert!(compressed.headers().get("accept-ranges").is_none());
     assert_eq!(compressed.headers().get("vary").unwrap(), "Accept-Encoding");
-    let gzip_etag = compressed.headers().get("etag").unwrap().to_str().unwrap().to_string();
-    assert_eq!(gzip_etag, format!("W/{etag}"), "same opaque tag as the identity response's, just weakened");
+    let gzip_etag = compressed
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        gzip_etag,
+        format!("W/{etag}"),
+        "same opaque tag as the identity response's, just weakened"
+    );
 
     // That weakened ETag can never satisfy If-Range (strong comparison
     // only) - even reused immediately, on the same file, with no actual
     // staleness at all.
-    let if_range_weak = client.get(&url).header("Range", "bytes=100-199").header("If-Range", &gzip_etag).send().await.unwrap();
-    assert_eq!(if_range_weak.status(), 200, "a weak If-Range must never be honored, per RFC 9110 §13.1.5");
+    let if_range_weak = client
+        .get(&url)
+        .header("Range", "bytes=100-199")
+        .header("If-Range", &gzip_etag)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        if_range_weak.status(),
+        200,
+        "a weak If-Range must never be honored, per RFC 9110 §13.1.5"
+    );
 
     let _ = tokio::fs::remove_dir_all(&root).await;
 }
@@ -337,18 +496,36 @@ async fn static_file_range_and_conditional_requests() {
 #[tokio::test]
 async fn small_static_file_gets_no_vary_header() {
     let root = std::env::temp_dir().join(format!("vary-test-{}", next_port()));
-    tokio::fs::create_dir_all(root.join("public")).await.unwrap();
-    tokio::fs::write(root.join("public/tiny.txt"), b"too small to compress").await.unwrap();
+    tokio::fs::create_dir_all(root.join("public"))
+        .await
+        .unwrap();
+    tokio::fs::write(root.join("public/tiny.txt"), b"too small to compress")
+        .await
+        .unwrap();
 
     let server = start_server("vary", root.to_str().unwrap(), serde_json::json!({})).await;
     let url = format!("http://127.0.0.1:{}/tiny.txt", server.port);
 
-    let resp = reqwest::Client::new().get(&url).header("Accept-Encoding", "gzip").send().await.unwrap();
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("content-encoding").is_none(), "well under min_size_bytes, must not compress");
-    assert!(resp.headers().get("vary").is_none(), "never compression-eligible, so it can't vary by encoding");
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "well under min_size_bytes, must not compress"
+    );
+    assert!(
+        resp.headers().get("vary").is_none(),
+        "never compression-eligible, so it can't vary by encoding"
+    );
     let etag = resp.headers().get("etag").unwrap().to_str().unwrap();
-    assert!(!etag.starts_with("W/"), "an ineligible response's ETag must stay strong: {etag}");
+    assert!(
+        !etag.starts_with("W/"),
+        "an ineligible response's ETag must stay strong: {etag}"
+    );
 
     let _ = tokio::fs::remove_dir_all(&root).await;
 }
@@ -361,13 +538,32 @@ async fn small_static_file_gets_no_vary_header() {
 async fn php_location_redirect_uses_303_for_post_and_302_for_get() {
     let www = fixtures_dir().join("www");
     let server = start_server("redirect", www.to_str().unwrap(), serde_json::json!({})).await;
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
 
-    let get_resp = client.get(format!("http://127.0.0.1:{}/redirect", server.port)).send().await.unwrap();
-    assert_eq!(get_resp.status(), 302, "GET with no explicit code stays 302");
+    let get_resp = client
+        .get(format!("http://127.0.0.1:{}/redirect", server.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_resp.status(),
+        302,
+        "GET with no explicit code stays 302"
+    );
 
-    let post_resp = client.post(format!("http://127.0.0.1:{}/redirect", server.port)).send().await.unwrap();
-    assert_eq!(post_resp.status(), 303, "POST with no explicit code becomes 303 - needs proto_num > 1000");
+    let post_resp = client
+        .post(format!("http://127.0.0.1:{}/redirect", server.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        post_resp.status(),
+        303,
+        "POST with no explicit code becomes 303 - needs proto_num > 1000"
+    );
 
     assert_eq!(get_resp.headers().get("location").unwrap(), "/done");
     assert_eq!(post_resp.headers().get("location").unwrap(), "/done");
@@ -407,7 +603,10 @@ async fn php_streams_a_large_multi_chunk_response_correctly() {
         .await
         .unwrap();
     assert_eq!(compressed.status(), 200);
-    assert_eq!(compressed.headers().get("content-encoding").unwrap(), "zstd");
+    assert_eq!(
+        compressed.headers().get("content-encoding").unwrap(),
+        "zstd"
+    );
     let compressed_bytes = compressed.bytes().await.unwrap();
     let decoded = String::from_utf8(zstd::decode_all(compressed_bytes.as_ref()).unwrap()).unwrap();
     assert_eq!(decoded, expected);
@@ -419,7 +618,12 @@ async fn php_streams_a_large_multi_chunk_response_correctly() {
 #[tokio::test]
 async fn php_streams_a_single_huge_echo_call_correctly() {
     let www = fixtures_dir().join("www");
-    let server = start_server("php-stream-one-echo", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "php-stream-one-echo",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let expected: String = "0123456789abcdef".repeat(256 * 1000);
 
@@ -445,21 +649,44 @@ async fn php_streams_a_single_huge_echo_call_correctly() {
 #[tokio::test]
 async fn php_response_with_oversized_headers_reaches_client_intact() {
     let www = fixtures_dir().join("www");
-    let server = start_server("php-many-headers", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "php-many-headers",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let resp = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}/many-headers?n=50&vsize=6000&csp=1", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/many-headers?n=50&vsize=6000&csp=1",
+            server.port
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
 
     let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
-    assert_eq!(cookies.len(), 50, "expected all 50 Set-Cookie headers to survive the split/reassembly");
-    assert_eq!(cookies[0].to_str().unwrap(), format!("cookie_0={}; Path=/", "v".repeat(6000)));
-    assert_eq!(cookies[49].to_str().unwrap(), format!("cookie_49={}; Path=/", "v".repeat(6000)));
+    assert_eq!(
+        cookies.len(),
+        50,
+        "expected all 50 Set-Cookie headers to survive the split/reassembly"
+    );
+    assert_eq!(
+        cookies[0].to_str().unwrap(),
+        format!("cookie_0={}; Path=/", "v".repeat(6000))
+    );
+    assert_eq!(
+        cookies[49].to_str().unwrap(),
+        format!("cookie_49={}; Path=/", "v".repeat(6000))
+    );
 
-    let csp = resp.headers().get("content-security-policy").unwrap().to_str().unwrap();
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert_eq!(csp, expected_csp());
 
     let body = resp.text().await.unwrap();
@@ -479,22 +706,41 @@ fn expected_csp() -> String {
 #[tokio::test]
 async fn php_response_with_one_oversized_header_value_reaches_client_intact() {
     let www = fixtures_dir().join("www");
-    let server = start_server("php-one-big-header", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "php-one-big-header",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("http://127.0.0.1:{}/many-headers?n=5&csp=1", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/many-headers?n=5&csp=1",
+            server.port
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get_all("set-cookie").iter().count(), 5);
-    assert_eq!(resp.headers().get("content-security-policy").unwrap().to_str().unwrap(), expected_csp());
+    assert_eq!(
+        resp.headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected_csp()
+    );
     assert_eq!(resp.text().await.unwrap(), "headers-ok n=5\n");
 
     // The same worker's very next response, ordinary-sized headers - proves
     // the split path didn't leave the ring/worker in a bad state.
-    let ordinary = client.get(format!("http://127.0.0.1:{}/", server.port)).send().await.unwrap();
+    let ordinary = client
+        .get(format!("http://127.0.0.1:{}/", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(ordinary.status(), 200);
     assert!(ordinary.text().await.unwrap().starts_with("PHP response"));
 }
@@ -505,17 +751,32 @@ async fn php_response_with_one_oversized_header_value_reaches_client_intact() {
 #[tokio::test]
 async fn a_script_reflected_control_byte_in_a_header_does_not_break_the_response() {
     let www = fixtures_dir().join("www");
-    let server = start_server("reflect-header", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "reflect-header",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/reflect-header?v=%01", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/reflect-header?v=%01",
+            server.port
+        ))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 200, "an invalid reflected header must not fail the whole response");
+    assert_eq!(
+        resp.status(),
+        200,
+        "an invalid reflected header must not fail the whole response"
+    );
     assert_eq!(resp.headers().get("x-before").unwrap(), "still-here");
-    assert!(resp.headers().get("x-reflected").is_none(), "the invalid header itself must be dropped");
+    assert!(
+        resp.headers().get("x-reflected").is_none(),
+        "the invalid header itself must be dropped"
+    );
     assert_eq!(
         resp.headers().get("x-after").unwrap(),
         "also-here",
@@ -525,7 +786,11 @@ async fn a_script_reflected_control_byte_in_a_header_does_not_break_the_response
 
     // The same worker's very next response - proves this didn't leave the
     // ring/worker or the connection in a bad state.
-    let ordinary = client.get(format!("http://127.0.0.1:{}/", server.port)).send().await.unwrap();
+    let ordinary = client
+        .get(format!("http://127.0.0.1:{}/", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(ordinary.status(), 200);
     assert!(ordinary.text().await.unwrap().starts_with("PHP response"));
 }
@@ -548,12 +813,26 @@ async fn rate_limit_only_applies_to_matching_user_agents_and_recovers_with_retry
 
     // Burst capacity of 2 for a matching User-Agent.
     for n in 1..=2 {
-        let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (compatible; GPTBot/1.0)").send().await.unwrap();
-        assert_eq!(resp.status(), 200, "request {n} should still be within budget");
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (compatible; GPTBot/1.0)")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {n} should still be within budget"
+        );
     }
 
     // The third exceeds the burst.
-    let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (compatible; GPTBot/1.0)").send().await.unwrap();
+    let resp = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0 (compatible; GPTBot/1.0)")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 429);
     assert_eq!(resp.headers().get("retry-after").unwrap(), "60");
     assert!(resp.text().await.unwrap().contains("too many requests"));
@@ -561,8 +840,17 @@ async fn rate_limit_only_applies_to_matching_user_agents_and_recovers_with_retry
     // A non-matching User-Agent is never subject to this limiter at all -
     // exhausting the GPTBot budget above must not have touched it.
     for _ in 0..5 {
-        let resp = client.get(&url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)").send().await.unwrap();
-        assert_eq!(resp.status(), 200, "a non-matching User-Agent must never be rate-limited");
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "a non-matching User-Agent must never be rate-limited"
+        );
     }
 }
 
@@ -596,7 +884,11 @@ async fn x_forwarded_for_cannot_buy_extra_rate_limit_budget() {
             .unwrap();
         statuses.push(resp.status().as_u16());
     }
-    assert_eq!(statuses, vec![200, 200, 200, 429, 429, 429], "trusted_proxies is empty, so a rotating X-Forwarded-For must buy nothing");
+    assert_eq!(
+        statuses,
+        vec![200, 200, 200, 429, 429, 429],
+        "trusted_proxies is empty, so a rotating X-Forwarded-For must buy nothing"
+    );
 }
 
 /// The other half: with the peer configured as a trusted proxy, its
@@ -631,8 +923,16 @@ async fn a_trusted_proxy_gets_a_bucket_per_forwarded_client() {
 
     assert_eq!(get("198.51.100.20").await, 200);
     assert_eq!(get("198.51.100.20").await, 200);
-    assert_eq!(get("198.51.100.20").await, 429, "the first forwarded client's own burst must run out");
-    assert_eq!(get("198.51.100.21").await, 200, "a different forwarded client must have its own budget");
+    assert_eq!(
+        get("198.51.100.20").await,
+        429,
+        "the first forwarded client's own burst must run out"
+    );
+    assert_eq!(
+        get("198.51.100.21").await,
+        200,
+        "a different forwarded client must have its own budget"
+    );
 }
 
 /// A proxy serves many clients down one keep-alive connection, so caching a
@@ -648,12 +948,19 @@ async fn one_keep_alive_connection_resolves_each_request_forwarded_client() {
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
 
     let mut seen = Vec::new();
     for client in ["198.51.100.20", "198.51.100.21"] {
         stream
-            .write_all(format!("GET /app HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: {client}\r\n\r\n").as_bytes())
+            .write_all(
+                format!(
+                    "GET /app HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: {client}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
             .await
             .unwrap();
         stream.flush().await.unwrap();
@@ -674,7 +981,13 @@ async fn one_keep_alive_connection_resolves_each_request_forwarded_client() {
             }
         }
         let body = String::from_utf8_lossy(&buf).to_string();
-        let addr = body.split("REMOTE_ADDR=").nth(1).and_then(|rest| rest.split('\n').next()).unwrap().trim().to_string();
+        let addr = body
+            .split("REMOTE_ADDR=")
+            .nth(1)
+            .and_then(|rest| rest.split('\n').next())
+            .unwrap()
+            .trim()
+            .to_string();
         seen.push(addr);
     }
 
@@ -696,37 +1009,66 @@ async fn one_keep_alive_connection_resolves_each_request_forwarded_client() {
 #[tokio::test]
 async fn oversized_headers_run_past_the_cap_does_not_leak_a_blocked_worker() {
     let www = fixtures_dir().join("www");
-    let server = start_server("php-headers-cap", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "php-headers-cap",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let pids_before = worker_pids(&server).await;
-    assert!(!pids_before.is_empty(), "expected pre-spawned spare workers before the request");
+    assert!(
+        !pids_before.is_empty(),
+        "expected pre-spawned spare workers before the request"
+    );
     // By process instance, not pid: the pool keeps spawning replacements
     // while this polls, and a healthy one can legitimately reuse the pid.
-    let start_times_before: std::collections::HashMap<i64, String> =
-        pids_before.iter().map(|&p| (p, process_start_time(p).expect("pre-existing worker must be readable"))).collect();
+    let start_times_before: std::collections::HashMap<i64, String> = pids_before
+        .iter()
+        .map(|&p| {
+            (
+                p,
+                process_start_time(p).expect("pre-existing worker must be readable"),
+            )
+        })
+        .collect();
 
     // Both the first attempt and `dispatch()`'s retry hit the exact same
     // deterministic PHP script, so both involved workers must end up
     // truly dead - not just the first one.
     let resp = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}/many-headers?n=300&vsize=60000", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/many-headers?n=300&vsize=60000",
+            server.port
+        ))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 500, "both attempts should exhaust and the request should fail cleanly, not hang");
+    assert_eq!(
+        resp.status(),
+        500,
+        "both attempts should exhaust and the request should fail cleanly, not hang"
+    );
 
     // A pid leaves `/status` before the kill is necessarily even delivered,
     // so this only proves the bookkeeping updated.
     let detect_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let consumed = loop {
         let current = worker_pids(&server).await;
-        let consumed: Vec<i64> = pids_before.iter().copied().filter(|p| !current.contains(p)).collect();
+        let consumed: Vec<i64> = pids_before
+            .iter()
+            .copied()
+            .filter(|p| !current.contains(p))
+            .collect();
         if !consumed.is_empty() || tokio::time::Instant::now() > detect_deadline {
             break consumed;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert!(!consumed.is_empty(), "expected at least one pre-existing worker to have been consumed by the request");
+    assert!(
+        !consumed.is_empty(),
+        "expected at least one pre-existing worker to have been consumed by the request"
+    );
 
     // Poll to actual death rather than wait a fixed delay: the reap cadence
     // is a steady-state figure, and the whole suite running at once pushes it
@@ -777,11 +1119,21 @@ fn process_real_uid(pid: i64) -> Option<u32> {
 }
 
 async fn status_json(server: &TestServer) -> serde_json::Value {
-    reqwest::get(format!("http://127.0.0.1:{}/", server.status_port)).await.unwrap().json().await.unwrap()
+    reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
 }
 
 async fn worker_pids(server: &TestServer) -> Vec<i64> {
-    status_json(server).await["php"]["workers"].as_array().unwrap().iter().map(|w| w["pid"].as_i64().unwrap()).collect()
+    status_json(server).await["php"]["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["pid"].as_i64().unwrap())
+        .collect()
 }
 
 /// With no user or group configured, the worker must run as this test
@@ -797,14 +1149,20 @@ async fn php_user_group_omitted_inherits_masters_own_identity() {
     )
     .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let pids = worker_pids(&server).await;
     assert_eq!(pids.len(), 1, "expected exactly one worker: {pids:?}");
-    let worker_uid = process_real_uid(pids[0]).expect("worker process must still be alive and readable via /proc");
+    let worker_uid = process_real_uid(pids[0])
+        .expect("worker process must still be alive and readable via /proc");
     let own_uid = nix::unistd::getuid().as_raw();
-    assert_eq!(worker_uid, own_uid, "worker must inherit this test process's own uid when php.user/group are omitted");
+    assert_eq!(
+        worker_uid, own_uid,
+        "worker must inherit this test process's own uid when php.user/group are omitted"
+    );
 }
 
 #[tokio::test]
@@ -812,9 +1170,12 @@ async fn php_dispatch_falls_back_from_missing_static_file() {
     let www = fixtures_dir().join("www");
     let server = start_server("php-fallback", www.to_str().unwrap(), serde_json::json!({})).await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/does-not-exist-as-a-file", server.port))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{}/does-not-exist-as-a-file",
+        server.port
+    ))
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.starts_with("PHP response"), "got: {body}");
@@ -839,10 +1200,15 @@ async fn php_dispatch_falls_back_through_a_multi_level_static_chain() {
     )
     .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.starts_with("PHP response"), "expected the chain to fall through both missing static roots to php: {body}");
+    assert!(
+        body.starts_with("PHP response"),
+        "expected the chain to fall through both missing static roots to php: {body}"
+    );
 }
 
 /// Several named entrypoints sharing one pool, covering both target modes.
@@ -882,16 +1248,27 @@ async fn targets_share_one_pool_with_independent_entrypoints() {
 
     // "script" target: single front-controller, PATH_INFO = whole URL path
     // - same convention the default (no-target) entrypoint already used.
-    let resp = client.get(format!("http://127.0.0.1:{}/api/whoami", server.port)).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/api/whoami", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("api target pid="), "got: {body}");
     assert!(body.contains("SCRIPT_NAME=/index.php"), "got: {body}");
     assert!(body.contains("PATH_INFO=/api/whoami"), "got: {body}");
-    assert!(body.contains(&format!("DOCUMENT_ROOT={}", api_root.to_str().unwrap())), "got: {body}");
+    assert!(
+        body.contains(&format!("DOCUMENT_ROOT={}", api_root.to_str().unwrap())),
+        "got: {body}"
+    );
 
     // "index" target: direct URL -> file match, no PATH_INFO.
-    let resp = client.get(format!("http://127.0.0.1:{}/legacy/foo.php", server.port)).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/legacy/foo.php", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("legacy foo pid="), "got: {body}");
@@ -903,17 +1280,27 @@ async fn targets_share_one_pool_with_independent_entrypoints() {
 
     // "index" target: PATH_INFO split after the matched script.
     let resp = client
-        .get(format!("http://127.0.0.1:{}/legacy/sub/handler.php/extra/path", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/legacy/sub/handler.php/extra/path",
+            server.port
+        ))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("SCRIPT_NAME=/legacy/sub/handler.php"), "got: {body}");
+    assert!(
+        body.contains("SCRIPT_NAME=/legacy/sub/handler.php"),
+        "got: {body}"
+    );
     assert!(body.contains("PATH_INFO=/extra/path"), "got: {body}");
 
     // "index" target: directory-style request appends the target's index.
-    let resp = client.get(format!("http://127.0.0.1:{}/legacy/dir/", server.port)).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/legacy/dir/", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("legacy dir index pid="), "got: {body}");
@@ -921,11 +1308,19 @@ async fn targets_share_one_pool_with_independent_entrypoints() {
     // "index" target: nothing on disk matches -> a plain 404, not a PHP
     // error (resolve_index_target returning None short-circuits before any
     // worker is ever dispatched to).
-    let resp = client.get(format!("http://127.0.0.1:{}/legacy/nope.php", server.port)).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/legacy/nope.php", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 
     // Default (no-target) entrypoint keeps working unchanged, same server.
-    let resp = client.get(format!("http://127.0.0.1:{}/app", server.port)).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/app", server.port))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let mut handles = Vec::new();
@@ -938,19 +1333,25 @@ async fn targets_share_one_pool_with_independent_entrypoints() {
             _ => "/app",
         };
         handles.push(tokio::spawn(async move {
-            client.get(format!("http://127.0.0.1:{port}{path}")).send().await.unwrap().status()
+            client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
         }));
     }
     for h in handles {
         assert_eq!(h.await.unwrap(), reqwest::StatusCode::OK);
     }
 
-    let status: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let status: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     assert!(
         status["php"]["processes"]["total"].as_u64().unwrap() <= 2,
         "targets must share one pool, not spawn one per target: {status}"
@@ -987,7 +1388,10 @@ async fn host_routing_selects_between_two_virtual_targets() {
         .await
         .unwrap();
     let body = resp.text().await.unwrap();
-    assert!(body.contains("api target pid="), "Host: api.example.test should route to the api target: {body}");
+    assert!(
+        body.contains("api target pid="),
+        "Host: api.example.test should route to the api target: {body}"
+    );
 
     let resp = client
         .get(format!("http://127.0.0.1:{}/", server.port))
@@ -996,7 +1400,10 @@ async fn host_routing_selects_between_two_virtual_targets() {
         .await
         .unwrap();
     let body = resp.text().await.unwrap();
-    assert!(body.contains("PHP response"), "any other Host should fall through to the catch-all default target: {body}");
+    assert!(
+        body.contains("PHP response"),
+        "any other Host should fall through to the catch-all default target: {body}"
+    );
 
     // Host headers aren't case-sensitive - the resolved value gets
     // lowercased before matching (config patterns are documented as
@@ -1008,7 +1415,10 @@ async fn host_routing_selects_between_two_virtual_targets() {
         .await
         .unwrap();
     let body = resp.text().await.unwrap();
-    assert!(body.contains("api target pid="), "Host matching must be case-insensitive: {body}");
+    assert!(
+        body.contains("api target pid="),
+        "Host matching must be case-insensitive: {body}"
+    );
 }
 
 /// LIFO, not FIFO: two workers finish at deliberately different times, and
@@ -1016,13 +1426,20 @@ async fn host_routing_selects_between_two_virtual_targets() {
 #[tokio::test]
 async fn idle_workers_are_reused_in_lifo_order() {
     let www = fixtures_dir().join("www");
-    let server =
-        start_server("lifo-reuse", www.to_str().unwrap(), serde_json::json!({ "php": { "processes": { "max": 2, "spare": 0 } } }))
-            .await;
+    let server = start_server(
+        "lifo-reuse",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "processes": { "max": 2, "spare": 0 } } }),
+    )
+    .await;
     let client = reqwest::Client::new();
 
     fn extract_pid(body: &str) -> String {
-        body.split("pid=").nth(1).and_then(|s| s.split(',').next()).unwrap().to_string()
+        body.split("pid=")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .unwrap()
+            .to_string()
     }
 
     // Both dispatched before either finishes, so two distinct workers are
@@ -1034,17 +1451,38 @@ async fn idle_workers_are_reused_in_lifo_order() {
         async move { client.get(url).send().await.unwrap().text().await.unwrap() }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let fast_body = client.get(format!("http://127.0.0.1:{}/app", server.port)).send().await.unwrap().text().await.unwrap();
+    let fast_body = client
+        .get(format!("http://127.0.0.1:{}/app", server.port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     let fast_pid = extract_pid(&fast_body);
 
     let slow_body = slow.await.unwrap();
     let slow_pid = extract_pid(&slow_body);
-    assert_ne!(slow_pid, fast_pid, "the two concurrent requests must have landed on two distinct workers");
+    assert_ne!(
+        slow_pid, fast_pid,
+        "the two concurrent requests must have landed on two distinct workers"
+    );
 
     // `fast`'s worker went idle first, `slow`'s worker went idle second
     // (most recent) - LIFO must pick `slow`'s worker next, not `fast`'s.
-    let next_body = client.get(format!("http://127.0.0.1:{}/app", server.port)).send().await.unwrap().text().await.unwrap();
-    assert_eq!(extract_pid(&next_body), slow_pid, "LIFO reuse must pick the most-recently-idled worker");
+    let next_body = client
+        .get(format!("http://127.0.0.1:{}/app", server.port))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        extract_pid(&next_body),
+        slow_pid,
+        "LIFO reuse must pick the most-recently-idled worker"
+    );
 }
 
 /// A script-set `Content-Length` disagreeing with the real output makes the
@@ -1054,26 +1492,51 @@ async fn idle_workers_are_reused_in_lifo_order() {
 #[tokio::test]
 async fn php_script_content_length_mismatch_does_not_desync_the_connection() {
     let www = fixtures_dir().join("www");
-    let server = start_server("bad-content-length", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "bad-content-length",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::new(); // one client -> connection reuse across requests
 
     for (path, expected_body) in [
-        ("/bad-content-length-under", "much more than two bytes of actual body\n"),
+        (
+            "/bad-content-length-under",
+            "much more than two bytes of actual body\n",
+        ),
         ("/bad-content-length-over", "hi"),
     ] {
-        let resp = client.get(format!("http://127.0.0.1:{}{path}", server.port)).send().await.unwrap();
+        let resp = client
+            .get(format!("http://127.0.0.1:{}{path}", server.port))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(resp.status(), 200);
-        assert!(resp.headers().get("content-length").is_none(), "the script's bogus Content-Length must never reach the wire: {path}");
+        assert!(
+            resp.headers().get("content-length").is_none(),
+            "the script's bogus Content-Length must never reach the wire: {path}"
+        );
         let body = resp.text().await.unwrap();
-        assert_eq!(body, expected_body, "the full real body must be delivered, never truncated to the script's claimed length: {path}");
+        assert_eq!(
+            body, expected_body,
+            "the full real body must be delivered, never truncated to the script's claimed length: {path}"
+        );
 
         // The very next request on this same (reused) connection must be
         // completely uncorrupted - proves no leftover bytes from the
         // mismatched response leaked onto it.
-        let follow_up = client.get(format!("http://127.0.0.1:{}/app", server.port)).send().await.unwrap();
+        let follow_up = client
+            .get(format!("http://127.0.0.1:{}/app", server.port))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(follow_up.status(), 200);
         let follow_up_body = follow_up.text().await.unwrap();
-        assert!(follow_up_body.starts_with("PHP response, worker pid="), "connection desync after {path}: got {follow_up_body:?}");
+        assert!(
+            follow_up_body.starts_with("PHP response, worker pid="),
+            "connection desync after {path}: got {follow_up_body:?}"
+        );
     }
 }
 
@@ -1093,7 +1556,11 @@ async fn worker_is_reused_then_recycles_without_client_visible_errors() {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), 200, "recycling must never surface as a client error");
+        assert_eq!(
+            resp.status(),
+            200,
+            "recycling must never surface as a client error"
+        );
         let body = resp.text().await.unwrap();
         let pid = body
             .split("pid=")
@@ -1129,13 +1596,19 @@ async fn watchdog_kills_hung_worker_and_returns_504() {
 
     // Pool must still be healthy afterward - status endpoint alive, and it
     // reports at least one watchdog kill.
-    let status: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert!(status["php"]["counters"]["watchdog_kills"].as_u64().unwrap() >= 1);
+    let status: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert!(
+        status["php"]["counters"]["watchdog_kills"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 }
 
 /// The worker dies after it has already streamed real bytes, so the response
@@ -1166,7 +1639,9 @@ async fn worker_killed_mid_stream_ends_the_response_and_pool_recovers() {
     let client = reqwest::Client::new();
     let mut resp = tokio::time::timeout(
         Duration::from_secs(10),
-        client.get(format!("http://127.0.0.1:{}/stream-then-die", server.port)).send(),
+        client
+            .get(format!("http://127.0.0.1:{}/stream-then-die", server.port))
+            .send(),
     )
     .await
     .expect("headers never arrived")
@@ -1183,8 +1658,11 @@ async fn worker_killed_mid_stream_ends_the_response_and_pool_recovers() {
     // the one serving this request.
     let pids = worker_pids(&server).await;
     assert_eq!(pids.len(), 1, "expected exactly one worker: {pids:?}");
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pids[0] as i32), nix::sys::signal::Signal::SIGKILL)
-        .expect("failed to SIGKILL the worker");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pids[0] as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("failed to SIGKILL the worker");
 
     // The connection must actually end - not hang forever waiting for
     // bytes that will never come.
@@ -1197,18 +1675,41 @@ async fn worker_killed_mid_stream_ends_the_response_and_pool_recovers() {
         }
     })
     .await;
-    assert!(drained.is_ok(), "response never ended after its worker was killed - connection hung");
+    assert!(
+        drained.is_ok(),
+        "response never ended after its worker was killed - connection hung"
+    );
 
     // Pool must have recovered: a fresh request gets a normal response,
     // not stuck behind a dead worker or a wedged semaphore permit.
-    let recovered = client.get(format!("http://127.0.0.1:{}/app", server.port)).send().await.unwrap();
-    assert_eq!(recovered.status(), 200, "pool did not recover after the worker was killed mid-stream");
+    let recovered = client
+        .get(format!("http://127.0.0.1:{}/app", server.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        recovered.status(),
+        200,
+        "pool did not recover after the worker was killed mid-stream"
+    );
 
     // Already dead by the time master read from it, so this is the
     // read-failure path, not a watchdog kill.
     let status = status_json(&server).await;
-    assert!(status["php"]["counters"]["requests_failed"].as_u64().unwrap() >= 1, "got: {status}");
-    assert_eq!(status["php"]["counters"]["watchdog_kills"].as_u64().unwrap(), 0, "got: {status}");
+    assert!(
+        status["php"]["counters"]["requests_failed"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "got: {status}"
+    );
+    assert_eq!(
+        status["php"]["counters"]["watchdog_kills"]
+            .as_u64()
+            .unwrap(),
+        0,
+        "got: {status}"
+    );
 }
 
 /// Once every worker slot is occupied by a hung request, a further
@@ -1280,7 +1781,12 @@ async fn compression_respects_min_size_threshold() {
 #[tokio::test]
 async fn compression_prefers_zstd_over_brotli_and_gzip() {
     let www = fixtures_dir().join("www");
-    let server = start_server("compression-zstd", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "compression-zstd",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::builder().no_gzip().build().unwrap();
 
     let resp = client
@@ -1293,7 +1799,9 @@ async fn compression_prefers_zstd_over_brotli_and_gzip() {
     let compressed = resp.bytes().await.unwrap();
     let decoded = String::from_utf8(zstd::decode_all(compressed.as_ref()).unwrap()).unwrap();
 
-    let expected = tokio::fs::read_to_string(www.join("public/big.txt")).await.unwrap();
+    let expected = tokio::fs::read_to_string(www.join("public/big.txt"))
+        .await
+        .unwrap();
     assert_eq!(decoded, expected);
 }
 
@@ -1305,15 +1813,18 @@ async fn status_endpoint_reports_pool_shape() {
 
     // Exercise a real PHP dispatch first, so `workers[]` has a real,
     // request_count > 0 entry to check, not just the pre-spawned spares.
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let status: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
-        .await
-        .unwrap()
-        .json()
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
         .await
         .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let status: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     assert!(status["php"]["processes"]["max"].as_u64().unwrap() >= 1);
     assert!(status["php"]["counters"]["requests_total"].is_u64());
     assert!(status["uptime_seconds"].is_u64());
@@ -1324,7 +1835,10 @@ async fn status_endpoint_reports_pool_shape() {
     assert!(status["php"]["prototype_pid"].as_i64().unwrap() > 0);
     let idle = status["php"]["processes"]["idle"].as_u64().unwrap();
     let busy = status["php"]["processes"]["busy"].as_u64().unwrap();
-    assert_eq!(status["php"]["processes"]["total"].as_u64().unwrap(), idle + busy);
+    assert_eq!(
+        status["php"]["processes"]["total"].as_u64().unwrap(),
+        idle + busy
+    );
     assert!(status["php"]["queue"]["depth"].is_u64());
     assert!(status["php"]["queue"]["max_depth"].is_u64());
     for counter in [
@@ -1334,13 +1848,24 @@ async fn status_endpoint_reports_pool_shape() {
         "prototype_respawns_total",
         "crash_loop_backoffs",
     ] {
-        assert!(status["php"]["counters"][counter].is_u64(), "missing counter: {counter}");
+        assert!(
+            status["php"]["counters"][counter].is_u64(),
+            "missing counter: {counter}"
+        );
     }
 
     let workers = status["php"]["workers"].as_array().unwrap();
-    assert!(!workers.is_empty(), "expected at least one worker after a real dispatch");
-    let served = workers.iter().find(|w| w["request_count"].as_u64() == Some(1));
-    assert!(served.is_some(), "expected a worker with request_count == 1, got: {workers:?}");
+    assert!(
+        !workers.is_empty(),
+        "expected at least one worker after a real dispatch"
+    );
+    let served = workers
+        .iter()
+        .find(|w| w["request_count"].as_u64() == Some(1));
+    assert!(
+        served.is_some(),
+        "expected a worker with request_count == 1, got: {workers:?}"
+    );
     let w = served.unwrap();
     assert!(w["pid"].as_i64().unwrap() > 0);
     assert!(w["state"] == "idle" || w["state"] == "busy");
@@ -1370,8 +1895,14 @@ async fn static_route_rejects_path_traversal() {
     let mut resp = String::new();
     sock.read_to_string(&mut resp).await.unwrap();
 
-    assert!(resp.starts_with("HTTP/1.1 400"), "expected 400, got: {resp}");
-    assert!(!resp.contains("root:"), "must never leak /etc/passwd contents: {resp}");
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "expected 400, got: {resp}"
+    );
+    assert!(
+        !resp.contains("root:"),
+        "must never leak /etc/passwd contents: {resp}"
+    );
 }
 
 /// The real request reaches PHP's `$_SERVER`. The client IP is loopback here
@@ -1392,7 +1923,10 @@ async fn php_receives_real_request_data() {
 
     assert!(body.contains("METHOD=GET"), "got: {body}");
     assert!(body.contains("URI=/app?x=1"), "got: {body}");
-    assert!(body.contains("HEADER_X_TEST=custom-header-value"), "got: {body}");
+    assert!(
+        body.contains("HEADER_X_TEST=custom-header-value"),
+        "got: {body}"
+    );
     assert!(body.contains("REMOTE_ADDR=127.0.0.1"), "got: {body}");
 }
 
@@ -1402,7 +1936,12 @@ async fn php_receives_real_request_data() {
 #[tokio::test]
 async fn header_with_a_literal_underscore_never_reaches_php() {
     let www = fixtures_dir().join("www");
-    let server = start_server("underscore-header", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "underscore-header",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{}/app", server.port))
@@ -1411,7 +1950,10 @@ async fn header_with_a_literal_underscore_never_reaches_php() {
         .await
         .unwrap();
     let body = resp.text().await.unwrap();
-    assert!(body.contains("HEADER_X_TEST=MISSING"), "an underscore-named header must not populate HTTP_X_TEST: {body}");
+    assert!(
+        body.contains("HEADER_X_TEST=MISSING"),
+        "an underscore-named header must not populate HTTP_X_TEST: {body}"
+    );
 }
 
 /// The standard CGI vars, plus `php.environment` reaching `getenv()`. The
@@ -1445,9 +1987,15 @@ async fn php_receives_server_vars_and_environment() {
     assert!(body.contains("SERVER_PORT=9999"), "got: {body}");
     assert!(body.contains("SERVER_PROTOCOL=HTTP/1.1"), "got: {body}");
     assert!(body.contains("GATEWAY_INTERFACE=CGI/1.1"), "got: {body}");
-    assert!(body.contains(&format!("DOCUMENT_ROOT={}", www.to_str().unwrap())), "got: {body}");
     assert!(
-        body.contains(&format!("SCRIPT_FILENAME={}/index.php", www.to_str().unwrap())),
+        body.contains(&format!("DOCUMENT_ROOT={}", www.to_str().unwrap())),
+        "got: {body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "SCRIPT_FILENAME={}/index.php",
+            www.to_str().unwrap()
+        )),
         "got: {body}"
     );
     assert!(body.contains("SCRIPT_NAME=/index.php"), "got: {body}");
@@ -1479,7 +2027,9 @@ async fn php_environment_reaches_env_superglobal_when_variables_order_is_set_exp
     )
     .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     let body = resp.text().await.unwrap();
 
     assert!(body.contains("ENV_GETENV=hello-env"), "got: {body}");
@@ -1522,12 +2072,26 @@ async fn disable_functions_actually_disables_the_function() {
     )
     .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/disabled-function-check", server.port)).await.unwrap();
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{}/disabled-function-check",
+        server.port
+    ))
+    .await
+    .unwrap();
     let body = resp.text().await.unwrap();
     assert!(body.contains("EXEC_EXISTS=false"), "got: {body}");
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/call-disabled-function", server.port)).await.unwrap();
-    assert_eq!(resp.status(), 500, "calling a disabled function must still surface as a real error, not silently no-op");
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{}/call-disabled-function",
+        server.port
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        500,
+        "calling a disabled function must still surface as a real error, not silently no-op"
+    );
 }
 
 /// Admin wins on a key collision, and an `ini_set()` against it from inside
@@ -1550,12 +2114,23 @@ async fn admin_ini_option_wins_over_user_and_locks_against_ini_set() {
     )
     .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/ini-check", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/ini-check", server.port))
+        .await
+        .unwrap();
     let body = resp.text().await.unwrap();
 
-    assert!(body.contains("MEMORY_LIMIT=128M"), "admin should win over user on the same key: {body}");
-    assert!(body.contains("INI_SET_RESULT=false"), "an admin-locked directive must reject the script's own ini_set(): {body}");
-    assert!(body.contains("MEMORY_LIMIT_AFTER_SET=128M"), "the rejected ini_set() must not have changed anything: {body}");
+    assert!(
+        body.contains("MEMORY_LIMIT=128M"),
+        "admin should win over user on the same key: {body}"
+    );
+    assert!(
+        body.contains("INI_SET_RESULT=false"),
+        "an admin-locked directive must reject the script's own ini_set(): {body}"
+    );
+    assert!(
+        body.contains("MEMORY_LIMIT_AFTER_SET=128M"),
+        "the rejected ini_set() must not have changed anything: {body}"
+    );
 }
 
 /// This client is always a loopback peer, so only the value is exercised
@@ -1563,11 +2138,21 @@ async fn admin_ini_option_wins_over_user_and_locks_against_ini_set() {
 #[tokio::test]
 async fn https_off_by_default_without_the_forwarded_header() {
     let www = fixtures_dir().join("www");
-    let server = start_server("https-default", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "https-default",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     let body = resp.text().await.unwrap();
-    assert!(body.contains("HTTPS=MISSING"), "no X-Forwarded-Proto sent, HTTPS must stay absent: {body}");
+    assert!(
+        body.contains("HTTPS=MISSING"),
+        "no X-Forwarded-Proto sent, HTTPS must stay absent: {body}"
+    );
 }
 
 /// The response must return well before the script's own post-response
@@ -1600,7 +2185,10 @@ async fn fastcgi_finish_request_responds_early_and_keeps_worker_running() {
 
     // Background work genuinely still running right after the response -
     // proves finish_request delivered the response WITHOUT waiting for it.
-    assert!(!std::path::Path::new(&marker).exists(), "background work finished suspiciously fast");
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "background work finished suspiciously fast"
+    );
 
     // ...but it does eventually finish, and the worker comes back to idle.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -1608,20 +2196,27 @@ async fn fastcgi_finish_request_responds_early_and_keeps_worker_running() {
         if std::path::Path::new(&marker).exists() {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "background work never completed");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "background work never completed"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let marker_body = std::fs::read_to_string(&marker).unwrap();
-    assert!(marker_body.contains("background-work-done:true"), "got: {marker_body}");
+    assert!(
+        marker_body.contains("background-work-done:true"),
+        "got: {marker_body}"
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let status: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let status: serde_json::Value =
+            reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
         if status["php"]["processes"]["busy"].as_u64() == Some(0) {
             break;
         }
@@ -1644,11 +2239,19 @@ async fn fastcgi_finish_request_responds_early_and_keeps_worker_running() {
 #[tokio::test]
 async fn fastcgi_finish_request_registration_survives_autoloaded_compilation() {
     let www = fixtures_dir().join("www");
-    let server = start_server("fcgifinish-autoload", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "fcgifinish-autoload",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/fastcgi-finish-autoload", server.port))
-        .await
-        .unwrap();
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{}/fastcgi-finish-autoload",
+        server.port
+    ))
+    .await
+    .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert_eq!(body, "has_fastcgi_finish_request=true\n", "got: {body}");
@@ -1659,11 +2262,19 @@ async fn fastcgi_finish_request_registration_survives_autoloaded_compilation() {
 #[tokio::test]
 async fn fastcgi_finish_request_response_is_still_compressed() {
     let www = fixtures_dir().join("www");
-    let server = start_server("fcgifinishgzip", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "fcgifinishgzip",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::builder().no_gzip().build().unwrap(); // inspect the raw header/body ourselves
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/fastcgi-finish?big=1", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/fastcgi-finish?big=1",
+            server.port
+        ))
         .header("Accept-Encoding", "gzip")
         .send()
         .await
@@ -1681,8 +2292,16 @@ async fn fastcgi_finish_request_response_is_still_compressed() {
     );
     let compressed = resp.bytes().await.unwrap();
     let mut decoded = String::new();
-    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(compressed.as_ref()), &mut decoded).unwrap();
-    assert!(decoded.starts_with(&"x".repeat(2048)), "got: {} bytes decoded", decoded.len());
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(compressed.as_ref()),
+        &mut decoded,
+    )
+    .unwrap();
+    assert!(
+        decoded.starts_with(&"x".repeat(2048)),
+        "got: {} bytes decoded",
+        decoded.len()
+    );
 }
 
 /// A script that compressed the body itself must not be compressed again.
@@ -1703,12 +2322,24 @@ async fn a_script_that_encoded_its_own_body_is_not_encoded_again() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let encodings: Vec<String> =
-        resp.headers().get_all("content-encoding").iter().map(|v| v.to_str().unwrap().to_string()).collect();
-    assert_eq!(encodings, vec!["gzip"], "the script's own encoding must survive, exactly once");
+    let encodings: Vec<String> = resp
+        .headers()
+        .get_all("content-encoding")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        encodings,
+        vec!["gzip"],
+        "the script's own encoding must survive, exactly once"
+    );
 
     let body = resp.bytes().await.unwrap();
-    assert_eq!(&body[..2], b"\x1f\x8b", "body is no longer gzip - it was encoded a second time");
+    assert_eq!(
+        &body[..2],
+        b"\x1f\x8b",
+        "body is no longer gzip - it was encoded a second time"
+    );
 }
 
 /// A PHP stream has no known length to gate on, so eligibility comes from
@@ -1716,21 +2347,37 @@ async fn a_script_that_encoded_its_own_body_is_not_encoded_again() {
 #[tokio::test]
 async fn small_php_response_still_gets_compressed_and_varies() {
     let www = fixtures_dir().join("www");
-    let server = start_server("fcgifinish-small-vary", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "fcgifinish-small-vary",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::builder().no_gzip().build().unwrap();
 
     let resp = client
-        .get(format!("http://127.0.0.1:{}/fastcgi-finish?marker=novary", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/fastcgi-finish?marker=novary",
+            server.port
+        ))
         .header("Accept-Encoding", "gzip")
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip", "mime-eligible responses compress regardless of size");
+    assert_eq!(
+        resp.headers().get("content-encoding").unwrap(),
+        "gzip",
+        "mime-eligible responses compress regardless of size"
+    );
     assert_eq!(resp.headers().get("vary").unwrap(), "Accept-Encoding");
     let compressed = resp.bytes().await.unwrap();
     let mut decoded = String::new();
-    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(compressed.as_ref()), &mut decoded).unwrap();
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(compressed.as_ref()),
+        &mut decoded,
+    )
+    .unwrap();
     assert!(decoded.starts_with("quick-response pid="), "got: {decoded}");
 }
 
@@ -1751,16 +2398,29 @@ async fn invalid_config_fails_fast_instead_of_starting() {
         }
     });
     let config_path = std::env::temp_dir().join("test-config-invalid.json");
-    std::fs::File::create(&config_path).unwrap().write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes()).unwrap();
-
-    let output = tokio::task::spawn_blocking(move || Command::new(env!("CARGO_BIN_EXE_proteus")).arg(&config_path).output())
-        .await
+    std::fs::File::create(&config_path)
         .unwrap()
+        .write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes())
         .unwrap();
 
-    assert!(!output.status.success(), "server should refuse to start with php.processes.spare > max");
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg(&config_path)
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "server should refuse to start with php.processes.spare > max"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("php.processes.spare"), "got stderr: {stderr}");
+    assert!(
+        stderr.contains("php.processes.spare"),
+        "got stderr: {stderr}"
+    );
 }
 
 /// A direct invocation, which nothing stops a human from attempting, must
@@ -1768,11 +2428,14 @@ async fn invalid_config_fails_fast_instead_of_starting() {
 /// or hang.
 #[tokio::test]
 async fn internal_prototype_flag_refuses_a_direct_invocation() {
-    let output =
-        tokio::task::spawn_blocking(|| Command::new(env!("CARGO_BIN_EXE_proteus")).arg("--internal-prototype").output())
-            .await
-            .unwrap()
-            .unwrap();
+    let output = tokio::task::spawn_blocking(|| {
+        Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("--internal-prototype")
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
 
     assert_eq!(
         output.status.code(),
@@ -1782,7 +2445,10 @@ async fn internal_prototype_flag_refuses_a_direct_invocation() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not a SOCK_SEQPACKET control socket"), "got stderr: {stderr}");
+    assert!(
+        stderr.contains("not a SOCK_SEQPACKET control socket"),
+        "got stderr: {stderr}"
+    );
 }
 
 /// Self-contained, since the shared harness discards stdout. Drains the pipe
@@ -1811,7 +2477,10 @@ async fn access_log_includes_worker_pid_and_php_target() {
         }
     });
     let config_path = std::env::temp_dir().join("test-config-accesslog.json");
-    std::fs::File::create(&config_path).unwrap().write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes()).unwrap();
+    std::fs::File::create(&config_path)
+        .unwrap()
+        .write_all(serde_json::to_string_pretty(&config).unwrap().as_bytes())
+        .unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_proteus"))
         .arg(&config_path)
@@ -1825,7 +2494,10 @@ async fn access_log_includes_worker_pid_and_php_target() {
     let lines_writer = std::sync::Arc::clone(&lines);
     std::thread::spawn(move || {
         use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             lines_writer.lock().unwrap().push(line);
         }
     });
@@ -1837,13 +2509,22 @@ async fn access_log_includes_worker_pid_and_php_target() {
         if tokio::time::Instant::now() > deadline {
             panic!("server never became ready");
         }
-        match client.get(format!("http://127.0.0.1:{status_port}/")).timeout(Duration::from_millis(500)).send().await {
+        match client
+            .get(format!("http://127.0.0.1:{status_port}/"))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => break,
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
 
-    let resp = client.get(format!("http://127.0.0.1:{port}/app")).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/app"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1854,10 +2535,17 @@ async fn access_log_includes_worker_pid_and_php_target() {
         });
         if let Some(entry) = found {
             assert!(entry["worker_pid"].as_u64().unwrap() > 0, "got: {entry}");
-            assert_eq!(entry["php_target"].as_str().unwrap(), "default", "got: {entry}");
+            assert_eq!(
+                entry["php_target"].as_str().unwrap(),
+                "default",
+                "got: {entry}"
+            );
             return;
         }
-        assert!(tokio::time::Instant::now() < deadline, "access log line for the php request never appeared");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "access log line for the php request never appeared"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -1901,10 +2589,17 @@ async fn queue_max_depth_rejects_immediately_when_full() {
     // Queue is now full - this one must be rejected right away, not after
     // waiting out queue.timeout (5s).
     let start = tokio::time::Instant::now();
-    let resp = client.get(format!("http://127.0.0.1:{}/z", server.port)).send().await.unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{}/z", server.port))
+        .send()
+        .await
+        .unwrap();
     let elapsed = start.elapsed();
     assert_eq!(resp.status(), 503);
-    assert!(elapsed < Duration::from_secs(1), "should reject immediately, took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "should reject immediately, took {elapsed:?}"
+    );
 }
 
 /// POST body reaches PHP via php://input (read_post callback).
@@ -1923,7 +2618,10 @@ async fn php_receives_post_body() {
     let body = resp.text().await.unwrap();
 
     assert!(body.contains("METHOD=POST"), "got: {body}");
-    assert!(body.contains("BODY=hello-from-integration-test"), "got: {body}");
+    assert!(
+        body.contains("BODY=hello-from-integration-test"),
+        "got: {body}"
+    );
 }
 
 /// Not merely that PHP saw bytes: `is_uploaded_file()` and
@@ -1939,7 +2637,9 @@ async fn php_receives_multipart_file_upload() {
         .file_name("greeting.txt")
         .mime_str("text/plain")
         .unwrap();
-    let form = reqwest::multipart::Form::new().part("upload", part).text("note", "a-regular-field");
+    let form = reqwest::multipart::Form::new()
+        .part("upload", part)
+        .text("note", "a-regular-field");
 
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}/upload", server.port))
@@ -1951,11 +2651,17 @@ async fn php_receives_multipart_file_upload() {
     let body = resp.text().await.unwrap();
 
     assert!(body.contains("NAME=greeting.txt"), "got: {body}");
-    assert!(body.contains(&format!("SIZE={}", file_content.len())), "got: {body}");
+    assert!(
+        body.contains(&format!("SIZE={}", file_content.len())),
+        "got: {body}"
+    );
     assert!(body.contains("ERROR=0"), "got: {body}");
     assert!(body.contains("IS_UPLOADED_FILE=true"), "got: {body}");
     assert!(body.contains("MOVE_UPLOADED_FILE=true"), "got: {body}");
-    assert!(body.contains("MOVED_CONTENT=hello from an uploaded file"), "got: {body}");
+    assert!(
+        body.contains("MOVED_CONTENT=hello from an uploaded file"),
+        "got: {body}"
+    );
     assert!(body.contains("FIELD=a-regular-field"), "got: {body}");
 }
 
@@ -2008,7 +2714,12 @@ async fn php_receives_a_large_spilled_request_body_correctly() {
 #[tokio::test]
 async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
     let www = fixtures_dir().join("www");
-    let server = start_server("body-symlink-attack", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "body-symlink-attack",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let canary = std::env::temp_dir().join(format!("symlink-attack-canary-{}", std::process::id()));
     std::fs::write(&canary, b"untouched").expect("failed to create canary file");
@@ -2026,7 +2737,11 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 500, "a blocked spillover must fail the request, not dispatch it as an empty body");
+    assert_eq!(
+        resp.status(),
+        500,
+        "a blocked spillover must fail the request, not dispatch it as an empty body"
+    );
     let resp_body = resp.text().await.unwrap();
     assert!(
         resp_body.contains("failed to read request body"),
@@ -2034,9 +2749,15 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
     );
 
     let canary_contents = std::fs::read(&canary).expect("canary file should still exist");
-    assert_eq!(canary_contents, b"untouched", "symlink must not have been followed and written through");
+    assert_eq!(
+        canary_contents, b"untouched",
+        "symlink must not have been followed and written through"
+    );
     assert!(
-        std::fs::symlink_metadata(&predicted_path).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&predicted_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "the pre-planted symlink itself must still be exactly that, not replaced by a real file"
     );
 
@@ -2051,9 +2772,16 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
 async fn a_request_body_that_disconnects_mid_transfer_fails_the_request() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let www = fixtures_dir().join("www");
-    let server = start_server("body-disconnect", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "body-disconnect",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
     stream
         .write_all(b"POST /submit HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000\r\n\r\n")
         .await
@@ -2082,7 +2810,11 @@ fn list_spilled_body_files() -> std::collections::HashSet<std::path::PathBuf> {
         .flatten()
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("proteus-body-")))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("proteus-body-"))
+        })
         .collect()
 }
 
@@ -2118,7 +2850,11 @@ async fn uncaught_error_forces_a_500() {
     let resp = reqwest::get(format!("http://127.0.0.1:{}/fatal-error", server.port))
         .await
         .unwrap();
-    assert_eq!(resp.status(), 500, "PHP core promotes an uncaught fatal error from the still-200 default to 500");
+    assert_eq!(
+        resp.status(),
+        500,
+        "PHP core promotes an uncaught fatal error from the still-200 default to 500"
+    );
 }
 
 /// SIGTERM must drain, not just die: an in-flight request has to get
@@ -2135,9 +2871,8 @@ async fn sigterm_drains_in_flight_request_before_exiting() {
     .await;
 
     let port = server.port;
-    let slow_request = tokio::spawn(async move {
-        reqwest::get(format!("http://127.0.0.1:{port}/slow")).await
-    });
+    let slow_request =
+        tokio::spawn(async move { reqwest::get(format!("http://127.0.0.1:{port}/slow")).await });
 
     // Give the request time to actually be dispatched to a worker before
     // signaling - otherwise this could race and send SIGTERM before the
@@ -2149,7 +2884,10 @@ async fn sigterm_drains_in_flight_request_before_exiting() {
     )
     .expect("failed to send SIGTERM");
 
-    let resp = slow_request.await.unwrap().expect("request must still complete, not be cut off");
+    let resp = slow_request
+        .await
+        .unwrap()
+        .expect("request must still complete, not be cut off");
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     assert!(body.contains("slow done"), "got: {body}");
@@ -2159,7 +2897,10 @@ async fn sigterm_drains_in_flight_request_before_exiting() {
         if let Ok(Some(_)) = server.child.try_wait() {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "master never exited after SIGTERM + drain");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "master never exited after SIGTERM + drain"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -2180,7 +2921,9 @@ async fn sigterm_drains_an_in_progress_streamed_response_before_exiting() {
 
     let port = server.port;
     let request = tokio::spawn(async move {
-        reqwest::get(format!("http://127.0.0.1:{port}/slow-stream")).await.and_then(|r| r.error_for_status())
+        reqwest::get(format!("http://127.0.0.1:{port}/slow-stream"))
+            .await
+            .and_then(|r| r.error_for_status())
     });
 
     // Past the first chunk (headers+first frame arrive near-instantly) but
@@ -2193,18 +2936,27 @@ async fn sigterm_drains_an_in_progress_streamed_response_before_exiting() {
     )
     .expect("failed to send SIGTERM");
 
-    let resp = request.await.unwrap().expect("streamed response must still complete, not be cut off");
+    let resp = request
+        .await
+        .unwrap()
+        .expect("streamed response must still complete, not be cut off");
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
     let expected: String = (0..5).map(|i| format!("chunk-{i}\n")).collect();
-    assert_eq!(body, expected, "response was truncated - in-flight tracking let master exit mid-stream");
+    assert_eq!(
+        body, expected,
+        "response was truncated - in-flight tracking let master exit mid-stream"
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Ok(Some(_)) = server.child.try_wait() {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "master never exited after SIGTERM + drain");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "master never exited after SIGTERM + drain"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -2230,36 +2982,61 @@ async fn prototype_death_triggers_auto_respawn_without_crashing_master() {
     let read_prototype_pid = || {
         let status_url = status_url.clone();
         async move {
-            reqwest::get(&status_url).await.unwrap().json::<serde_json::Value>().await.unwrap()["php"]
-                ["prototype_pid"]
+            reqwest::get(&status_url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["php"]["prototype_pid"]
                 .as_i64()
                 .unwrap() as i32
         }
     };
     let original_prototype_pid = read_prototype_pid().await;
 
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(original_prototype_pid), nix::sys::signal::Signal::SIGKILL)
-        .expect("failed to SIGKILL the prototype");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(original_prototype_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("failed to SIGKILL the prototype");
 
     // Still served by the already-forked spare worker - its data-channel
     // fd was handed to master directly (SCM_RIGHTS) independent of the
     // (now dead) prototype.
-    let first = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let first = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     assert_eq!(first.status(), 200);
 
     // Retiring that worker forces a fresh spawn, which needs the dead
     // prototype. This must respawn and succeed, not fail cleanly.
-    let second = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
-    assert_eq!(second.status(), 200, "should succeed via the auto-respawned prototype, not degrade to 500");
+    let second = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        200,
+        "should succeed via the auto-respawned prototype, not degrade to 500"
+    );
 
     // A different pid, not the original having survived SIGKILL. Fetching
     // this at all also proves master itself did not crash.
     let new_prototype_pid = read_prototype_pid().await;
-    assert_ne!(new_prototype_pid, original_prototype_pid, "prototype pid should have changed after respawn");
+    assert_ne!(
+        new_prototype_pid, original_prototype_pid,
+        "prototype pid should have changed after respawn"
+    );
 
-    let status: serde_json::Value =
-        reqwest::get(&status_url).await.expect("master process appears to have crashed").json().await.unwrap();
-    assert_eq!(status["php"]["counters"]["prototype_respawns_total"].as_u64(), Some(1));
+    let status: serde_json::Value = reqwest::get(&status_url)
+        .await
+        .expect("master process appears to have crashed")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status["php"]["counters"]["prototype_respawns_total"].as_u64(),
+        Some(1)
+    );
 }
 
 /// A second death right behind the first must be counted as a backoff rather
@@ -2279,35 +3056,62 @@ async fn repeated_prototype_death_within_the_backoff_window_counts_a_crash_loop_
     let status_url = format!("http://127.0.0.1:{}/", server.status_port);
     let read_status = || {
         let status_url = status_url.clone();
-        async move { reqwest::get(&status_url).await.unwrap().json::<serde_json::Value>().await.unwrap() }
+        async move {
+            reqwest::get(&status_url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
     };
     let kill_prototype = |pid: i64| {
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL)
-            .expect("failed to SIGKILL the prototype");
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("failed to SIGKILL the prototype");
     };
 
-    let original_pid = read_status().await["php"]["prototype_pid"].as_i64().unwrap();
+    let original_pid = read_status().await["php"]["prototype_pid"]
+        .as_i64()
+        .unwrap();
     kill_prototype(original_pid);
 
     // Served by the already-forked spare, which then retires; the dead
     // prototype is not noticed by this request at all.
-    let first = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let first = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     assert_eq!(first.status(), 200);
 
     // Second request: the retired worker is gone, so this one needs a
     // fresh spawn - which notices the dead prototype and respawns it
     // before retrying, same reactive path as that test's own `second`.
-    let second = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
-    assert_eq!(second.status(), 200, "should succeed via the auto-respawned prototype");
+    let second = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
+    assert_eq!(
+        second.status(),
+        200,
+        "should succeed via the auto-respawned prototype"
+    );
 
     // Immediately - well within the 1s backoff window - kill the freshly
     // respawned prototype too, then force another fresh spawn right away
     // (third request, same reasoning as the second).
-    let respawned_pid = read_status().await["php"]["prototype_pid"].as_i64().unwrap();
-    assert_ne!(respawned_pid, original_pid, "the second request should have triggered a real respawn");
+    let respawned_pid = read_status().await["php"]["prototype_pid"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(
+        respawned_pid, original_pid,
+        "the second request should have triggered a real respawn"
+    );
     kill_prototype(respawned_pid);
 
-    let third = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let third = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     assert_eq!(
         third.status(),
         500,
@@ -2315,9 +3119,16 @@ async fn repeated_prototype_death_within_the_backoff_window_counts_a_crash_loop_
     );
 
     let status = read_status().await;
-    assert_eq!(status["php"]["counters"]["prototype_respawns_total"].as_u64(), Some(1), "only the first death should have respawned");
+    assert_eq!(
+        status["php"]["counters"]["prototype_respawns_total"].as_u64(),
+        Some(1),
+        "only the first death should have respawned"
+    );
     assert!(
-        status["php"]["counters"]["crash_loop_backoffs"].as_u64().unwrap() >= 1,
+        status["php"]["counters"]["crash_loop_backoffs"]
+            .as_u64()
+            .unwrap()
+            >= 1,
         "the second, too-soon death must be counted as a crash-loop backoff: {status}"
     );
 }
@@ -2339,16 +3150,23 @@ async fn prototype_death_is_noticed_proactively_even_with_enough_idle_workers() 
     let read_prototype_pid = || {
         let status_url = status_url.clone();
         async move {
-            reqwest::get(&status_url).await.unwrap().json::<serde_json::Value>().await.unwrap()["php"]
-                ["prototype_pid"]
+            reqwest::get(&status_url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["php"]["prototype_pid"]
                 .as_i64()
                 .unwrap() as i32
         }
     };
     let original_prototype_pid = read_prototype_pid().await;
 
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(original_prototype_pid), nix::sys::signal::Signal::SIGKILL)
-        .expect("failed to SIGKILL the prototype");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(original_prototype_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("failed to SIGKILL the prototype");
 
     // Deliberately NOT making any requests here - the two spare workers
     // could serve traffic forever without ever calling spawn_worker. Only
@@ -2368,7 +3186,9 @@ async fn prototype_death_is_noticed_proactively_even_with_enough_idle_workers() 
 
     // Still fully functional afterward, served by whichever generation of
     // spare worker was already up.
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/app", server.port))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
 }
 
@@ -2396,7 +3216,12 @@ async fn idle_timeout_retires_workers_above_spare() {
     let requests: Vec<_> = (0..3)
         .map(|_| {
             let client = client.clone();
-            tokio::spawn(async move { client.get(format!("http://127.0.0.1:{port}/app")).send().await })
+            tokio::spawn(async move {
+                client
+                    .get(format!("http://127.0.0.1:{port}/app"))
+                    .send()
+                    .await
+            })
         })
         .collect();
     for r in requests {
@@ -2407,15 +3232,22 @@ async fn idle_timeout_retires_workers_above_spare() {
     let read_idle = || {
         let status_url = status_url.clone();
         async move {
-            reqwest::get(&status_url).await.unwrap().json::<serde_json::Value>().await.unwrap()["php"]["processes"]
-                ["idle"]
+            reqwest::get(&status_url)
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["php"]["processes"]["idle"]
                 .as_u64()
                 .unwrap()
         }
     };
 
     let idle_now = read_idle().await;
-    assert!(idle_now > 1, "expected more than spare(1) idle workers right after 3 concurrent requests, got {idle_now}");
+    assert!(
+        idle_now > 1,
+        "expected more than spare(1) idle workers right after 3 concurrent requests, got {idle_now}"
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
     loop {
@@ -2423,7 +3255,10 @@ async fn idle_timeout_retires_workers_above_spare() {
         if idle <= 1 {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "idle pool never shrank back to spare(1), still {idle}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "idle pool never shrank back to spare(1), still {idle}"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -2441,20 +3276,33 @@ async fn workers_do_not_outlive_a_killed_prototype() {
     let server = start_server("pdeathsig", www.to_str().unwrap(), serde_json::json!({})).await;
 
     let status = status_json(&server).await;
-    let prototype_pid = status["php"]["prototype_pid"].as_i64().expect("status must report a prototype pid");
+    let prototype_pid = status["php"]["prototype_pid"]
+        .as_i64()
+        .expect("status must report a prototype pid");
     let workers_before = worker_pids(&server).await;
-    assert!(!workers_before.is_empty(), "expected pre-spawned spare workers to inherit the guard");
+    assert!(
+        !workers_before.is_empty(),
+        "expected pre-spawned spare workers to inherit the guard"
+    );
 
     let start_times_before: std::collections::HashMap<i64, String> = workers_before
         .iter()
-        .map(|&p| (p, process_start_time(p).expect("pre-existing worker must be readable")))
+        .map(|&p| {
+            (
+                p,
+                process_start_time(p).expect("pre-existing worker must be readable"),
+            )
+        })
         .collect();
 
     // SIGKILL, not SIGTERM: an orderly shutdown could plausibly tear the
     // workers down some other way, which would let a missing PDEATHSIG
     // pass. This leaves the kernel as the only thing that could.
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(prototype_pid as i32), nix::sys::signal::Signal::SIGKILL)
-        .expect("failed to kill the prototype");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(prototype_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .expect("failed to kill the prototype");
 
     // A leaked worker never dies however long this polls, so a generous
     // deadline only costs time in the genuinely-broken case. Same
@@ -2520,7 +3368,10 @@ async fn a_script_declared_content_length_gates_compression_without_being_forwar
     // Below the threshold: not compressed, and no Vary either - no
     // Accept-Encoding could have changed this response.
     let small = client
-        .get(format!("http://127.0.0.1:{}/declared-length?size=100", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/declared-length?size=100",
+            server.port
+        ))
         .header("Accept-Encoding", "gzip")
         .send()
         .await
@@ -2530,7 +3381,10 @@ async fn a_script_declared_content_length_gates_compression_without_being_forwar
         small.headers().get("content-encoding").is_none(),
         "a script-declared 100 bytes is under min_size_bytes and must not be compressed"
     );
-    assert!(small.headers().get("vary").is_none(), "an ineligible response must not advertise Vary");
+    assert!(
+        small.headers().get("vary").is_none(),
+        "an ineligible response must not advertise Vary"
+    );
     assert!(
         small.headers().get("content-length").is_none()
             || small.headers().get("content-length").unwrap() == "100",
@@ -2540,7 +3394,10 @@ async fn a_script_declared_content_length_gates_compression_without_being_forwar
 
     // Above it: compressed exactly as before.
     let big = client
-        .get(format!("http://127.0.0.1:{}/declared-length?size=4096", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/declared-length?size=4096",
+            server.port
+        ))
         .header("Accept-Encoding", "gzip")
         .send()
         .await
@@ -2554,8 +3411,16 @@ async fn a_script_declared_content_length_gates_compression_without_being_forwar
     assert_eq!(big.headers().get("vary").unwrap(), "Accept-Encoding");
     let compressed = big.bytes().await.unwrap();
     let mut decoded = String::new();
-    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(compressed.as_ref()), &mut decoded).unwrap();
-    assert_eq!(decoded.len(), 4096, "the body must survive the round trip intact");
+    std::io::Read::read_to_string(
+        &mut flate2::read::GzDecoder::new(compressed.as_ref()),
+        &mut decoded,
+    )
+    .unwrap();
+    assert_eq!(
+        decoded.len(),
+        4096,
+        "the body must survive the round trip intact"
+    );
 }
 
 /// `queue.timeout` bounds only acquiring a permit; everything after it had no
@@ -2583,11 +3448,16 @@ async fn a_wedged_prototype_does_not_hang_dispatch_forever() {
     )
     .await;
 
-    let prototype_pid = status_json(&server).await["php"]["prototype_pid"].as_i64().expect("a prototype pid");
+    let prototype_pid = status_json(&server).await["php"]["prototype_pid"]
+        .as_i64()
+        .expect("a prototype pid");
     let start_time_before = process_start_time(prototype_pid).expect("prototype must be readable");
 
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(prototype_pid as i32), nix::sys::signal::Signal::SIGSTOP)
-        .expect("failed to stop the prototype");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(prototype_pid as i32),
+        nix::sys::signal::Signal::SIGSTOP,
+    )
+    .expect("failed to stop the prototype");
 
     // The assertion is the deadline itself: without a spawn timeout this
     // request never returns at all. 20s is far above spawn_timeout (2s)
@@ -2595,7 +3465,9 @@ async fn a_wedged_prototype_does_not_hang_dispatch_forever() {
     let started = tokio::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(20),
-        reqwest::Client::new().get(format!("http://127.0.0.1:{}/", server.port)).send(),
+        reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{}/", server.port))
+            .send(),
     )
     .await;
     let elapsed = started.elapsed();
@@ -2647,10 +3519,24 @@ async fn a_wedged_prototype_does_not_hang_dispatch_forever() {
 #[tokio::test]
 async fn a_percent_encoded_static_path_reaches_the_real_file() {
     let www = fixtures_dir().join("www");
-    let server = start_server("percent-decode-static", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "percent-decode-static",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/spaced%20name.txt", server.port)).await.unwrap();
-    assert_eq!(resp.status(), 200, "an encoded space must resolve to the real filename");
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{}/spaced%20name.txt",
+        server.port
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "an encoded space must resolve to the real filename"
+    );
     assert_eq!(resp.text().await.unwrap(), "hello from a spaced filename\n");
 }
 
@@ -2659,7 +3545,9 @@ async fn a_percent_encoded_static_path_reaches_the_real_file() {
 /// before the request is even sent. An attacker is under no such constraint.
 async fn raw_get(port: u16, raw_target: &str) -> (u16, String) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let req = format!("GET {raw_target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
@@ -2679,7 +3567,12 @@ async fn raw_get(port: u16, raw_target: &str) -> (u16, String) {
 #[tokio::test]
 async fn encoded_traversal_and_encoded_separators_are_rejected() {
     let www = fixtures_dir().join("www");
-    let server = start_server("percent-decode-traversal", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "percent-decode-traversal",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     for path in [
         "/%2e%2e/%2e%2e/etc/passwd", // decodes to ../../etc/passwd
@@ -2693,7 +3586,10 @@ async fn encoded_traversal_and_encoded_separators_are_rejected() {
         let (status, body) = raw_get(server.port, path).await;
         assert_eq!(status, 400, "{path} must be refused outright, got {status}");
         // Whatever else happens, no file content may come back.
-        assert!(!body.contains("root:"), "{path} returned something that looks like /etc/passwd");
+        assert!(
+            !body.contains("root:"),
+            "{path} returned something that looks like /etc/passwd"
+        );
     }
 }
 
@@ -2702,7 +3598,12 @@ async fn encoded_traversal_and_encoded_separators_are_rejected() {
 #[tokio::test]
 async fn a_raw_request_target_reaches_the_server_unnormalised() {
     let www = fixtures_dir().join("www");
-    let server = start_server("raw-target-sanity", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "raw-target-sanity",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     // An ordinary encoded path arrives encoded and is decoded server-side
     // to a real file - proving the target crossed the wire verbatim.
@@ -2717,13 +3618,26 @@ async fn a_raw_request_target_reaches_the_server_unnormalised() {
 #[tokio::test]
 async fn php_gets_a_decoded_path_info_and_a_raw_request_uri() {
     let www = fixtures_dir().join("www");
-    let server = start_server("percent-decode-php", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "percent-decode-php",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{}/a%20b/c?q=%20x", server.port)).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/a%20b/c?q=%20x", server.port))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("PATH_INFO=/a b/c"), "PATH_INFO must be decoded, got: {body}");
-    assert!(body.contains("URI=/a%20b/c?q=%20x"), "REQUEST_URI must stay raw, got: {body}");
+    assert!(
+        body.contains("PATH_INFO=/a b/c"),
+        "PATH_INFO must be decoded, got: {body}"
+    );
+    assert!(
+        body.contains("URI=/a%20b/c?q=%20x"),
+        "REQUEST_URI must stay raw, got: {body}"
+    );
 }
 
 /// httpoxy (CVE-2016-5385): a client-set `Proxy:` header must never become
@@ -2738,7 +3652,10 @@ async fn a_client_supplied_proxy_header_never_reaches_php() {
     let server = start_server("httpoxy", www.to_str().unwrap(), serde_json::json!({})).await;
 
     let resp = reqwest::Client::new()
-        .get(format!("http://127.0.0.1:{}/proxy-header-check", server.port))
+        .get(format!(
+            "http://127.0.0.1:{}/proxy-header-check",
+            server.port
+        ))
         .header("Proxy", "http://attacker.example:8080")
         .header("X-Test", "sentinel")
         .send()
@@ -2746,10 +3663,16 @@ async fn a_client_supplied_proxy_header_never_reaches_php() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("HTTP_PROXY=MISSING"), "the Proxy header must be stripped, got: {body}");
+    assert!(
+        body.contains("HTTP_PROXY=MISSING"),
+        "the Proxy header must be stripped, got: {body}"
+    );
     // The sentinel proves ordinary headers still get through - a filter
     // that dropped everything would pass the assertion above for free.
-    assert!(body.contains("HEADER_X_TEST=sentinel"), "unrelated headers must still reach PHP, got: {body}");
+    assert!(
+        body.contains("HEADER_X_TEST=sentinel"),
+        "unrelated headers must still reach PHP, got: {body}"
+    );
 }
 
 /// Shrinking the header buffer resets its bookkeeping mid-life, on a buffer
@@ -2777,7 +3700,11 @@ async fn a_worker_survives_repeated_oversized_header_responses() {
 
     for round in 0..3 {
         let resp = client.get(big(server.port)).send().await.unwrap();
-        assert_eq!(resp.status(), 200, "round {round}: oversized header response failed");
+        assert_eq!(
+            resp.status(),
+            200,
+            "round {round}: oversized header response failed"
+        );
         let cookies: Vec<_> = resp.headers().get_all("set-cookie").iter().collect();
         assert_eq!(cookies.len(), 50, "round {round}: lost Set-Cookie headers");
         assert_eq!(
@@ -2786,24 +3713,44 @@ async fn a_worker_survives_repeated_oversized_header_responses() {
             "round {round}: last cookie came back damaged"
         );
         assert_eq!(
-            resp.headers().get("content-security-policy").unwrap().to_str().unwrap(),
+            resp.headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
             expected_csp(),
             "round {round}: CSP came back damaged"
         );
 
         // An ordinary response between the big ones: this is the one that
         // runs against the freshly shrunk buffer.
-        let small = client.get(format!("http://127.0.0.1:{}/", server.port)).send().await.unwrap();
-        assert_eq!(small.status(), 200, "round {round}: small request after a shrink failed");
+        let small = client
+            .get(format!("http://127.0.0.1:{}/", server.port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            small.status(),
+            200,
+            "round {round}: small request after a shrink failed"
+        );
         assert!(
-            small.text().await.unwrap().contains("PHP response, worker pid="),
+            small
+                .text()
+                .await
+                .unwrap()
+                .contains("PHP response, worker pid="),
             "round {round}: small response body was damaged"
         );
     }
 
     // If the worker had been recycled or replaced mid-test, the buffer
     // reuse this is meant to exercise never happened.
-    assert_eq!(worker_pids(&server).await, worker_before, "the same worker must have served every request");
+    assert_eq!(
+        worker_pids(&server).await,
+        worker_before,
+        "the same worker must have served every request"
+    );
 }
 
 /// Starts a server with stdout piped, returning the child plus a shared
@@ -2833,7 +3780,10 @@ async fn start_server_capturing_stdout(
     let writer = std::sync::Arc::clone(&lines);
     std::thread::spawn(move || {
         use std::io::BufRead;
-        for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
             writer.lock().unwrap().push(line);
         }
     });
@@ -2841,8 +3791,16 @@ async fn start_server_capturing_stdout(
     let client = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "server never became ready");
-        match client.get(format!("http://127.0.0.1:{status_port}/")).timeout(Duration::from_millis(500)).send().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server never became ready"
+        );
+        match client
+            .get(format!("http://127.0.0.1:{status_port}/"))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+        {
             Ok(resp) if resp.status().is_success() => break,
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
@@ -2865,7 +3823,10 @@ async fn await_access_log(
         if let Some(entry) = found {
             return entry;
         }
-        assert!(tokio::time::Instant::now() < deadline, "no matching access log line appeared");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no matching access log line appeared"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -2908,7 +3869,9 @@ async fn the_access_log_records_a_body_that_failed_after_the_headers_went_out() 
 
     let mut resp = tokio::time::timeout(
         Duration::from_secs(10),
-        client.get(format!("http://127.0.0.1:{port}/stream-then-die")).send(),
+        client
+            .get(format!("http://127.0.0.1:{port}/stream-then-die"))
+            .send(),
     )
     .await
     .expect("headers never arrived")
@@ -2921,19 +3884,38 @@ async fn the_access_log_records_a_body_that_failed_after_the_headers_went_out() 
         .expect("stream ended before any chunk");
     assert_eq!(&first[..], b"first-chunk\n");
 
-    let status: serde_json::Value =
-        client.get(format!("http://127.0.0.1:{status_port}/")).send().await.unwrap().json().await.unwrap();
-    let pid = status["php"]["workers"][0]["pid"].as_i64().expect("exactly one worker");
-    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), nix::sys::signal::Signal::SIGKILL).unwrap();
+    let status: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{status_port}/"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pid = status["php"]["workers"][0]["pid"]
+        .as_i64()
+        .expect("exactly one worker");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
 
     let drained = tokio::time::timeout(Duration::from_secs(10), async {
         while let Ok(Some(_)) = resp.chunk().await {}
     })
     .await;
-    assert!(drained.is_ok(), "response never ended after its worker was killed");
+    assert!(
+        drained.is_ok(),
+        "response never ended after its worker was killed"
+    );
 
     let entry = await_access_log(&lines, |v| v["path"].as_str() == Some("/stream-then-die")).await;
-    assert_eq!(entry["status"].as_u64(), Some(200), "the status was already committed: {entry}");
+    assert_eq!(
+        entry["status"].as_u64(),
+        Some(200),
+        "the status was already committed: {entry}"
+    );
     assert_ne!(
         entry["body"].as_str(),
         Some("complete"),
@@ -2968,10 +3950,15 @@ async fn access_log_duration_covers_the_body_transfer_not_just_the_headers() {
     .await;
     let _guard = ChildGuard(&mut child);
 
-    let resp = reqwest::get(format!("http://127.0.0.1:{port}/slow-stream")).await.unwrap();
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/slow-stream"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
-    assert!(body.contains("chunk-4"), "the whole body should have arrived: {body}");
+    assert!(
+        body.contains("chunk-4"),
+        "the whole body should have arrived: {body}"
+    );
 
     let entry = await_access_log(&lines, |v| v["path"].as_str() == Some("/slow-stream")).await;
     assert_eq!(entry["body"].as_str(), Some("complete"), "got: {entry}");
@@ -2997,17 +3984,25 @@ async fn an_unfinished_request_head_is_cut_off_by_the_header_read_timeout() {
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
     // A request head with no terminating blank line: complete-looking, and
     // never finished.
-    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n").await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
 
     let started = tokio::time::Instant::now();
     let mut sink = Vec::new();
     // Returns once the server hangs up. Without the timeout this blocks
     // until the test's own deadline.
     let closed = tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut sink)).await;
-    assert!(closed.is_ok(), "the server never closed a connection that never finished its request head");
+    assert!(
+        closed.is_ok(),
+        "the server never closed a connection that never finished its request head"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(10),
         "connection lingered {:?}, far past the 2s header_read_timeout",
@@ -3031,7 +4026,9 @@ async fn a_request_body_that_never_arrives_does_not_hold_a_connection_forever() 
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
     // A complete head - so the head timeout is satisfied - promising a body
     // that then never finishes arriving.
     stream
@@ -3058,7 +4055,10 @@ async fn a_request_body_that_never_arrives_does_not_hold_a_connection_forever() 
     assert!(
         String::from_utf8_lossy(&sink).starts_with("HTTP/1.1 408"),
         "a stalled body should be answered, not just dropped, got: {:?}",
-        String::from_utf8_lossy(&sink).chars().take(80).collect::<String>()
+        String::from_utf8_lossy(&sink)
+            .chars()
+            .take(80)
+            .collect::<String>()
     );
 }
 
@@ -3079,7 +4079,9 @@ async fn a_slow_but_steady_request_body_is_not_cut_off() {
     let chunks = ["alpha-", "bravo-", "charlie-", "delta-", "echo-", "foxtrot"];
     let expected: String = chunks.concat();
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
     stream
         .write_all(
             format!(
@@ -3099,10 +4101,19 @@ async fn a_slow_but_steady_request_body_is_not_cut_off() {
 
     let mut sink = Vec::new();
     let read = tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut sink)).await;
-    assert!(read.is_ok(), "the server never answered a slow but steady upload");
+    assert!(
+        read.is_ok(),
+        "the server never answered a slow but steady upload"
+    );
     let response = String::from_utf8_lossy(&sink);
-    assert!(response.starts_with("HTTP/1.1 200"), "slow steady upload was rejected: {response}");
-    assert!(response.contains(&expected), "body did not survive a slow upload: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "slow steady upload was rejected: {response}"
+    );
+    assert!(
+        response.contains(&expected),
+        "body did not survive a slow upload: {response}"
+    );
 }
 
 /// The connection cap only helps if idle connections go away: otherwise an
@@ -3119,19 +4130,33 @@ async fn an_idle_keep_alive_connection_is_eventually_closed() {
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
-    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
 
     // Read the response but keep the connection open and silent after it.
     let mut buf = [0u8; 4096];
-    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await.unwrap().unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(n > 0, "no response arrived");
-    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"), "unexpected response");
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"),
+        "unexpected response"
+    );
 
     let started = tokio::time::Instant::now();
     let mut sink = Vec::new();
     let closed = tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut sink)).await;
-    assert!(closed.is_ok(), "an idle keep-alive connection was never closed");
+    assert!(
+        closed.is_ok(),
+        "an idle keep-alive connection was never closed"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(15),
         "idle connection lingered {:?}, far past the 2s idle_timeout",
@@ -3166,7 +4191,13 @@ async fn a_slow_request_is_not_mistaken_for_an_idle_connection() {
     .expect("request never completed - the idle watcher closed a busy connection")
     .unwrap();
     assert_eq!(resp.status(), 200);
-    assert!(resp.text().await.unwrap().contains("PHP response, worker pid="), "the body must arrive intact");
+    assert!(
+        resp.text()
+            .await
+            .unwrap()
+            .contains("PHP response, worker pid="),
+        "the body must arrive intact"
+    );
 }
 
 /// Same property for a streamed body, where `handle` has already returned
@@ -3199,7 +4230,10 @@ async fn a_slowly_streaming_response_is_not_mistaken_for_an_idle_connection() {
         .await
         .expect("body never finished - the idle watcher cut a streaming response")
         .unwrap();
-    assert!(body.contains("chunk-0") && body.contains("chunk-4"), "streamed body was truncated: {body}");
+    assert!(
+        body.contains("chunk-0") && body.contains("chunk-4"),
+        "streamed body was truncated: {body}"
+    );
 }
 
 /// What the in-flight tracking is actually for.
@@ -3224,17 +4258,28 @@ async fn keep_alive_survives_a_request_slower_than_the_idle_timeout() {
     )
     .await;
 
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .unwrap();
 
     // Request one takes 2x the idle timeout, all of it inside PHP.
-    stream.write_all(b"GET /?delay_ms=4000 HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    stream
+        .write_all(b"GET /?delay_ms=4000 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
     let first = read_one_chunked_response(&mut stream, Duration::from_secs(30))
         .await
         .expect("slow request never answered");
-    assert!(first.starts_with("HTTP/1.1 200"), "slow request failed: {first}");
+    assert!(
+        first.starts_with("HTTP/1.1 200"),
+        "slow request failed: {first}"
+    );
 
     // Request two, immediately, on the same connection.
-    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await.unwrap();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
     let second = read_one_chunked_response(&mut stream, Duration::from_secs(15))
         .await
         .expect("the connection was closed behind the slow request - keep-alive was lost");
@@ -3258,7 +4303,10 @@ async fn read_one_chunked_response(
     let deadline = tokio::time::Instant::now() + limit;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let n = tokio::time::timeout(remaining, stream.read(&mut buf)).await.ok()?.ok()?;
+        let n = tokio::time::timeout(remaining, stream.read(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
         if n == 0 {
             return None; // peer hung up mid-response
         }

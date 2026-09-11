@@ -38,7 +38,6 @@ fn die_with_parent(expected_parent: nix::unistd::Pid) {
 #[cfg(not(target_os = "linux"))]
 fn die_with_parent(_expected_parent: nix::unistd::Pid) {}
 
-
 /// Serves requests until `max_requests` or the peer goes away.
 ///
 /// `_liveness` is held for the worker's whole life, so its process exit is
@@ -138,15 +137,28 @@ pub(crate) fn run(
         // Unconditional, right after execute_file truly returns: this marker
         // is the only thing that tells master the worker is free again.
         if result.early_sent {
-            tracing::debug!(r#type = "worker", pid, "fastcgi_finish_request() fired, response already streamed early");
+            tracing::debug!(
+                r#type = "worker",
+                pid,
+                "fastcgi_finish_request() fired, response already streamed early"
+            );
         }
-        if let Err(e) = data::write_worker_done_to_ring(&channel.response, &channel.peer_death, resp_data_efd_raw) {
+        if let Err(e) = data::write_worker_done_to_ring(
+            &channel.response,
+            &channel.peer_death,
+            resp_data_efd_raw,
+        ) {
             tracing::warn!(r#type = "worker", pid, error = %e, "write_worker_done_to_ring failed");
             break;
         }
 
         if retiring {
-            tracing::debug!(r#type = "worker", pid, max_requests, "hit max_requests, retiring");
+            tracing::debug!(
+                r#type = "worker",
+                pid,
+                max_requests,
+                "hit max_requests, retiring"
+            );
             break;
         }
     }

@@ -4,15 +4,15 @@
 //! EOF detection breaks when the prototype dies.
 
 use crate::ipc::shm;
-use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::io::{IoSlice, Read};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::time::Duration;
-use tokio_seqpacket::ancillary::OwnedAncillaryMessage;
 use tokio_seqpacket::UnixSeqpacket;
+use tokio_seqpacket::ancillary::OwnedAncillaryMessage;
 
 pub const SPAWN: &[u8] = b"SPAWN";
 
@@ -50,18 +50,25 @@ pub async fn request_worker(control: &UnixSeqpacket) -> std::io::Result<(WorkerR
             fds.extend(received);
         }
     }
-    let [channel_fd, liveness_fd, req_space_efd, resp_data_efd] = <[OwnedFd; 4]>::try_from(fds).map_err(|fds| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("expected exactly 4 fds in WORKER_READY reply, got {}", fds.len()),
-        )
-    })?;
+    let [channel_fd, liveness_fd, req_space_efd, resp_data_efd] = <[OwnedFd; 4]>::try_from(fds)
+        .map_err(|fds| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "expected exactly 4 fds in WORKER_READY reply, got {}",
+                    fds.len()
+                ),
+            )
+        })?;
 
     Ok((
         WorkerReadyFds {
             channel: channel_fd,
             liveness: liveness_fd,
-            notify: shm::NotifyEfds { req_space: req_space_efd, resp_data: resp_data_efd },
+            notify: shm::NotifyEfds {
+                req_space: req_space_efd,
+                resp_data: resp_data_efd,
+            },
         },
         pid,
     ))
@@ -79,12 +86,20 @@ pub fn recv_command(control: &mut StdUnixStream) -> std::io::Result<Option<Vec<u
 
 /// All four fds go in one `SCM_RIGHTS` message, in the fixed order
 /// `request_worker` unpacks them.
-pub fn send_worker_ready(control: &mut StdUnixStream, worker_pid: i32, fds: WorkerReadyFds) -> std::io::Result<()> {
+pub fn send_worker_ready(
+    control: &mut StdUnixStream,
+    worker_pid: i32,
+    fds: WorkerReadyFds,
+) -> std::io::Result<()> {
     let mut payload = (worker_pid as u32).to_le_bytes().to_vec();
     payload.extend_from_slice(b"READY");
 
-    let raw_fds =
-        [fds.channel.as_raw_fd(), fds.liveness.as_raw_fd(), fds.notify.req_space.as_raw_fd(), fds.notify.resp_data.as_raw_fd()];
+    let raw_fds = [
+        fds.channel.as_raw_fd(),
+        fds.liveness.as_raw_fd(),
+        fds.notify.req_space.as_raw_fd(),
+        fds.notify.resp_data.as_raw_fd(),
+    ];
     let cmsg = [ControlMessage::ScmRights(&raw_fds)];
     let iov = [IoSlice::new(&payload)];
 
@@ -115,9 +130,10 @@ pub fn reap_finished_workers() {
 
 /// For the prototype's inherited copy; master keeps its own fd async.
 pub fn clear_nonblocking(fd: RawFd) -> std::io::Result<()> {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let flags = fcntl(fd, FcntlArg::F_GETFL).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    let flags =
+        fcntl(fd, FcntlArg::F_GETFL).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     let mut flags = OFlag::from_bits_truncate(flags);
     flags.remove(OFlag::O_NONBLOCK);
     fcntl(fd, FcntlArg::F_SETFL(flags)).map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;

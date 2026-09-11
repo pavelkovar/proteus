@@ -26,7 +26,9 @@ fn parses_a_full_config() {
         cfg.routes[1].action,
         RouteActionConfig::Static {
             root: "/var/www/public".into(),
-            fallback: Some(Box::new(RouteActionConfig::Php { target: "app".into() })),
+            fallback: Some(Box::new(RouteActionConfig::Php {
+                target: "app".into()
+            })),
         }
     );
     assert_eq!(cfg.php.limits.requests, 500);
@@ -134,7 +136,10 @@ fn rejects_an_invalid_cidr_in_trusted_proxies() {
       }
     }"#;
     let result: Result<Config, _> = serde_json::from_str(json);
-    assert!(result.is_err(), "a malformed CIDR must fail config parsing, not parse into some default network");
+    assert!(
+        result.is_err(),
+        "a malformed CIDR must fail config parsing, not parse into some default network"
+    );
 }
 
 #[test]
@@ -148,7 +153,10 @@ fn rejects_missing_required_field() {
 fn rejects_php_route_with_no_target() {
     let json = r#"{ "match": {}, "action": "php" }"#;
     let result: Result<Route, _> = serde_json::from_str(json);
-    assert!(result.is_err(), "Php.target is required, not Option<String>");
+    assert!(
+        result.is_err(),
+        "Php.target is required, not Option<String>"
+    );
 }
 
 fn base_config_json(routes: &str, targets: &str) -> String {
@@ -202,7 +210,11 @@ fn validate_rejects_route_target_missing_from_php_targets() {
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     let errors = validate(&cfg);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("typo"), "unexpected error: {}", errors[0]);
+    assert!(
+        errors[0].contains("typo"),
+        "unexpected error: {}",
+        errors[0]
+    );
 }
 
 #[test]
@@ -233,16 +245,25 @@ fn validate_rejects_a_zero_limits_requests() {
 #[test]
 fn validate_rejects_a_trusted_proxies_entry_covering_every_address() {
     for cidr in ["0.0.0.0/0", "::/0"] {
-        let json = base_config_json("", "").replace(r#""listen""#, &format!(r#""trusted_proxies": ["{cidr}"], "listen""#));
+        let json = base_config_json("", "").replace(
+            r#""listen""#,
+            &format!(r#""trusted_proxies": ["{cidr}"], "listen""#),
+        );
         let cfg: Config = serde_json::from_str(&json).expect("should parse");
         let errors = validate(&cfg);
-        assert!(errors.iter().any(|e| e.contains("trusted_proxies")), "expected a trusted_proxies error for {cidr}, got: {errors:?}");
+        assert!(
+            errors.iter().any(|e| e.contains("trusted_proxies")),
+            "expected a trusted_proxies error for {cidr}, got: {errors:?}"
+        );
     }
 }
 
 #[test]
 fn validate_accepts_a_narrow_trusted_proxies_entry() {
-    let json = base_config_json("", "").replace(r#""listen""#, r#""trusted_proxies": ["10.0.0.0/8", "192.168.0.0/16"], "listen""#);
+    let json = base_config_json("", "").replace(
+        r#""listen""#,
+        r#""trusted_proxies": ["10.0.0.0/8", "192.168.0.0/16"], "listen""#,
+    );
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     assert_eq!(validate(&cfg), Vec::<String>::new());
 }
@@ -260,11 +281,17 @@ fn validate_rejects_a_zero_queue_timeout() {
 
 #[test]
 fn php_user_and_group_default_to_absent_and_parse_together() {
-    let json = base_config_json("", "").replace(r#""user": "phpapp","#, "").replace(r#""group": "phpapp","#, "");
+    let json = base_config_json("", "")
+        .replace(r#""user": "phpapp","#, "")
+        .replace(r#""group": "phpapp","#, "");
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     assert_eq!(cfg.php.user, None);
     assert_eq!(cfg.php.group, None);
-    assert_eq!(validate(&cfg), Vec::<String>::new(), "omitting both together must not be a validation error");
+    assert_eq!(
+        validate(&cfg),
+        Vec::<String>::new(),
+        "omitting both together must not be a validation error"
+    );
 }
 
 #[test]
@@ -275,7 +302,9 @@ fn validate_rejects_specifying_only_one_of_php_user_and_group() {
     assert_eq!(cfg.php.group, None);
     let errors = validate(&cfg);
     assert!(
-        errors.iter().any(|e| e.contains("php.user") && e.contains("php.group")),
+        errors
+            .iter()
+            .any(|e| e.contains("php.user") && e.contains("php.group")),
         "expected a php.user/php.group mismatch error, got: {errors:?}"
     );
 }
@@ -290,7 +319,11 @@ fn validate_walks_into_a_nested_fallback_target() {
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     let errors = validate(&cfg);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].contains("typo"), "unexpected error: {}", errors[0]);
+    assert!(
+        errors[0].contains("typo"),
+        "unexpected error: {}",
+        errors[0]
+    );
 }
 
 #[test]
@@ -318,7 +351,9 @@ fn route_match_parses_negated_uri_patterns() {
         &route.matcher.uri[0],
         MatchPattern::Not(inner) if matches!(&**inner, MatchPattern::Glob { leading: false, trailing: true, parts, .. } if parts.as_slice() == ["/admin/secret"])
     ));
-    assert!(matches!(&route.matcher.uri[1], MatchPattern::Not(inner) if matches!(**inner, MatchPattern::Regex(_))));
+    assert!(
+        matches!(&route.matcher.uri[1], MatchPattern::Not(inner) if matches!(**inner, MatchPattern::Regex(_)))
+    );
     assert!(matches!(
         &route.matcher.uri[2],
         MatchPattern::Glob { leading: false, trailing: true, parts, .. } if parts.as_slice() == ["/admin/"]
@@ -386,10 +421,7 @@ fn route_match_rejects_an_invalid_uri_regex() {
 
 #[test]
 fn validate_rejects_an_out_of_range_return_status() {
-    let json = base_config_json(
-        r#"{ "match": {}, "action": "return", "status": 1000 }"#,
-        "",
-    );
+    let json = base_config_json(r#"{ "match": {}, "action": "return", "status": 1000 }"#, "");
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     let errors = validate(&cfg);
     assert!(
@@ -422,7 +454,8 @@ fn minimal_config_json(php_extra: &str) -> String {
 #[test]
 fn parse_substitutes_a_set_variable_outside_uri() {
     unsafe { std::env::set_var("PROTEUS_TEST_INTERPOLATE_A", "secret123") };
-    let json = minimal_config_json(r#""environment": { "SECRET": "${PROTEUS_TEST_INTERPOLATE_A}" },"#);
+    let json =
+        minimal_config_json(r#""environment": { "SECRET": "${PROTEUS_TEST_INTERPOLATE_A}" },"#);
     let cfg = parse(&json).expect("should parse");
     unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_A") };
     assert_eq!(cfg.php.environment["SECRET"], "secret123");
@@ -431,7 +464,8 @@ fn parse_substitutes_a_set_variable_outside_uri() {
 #[test]
 fn parse_falls_back_to_default_and_prefers_a_set_value() {
     unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_B") };
-    let json = minimal_config_json(r#""environment": { "PORT": "${PROTEUS_TEST_INTERPOLATE_B:8080}" },"#);
+    let json =
+        minimal_config_json(r#""environment": { "PORT": "${PROTEUS_TEST_INTERPOLATE_B:8080}" },"#);
     let cfg = parse(&json).expect("should parse");
     assert_eq!(cfg.php.environment["PORT"], "8080");
 
@@ -477,7 +511,10 @@ fn parse_errors_on_missing_variable_without_default() {
     unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_D") };
     let json = minimal_config_json(r#""environment": { "X": "${PROTEUS_TEST_INTERPOLATE_D}" },"#);
     let err = parse(&json).expect_err("should error");
-    assert!(err.contains("PROTEUS_TEST_INTERPOLATE_D"), "unexpected error: {err}");
+    assert!(
+        err.contains("PROTEUS_TEST_INTERPOLATE_D"),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
@@ -505,7 +542,8 @@ fn parse_does_not_mistake_uri_regex_syntax_for_a_placeholder() {
         "queue": { "timeout": 5 }
       }
     }"#;
-    let cfg = parse(json).expect("a literal regex $ anchor in match.uri must not be treated as an env var");
+    let cfg = parse(json)
+        .expect("a literal regex $ anchor in match.uri must not be treated as an env var");
     let pattern = &cfg.routes[0].matcher.uri[0];
     assert!(pattern.matches("/index.php"));
     assert!(!pattern.matches("/index.phtml"));
@@ -515,7 +553,10 @@ fn parse_does_not_mistake_uri_regex_syntax_for_a_placeholder() {
 fn parse_errors_still_report_a_line_and_column() {
     let json = minimal_config_json("\"user\": 12345,");
     let err = parse(&json).expect_err("a number where a string is expected must fail to parse");
-    assert!(err.contains("line") && err.contains("column"), "unexpected error (no location?): {err}");
+    assert!(
+        err.contains("line") && err.contains("column"),
+        "unexpected error (no location?): {err}"
+    );
 }
 
 /// 0 reads as disabled but is the opposite here, failing every spawn
@@ -545,7 +586,10 @@ fn connection_timeouts_default_when_the_whole_block_is_absent() {
     // Derived from the core count, so only the zero case is worth asserting:
     // a 0 there would disable the cap outright.
     assert_ne!(cfg.connection.max, 0);
-    assert!(validate(&cfg).is_empty(), "the defaults must themselves be valid");
+    assert!(
+        validate(&cfg).is_empty(),
+        "the defaults must themselves be valid"
+    );
 }
 
 /// Omitted, it must land on the generous default: a short one makes a cold
@@ -554,7 +598,10 @@ fn connection_timeouts_default_when_the_whole_block_is_absent() {
 fn spawn_timeout_defaults_when_absent() {
     let cfg = parse(&minimal_config_json("")).expect("should parse");
     assert_eq!(cfg.php.processes.spawn_timeout, 30);
-    assert!(validate(&cfg).is_empty(), "the default must itself be valid");
+    assert!(
+        validate(&cfg).is_empty(),
+        "the default must itself be valid"
+    );
 }
 
 fn config_json_with_rate_limit(rate_limit_json: &str) -> String {
@@ -570,7 +617,10 @@ fn rate_limit_is_none_when_the_section_is_absent() {
 
 #[test]
 fn rate_limit_parses_with_and_without_user_agent() {
-    let cfg = parse(&config_json_with_rate_limit(r#"{ "requests": 100, "period_seconds": 60 }"#)).expect("should parse");
+    let cfg = parse(&config_json_with_rate_limit(
+        r#"{ "requests": 100, "period_seconds": 60 }"#,
+    ))
+    .expect("should parse");
     let rl = cfg.rate_limit.expect("rate_limit should be Some");
     assert_eq!(rl.requests, 100);
     assert_eq!(rl.period_seconds, 60);
@@ -580,22 +630,39 @@ fn rate_limit_parses_with_and_without_user_agent() {
         r#"{ "requests": 100, "period_seconds": 60, "user_agent": ["*GPTBot*", "*ClaudeBot*"] }"#,
     ))
     .expect("should parse");
-    assert_eq!(cfg.rate_limit.expect("rate_limit should be Some").user_agent.len(), 2);
+    assert_eq!(
+        cfg.rate_limit
+            .expect("rate_limit should be Some")
+            .user_agent
+            .len(),
+        2
+    );
 }
 
 #[test]
 fn validate_rejects_a_zero_rate_limit_requests() {
-    let cfg = parse(&config_json_with_rate_limit(r#"{ "requests": 0, "period_seconds": 60 }"#)).expect("should parse");
+    let cfg = parse(&config_json_with_rate_limit(
+        r#"{ "requests": 0, "period_seconds": 60 }"#,
+    ))
+    .expect("should parse");
     let errors = validate(&cfg);
-    assert!(errors.iter().any(|e| e.contains("rate_limit.requests")), "expected a rate_limit.requests error, got: {errors:?}");
+    assert!(
+        errors.iter().any(|e| e.contains("rate_limit.requests")),
+        "expected a rate_limit.requests error, got: {errors:?}"
+    );
 }
 
 #[test]
 fn validate_rejects_a_zero_rate_limit_period_seconds() {
-    let cfg = parse(&config_json_with_rate_limit(r#"{ "requests": 100, "period_seconds": 0 }"#)).expect("should parse");
+    let cfg = parse(&config_json_with_rate_limit(
+        r#"{ "requests": 100, "period_seconds": 0 }"#,
+    ))
+    .expect("should parse");
     let errors = validate(&cfg);
     assert!(
-        errors.iter().any(|e| e.contains("rate_limit.period_seconds")),
+        errors
+            .iter()
+            .any(|e| e.contains("rate_limit.period_seconds")),
         "expected a rate_limit.period_seconds error, got: {errors:?}"
     );
 }

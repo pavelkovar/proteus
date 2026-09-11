@@ -12,7 +12,10 @@ fn relocate_above_moves_an_fd_clear_of_the_target_range() {
     let original = read_end.as_raw_fd();
 
     let moved = unsafe { relocate_above(original, CONFIG_FD) }.expect("relocation must succeed");
-    assert!(moved > CONFIG_FD, "relocated fd {moved} must be clear of CONTROL_FD/CONFIG_FD");
+    assert!(
+        moved > CONFIG_FD,
+        "relocated fd {moved} must be clear of CONTROL_FD/CONFIG_FD"
+    );
     assert_ne!(moved, original);
 
     // The same underlying pipe, not merely some free number.
@@ -34,10 +37,16 @@ fn relocate_above_returns_a_new_fd_even_when_the_original_is_already_high() {
     // Forced rather than assumed: which number the OS picks depends on what
     // else this process has open.
     let original = unsafe { libc::fcntl(read_end.as_raw_fd(), libc::F_DUPFD, 100) };
-    assert!(original > CONFIG_FD, "fcntl(F_DUPFD, 100) must return a high fd");
+    assert!(
+        original > CONFIG_FD,
+        "fcntl(F_DUPFD, 100) must return a high fd"
+    );
 
     let moved = unsafe { relocate_above(original, CONFIG_FD) }.unwrap();
-    assert_ne!(moved, original, "must be a distinct descriptor the caller can close safely");
+    assert_ne!(
+        moved, original,
+        "must be a distinct descriptor the caller can close safely"
+    );
     assert!(moved > CONFIG_FD);
 
     unsafe { libc::close(moved) };

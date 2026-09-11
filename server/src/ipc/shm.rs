@@ -14,8 +14,8 @@
 use std::cell::UnsafeCell;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
 
 /// One request, inline body included - a worker handles one at a time, so
 /// this need only fit the largest inline body plus its headers.
@@ -58,14 +58,20 @@ unsafe fn futex_wait(addr: &AtomicU32, expected: u32, timeout: Option<std::time:
             addr as *const AtomicU32 as *const u32,
             libc::FUTEX_WAIT,
             expected,
-            spec.as_ref().map_or(std::ptr::null(), |s| s as *const libc::timespec),
+            spec.as_ref()
+                .map_or(std::ptr::null(), |s| s as *const libc::timespec),
         );
     }
 }
 
 unsafe fn futex_wake_all(addr: &AtomicU32) {
     unsafe {
-        libc::syscall(libc::SYS_futex, addr as *const AtomicU32 as *const u32, libc::FUTEX_WAKE, i32::MAX);
+        libc::syscall(
+            libc::SYS_futex,
+            addr as *const AtomicU32 as *const u32,
+            libc::FUTEX_WAKE,
+            i32::MAX,
+        );
     }
 }
 
@@ -79,12 +85,15 @@ impl NotifyEfds {
     /// Fresh fds onto the same eventfds, so a second owner can notify
     /// without racing whoever drops the original first.
     pub fn try_clone(&self) -> std::io::Result<NotifyEfds> {
-        Ok(NotifyEfds { req_space: dup_cloexec(&self.req_space)?, resp_data: dup_cloexec(&self.resp_data)? })
+        Ok(NotifyEfds {
+            req_space: dup_cloexec(&self.req_space)?,
+            resp_data: dup_cloexec(&self.resp_data)?,
+        })
     }
 }
 
 fn dup_cloexec(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
-    use nix::fcntl::{fcntl, FcntlArg};
+    use nix::fcntl::{FcntlArg, fcntl};
     use std::os::fd::FromRawFd;
     let raw = fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(std::io::Error::from)?;
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
@@ -92,7 +101,9 @@ fn dup_cloexec(fd: &OwnedFd) -> std::io::Result<OwnedFd> {
 
 pub fn create_notify_eventfd() -> std::io::Result<OwnedFd> {
     use nix::sys::eventfd::{EfdFlags, EventFd};
-    EventFd::from_flags(EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC).map(OwnedFd::from).map_err(std::io::Error::from)
+    EventFd::from_flags(EfdFlags::EFD_NONBLOCK | EfdFlags::EFD_CLOEXEC)
+        .map(OwnedFd::from)
+        .map_err(std::io::Error::from)
 }
 
 /// Best-effort: a dropped wake is safe because waiters recheck before
@@ -124,7 +135,7 @@ async fn wait_readable_and_drain(efd: &AsyncFd<OwnedFd>) -> std::io::Result<()> 
 /// Returns the range's physical pages to the kernel. Must be `fallocate`,
 /// not `madvise(MADV_DONTNEED)`, which is a no-op on a MAP_SHARED memfd.
 fn punch_hole(fd: &OwnedFd, offset: u64, len: u64) -> std::io::Result<()> {
-    use nix::fcntl::{fallocate, FallocateFlags};
+    use nix::fcntl::{FallocateFlags, fallocate};
     fallocate(
         fd,
         FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
@@ -294,10 +305,12 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
                 return Err(RingError::PeerGone);
             }
             let remaining = match deadline {
-                Some(deadline) => match deadline.checked_duration_since(std::time::Instant::now()) {
-                    Some(remaining) => Some(remaining),
-                    None => return Ok(false),
-                },
+                Some(deadline) => {
+                    match deadline.checked_duration_since(std::time::Instant::now()) {
+                        Some(remaining) => Some(remaining),
+                        None => return Ok(false),
+                    }
+                }
                 None => None,
             };
             if Self::declare_waiting(&self.data_state, peer, || self.has_data(r, needed))? {
@@ -449,7 +462,10 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         // writer may be filling zeroes live data, while skipping costs only
         // residency. A necessary condition, not a proof - see the safety note.
         if self.write_pos.load(Ordering::Relaxed) != read_pos {
-            tracing::warn!(r#type = "controller", "skipped a ring reclaim: the writer is not idle");
+            tracing::warn!(
+                r#type = "controller",
+                "skipped a ring reclaim: the writer is not idle"
+            );
             return;
         }
 
@@ -463,8 +479,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
             punch_hole(fd, file_offset + start, end - start)
         } else {
             // fallocate EINVALs on zero length, hence the end == 0 skip.
-            punch_hole(fd, file_offset + start, CAPACITY as u64 - start)
-                .and_then(|()| if end == 0 { Ok(()) } else { punch_hole(fd, file_offset, end) })
+            punch_hole(fd, file_offset + start, CAPACITY as u64 - start).and_then(|()| {
+                if end == 0 {
+                    Ok(())
+                } else {
+                    punch_hole(fd, file_offset, end)
+                }
+            })
         };
         if let Err(e) = result {
             tracing::debug!(r#type = "controller", error = %e, "fallocate(FALLOC_FL_PUNCH_HOLE) failed, skipping reclaim");
@@ -502,14 +523,18 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// `LEN_PREFIX + payload.len()` bytes of space must already have been
     /// waited for.
     unsafe fn raw_write_frame(&self, payload: &[u8]) {
-        debug_assert!(payload.len() <= CAPACITY - LEN_PREFIX, "caller must reject an oversized frame");
+        debug_assert!(
+            payload.len() <= CAPACITY - LEN_PREFIX,
+            "caller must reject an oversized frame"
+        );
         let w = self.write_pos.load(Ordering::Relaxed);
         unsafe {
             self.copy_at(w, &(payload.len() as u32).to_le_bytes());
             self.copy_at(w + LEN_PREFIX as u64, payload);
         }
         // Release: publishes both copies above to whoever reads this frame.
-        self.write_pos.store(w + (LEN_PREFIX + payload.len()) as u64, Ordering::Release);
+        self.write_pos
+            .store(w + (LEN_PREFIX + payload.len()) as u64, Ordering::Release);
     }
 
     /// # Safety
@@ -557,7 +582,12 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
 
     /// Blocking, so worker-side only. Waits for the whole frame's space up
     /// front, so a reader never sees a partially-written frame.
-    pub fn write_frame(&self, payload: &[u8], peer: &PeerDeath, notify_efd: RawFd) -> Result<(), RingError> {
+    pub fn write_frame(
+        &self,
+        payload: &[u8],
+        peer: &PeerDeath,
+        notify_efd: RawFd,
+    ) -> Result<(), RingError> {
         if payload.len() > CAPACITY - LEN_PREFIX {
             return Err(RingError::FrameTooLarge);
         }
@@ -571,8 +601,14 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     }
 
     #[cfg(test)]
-    pub fn read_frame(&self, scratch: &mut Vec<u8>, peer: &PeerDeath, notify_efd: RawFd) -> Result<(), RingError> {
-        self.read_frame_until(scratch, peer, notify_efd, None).map(|_| ())
+    pub fn read_frame(
+        &self,
+        scratch: &mut Vec<u8>,
+        peer: &PeerDeath,
+        notify_efd: RawFd,
+    ) -> Result<(), RingError> {
+        self.read_frame_until(scratch, peer, notify_efd, None)
+            .map(|_| ())
     }
 
     /// `deadline` bounds only the wait for a frame to *start*: abandoning a
@@ -682,13 +718,15 @@ impl Channel {
     /// page resident for the rest of its life. Callable only between
     /// responses - see `reclaim_if_due`'s safety note.
     fn reclaim_response(&self, fd: &OwnedFd) {
-        self.response.reclaim_if_due(fd, Self::RESPONSE_BUF_FILE_OFFSET);
+        self.response
+            .reclaim_if_due(fd, Self::RESPONSE_BUF_FILE_OFFSET);
     }
 
     /// The request ring reaches full residency on request *count* alone: the
     /// positions wrap, so even small requests eventually touch every page.
     fn reclaim_request(&self, fd: &OwnedFd) {
-        self.request.reclaim_if_due(fd, Self::REQUEST_BUF_FILE_OFFSET);
+        self.request
+            .reclaim_if_due(fd, Self::REQUEST_BUF_FILE_OFFSET);
     }
 }
 
@@ -735,7 +773,14 @@ impl Drop for MappedChannel {
 fn mmap_channel(fd: RawFd) -> std::io::Result<std::ptr::NonNull<Channel>> {
     let size = size_of::<Channel>();
     let ptr = unsafe {
-        libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0)
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
     };
     if ptr == libc::MAP_FAILED {
         return Err(std::io::Error::last_os_error());

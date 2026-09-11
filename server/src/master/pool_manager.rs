@@ -12,8 +12,8 @@ use super::worker_channel::WorkerChannel;
 use crate::config::{Config, PhpOptions};
 use crate::ipc::control;
 use nix::errno::Errno;
-use nix::sys::signal::{kill, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::sys::signal::{Signal, kill};
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -140,7 +140,13 @@ impl<'a> QueueDepthGuard<'a> {
             return Some(QueueDepthGuard(counter));
         }
         counter
-            .try_update(Relaxed, Relaxed, |d| if (d as usize) < max { Some(d + 1) } else { None })
+            .try_update(Relaxed, Relaxed, |d| {
+                if (d as usize) < max {
+                    Some(d + 1)
+                } else {
+                    None
+                }
+            })
             .ok()?;
         Some(QueueDepthGuard(counter))
     }
@@ -194,12 +200,14 @@ impl WorkerMeta {
     fn mark_busy(&self, at: Instant, pool_started: Instant) {
         self.state.store(STATE_BUSY, Relaxed);
         self.request_count.fetch_add(1, Relaxed);
-        self.last_active_ms.store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
+        self.last_active_ms
+            .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
     }
 
     fn mark_idle(&self, at: Instant, pool_started: Instant) {
         self.state.store(STATE_IDLE, Relaxed);
-        self.last_active_ms.store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
+        self.last_active_ms
+            .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
     }
 
     fn state_str(&self) -> &'static str {
@@ -221,7 +229,10 @@ struct PrototypeHandle {
 
 impl PrototypeHandle {
     fn new(child: std::process::Child) -> Self {
-        PrototypeHandle { child, reaped: false }
+        PrototypeHandle {
+            child,
+            reaped: false,
+        }
     }
 
     fn pid(&self) -> u32 {
@@ -250,7 +261,12 @@ fn respawn_backoff_delay(consecutive_failures: u32) -> Duration {
 /// Logs rather than panics on delivery failure; ESRCH on an already-dead pid
 /// is the expected case.
 pub(crate) fn sigkill(pid: u32, context: &str) {
-    tracing::debug!(r#type = "controller", pid, context, "sending SIGKILL to worker");
+    tracing::debug!(
+        r#type = "controller",
+        pid,
+        context,
+        "sending SIGKILL to worker"
+    );
     if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
         tracing::warn!(r#type = "controller", pid, error = %e, "signal delivery failed");
     }
@@ -281,7 +297,12 @@ impl PoolManager {
             }
             _ => None,
         };
-        let (uid, gid) = drop_to.unwrap_or_else(|| (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw()));
+        let (uid, gid) = drop_to.unwrap_or_else(|| {
+            (
+                nix::unistd::getuid().as_raw(),
+                nix::unistd::getgid().as_raw(),
+            )
+        });
 
         let php_mod_path = resolve_php_mod_path();
         let (control, child) = prototype_launch::spawn(
@@ -293,7 +314,14 @@ impl PoolManager {
             &cfg.php.environment,
         )
         .expect("failed to spawn prototype");
-        tracing::info!(r#type = "controller", pid = child.id(), uid, gid, dropped = drop_to.is_some(), "spawned prototype");
+        tracing::info!(
+            r#type = "controller",
+            pid = child.id(),
+            uid,
+            gid,
+            dropped = drop_to.is_some(),
+            "spawned prototype"
+        );
 
         PoolManager {
             control: Mutex::new(control),
@@ -325,7 +353,10 @@ impl PoolManager {
             uid,
             gid,
             drop_privileges: drop_to.is_some(),
-            options: PhpOptions { admin: cfg.php.options.admin.clone(), user: cfg.php.options.user.clone() },
+            options: PhpOptions {
+                admin: cfg.php.options.admin.clone(),
+                user: cfg.php.options.user.clone(),
+            },
             environment: cfg.php.environment.clone(),
             respawn_backoff: Mutex::new(RespawnBackoff::default()),
             crash_loop_backoffs: AtomicU64::new(0),
@@ -361,7 +392,14 @@ impl PoolManager {
         let environment = self.environment.clone();
         let idle_timeout = self.idle_timeout;
         let spawn_result = tokio::task::spawn_blocking(move || {
-            prototype_launch::spawn(&php_mod_path, max_requests, idle_timeout, drop_to, &options, &environment)
+            prototype_launch::spawn(
+                &php_mod_path,
+                max_requests,
+                idle_timeout,
+                drop_to,
+                &options,
+                &environment,
+            )
         })
         .await
         .expect("prototype_launch::spawn blocking task panicked");
@@ -420,9 +458,15 @@ impl PoolManager {
         let to_check = self.idle.len();
         let mut keep = Vec::new();
         for _ in 0..to_check {
-            let Some((_slot, worker)) = self.idle.pop() else { break };
+            let Some((_slot, worker)) = self.idle.pop() else {
+                break;
+            };
             if worker.channel.worker_has_exited() {
-                tracing::debug!(r#type = "controller", pid = worker.pid, "worker retired itself on idle timeout");
+                tracing::debug!(
+                    r#type = "controller",
+                    pid = worker.pid,
+                    "worker retired itself on idle timeout"
+                );
                 self.recycled_idle_timeout.fetch_add(1, Relaxed);
                 self.remove_worker_meta(worker.pid);
                 // Dropping releases the channel and its mapping.
@@ -506,7 +550,9 @@ impl PoolManager {
         for _ in 0..spare {
             match self.spawn_worker().await {
                 Ok(w) => self.return_worker(w),
-                Err(e) => tracing::error!(r#type = "controller", error = %e, "failed to pre-spawn a spare worker"),
+                Err(e) => {
+                    tracing::error!(r#type = "controller", error = %e, "failed to pre-spawn a spare worker")
+                }
             }
         }
     }
@@ -528,7 +574,8 @@ impl PoolManager {
 
     async fn spawn_worker_once(&self) -> std::io::Result<PooledWorker> {
         let control = self.control.lock().await;
-        let request = tokio::time::timeout(self.spawn_timeout, control::request_worker(&control)).await;
+        let request =
+            tokio::time::timeout(self.spawn_timeout, control::request_worker(&control)).await;
         drop(control);
         let (fds, pid) = match request {
             Ok(result) => result?,
@@ -587,7 +634,11 @@ impl PoolManager {
             if !worker.channel.worker_has_exited() {
                 return Ok(worker);
             }
-            tracing::debug!(r#type = "controller", pid = worker.pid, "discarding a worker that retired on idle timeout");
+            tracing::debug!(
+                r#type = "controller",
+                pid = worker.pid,
+                "discarding a worker that retired on idle timeout"
+            );
             self.recycled_idle_timeout.fetch_add(1, Relaxed);
             self.remove_worker_meta(worker.pid);
         }
@@ -603,7 +654,6 @@ impl PoolManager {
     pub fn worker_uid_gid(&self) -> (u32, u32) {
         (self.uid, self.gid)
     }
-
 
     pub fn status_json(&self) -> serde_json::Value {
         let idle_count = self.idle.len();
@@ -654,7 +704,6 @@ impl PoolManager {
             }
         })
     }
-
 }
 
 #[path = "pool_manager_dispatch.rs"]

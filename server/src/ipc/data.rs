@@ -17,7 +17,11 @@ use tokio::io::unix::AsyncFd;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RequestBody<'a> {
     Inline(#[serde(borrow, with = "serde_bytes")] Cow<'a, [u8]>),
-    File { #[serde(borrow)] path: Cow<'a, str>, len: u64 },
+    File {
+        #[serde(borrow)]
+        path: Cow<'a, str>,
+        len: u64,
+    },
 }
 
 /// Every string field is a `Cow` so one type serves both directions: master
@@ -184,12 +188,19 @@ pub enum ResponseFrame<'a> {
     /// all but the last so a reader can forward a complete set without
     /// waiting on the next frame to infer the run ended. `status` repeats and
     /// is ignored past the first.
-    Headers { status: u16, #[serde(borrow)] headers: HeaderBlob<'a>, more: bool },
+    Headers {
+        status: u16,
+        #[serde(borrow)]
+        headers: HeaderBlob<'a>,
+        more: bool,
+    },
     Body(#[serde(borrow, with = "serde_bytes")] Cow<'a, [u8]>),
     /// The response is fully sent. Says nothing about the worker being free -
     /// after `fastcgi_finish_request()` the script keeps running - so callers
     /// must still wait for the worker-done marker.
-    End { retiring: bool },
+    End {
+        retiring: bool,
+    },
 }
 
 impl ResponseFrame<'_> {
@@ -199,9 +210,15 @@ impl ResponseFrame<'_> {
     /// consumed before the next read.
     pub fn into_owned(self) -> ResponseFrame<'static> {
         match self {
-            ResponseFrame::Headers { status, headers, more } => {
-                ResponseFrame::Headers { status, headers: headers.into_owned(), more }
-            }
+            ResponseFrame::Headers {
+                status,
+                headers,
+                more,
+            } => ResponseFrame::Headers {
+                status,
+                headers: headers.into_owned(),
+                more,
+            },
             ResponseFrame::Body(bytes) => ResponseFrame::Body(Cow::Owned(bytes.into_owned())),
             ResponseFrame::End { retiring } => ResponseFrame::End { retiring },
         }
@@ -213,9 +230,15 @@ impl ResponseFrame<'_> {
 /// postcard instead of through a fresh `Vec`.
 #[derive(Serialize)]
 pub enum ResponseFrameRef<'a> {
-    Headers { status: u16, headers: HeaderBlobRef<'a>, more: bool },
+    Headers {
+        status: u16,
+        headers: HeaderBlobRef<'a>,
+        more: bool,
+    },
     Body(#[serde(with = "serde_bytes")] &'a [u8]),
-    End { retiring: bool },
+    End {
+        retiring: bool,
+    },
 }
 
 /// Encodes into `scratch`, reusing its allocation. The `mem::take` and
@@ -261,7 +284,9 @@ pub fn read_command_from_ring<'a>(
         // empty frame here (never written by the current request-ring
         // producer) falls through to postcard, which errors on it rather
         // than being silently read as a retire nothing actually sent.
-        Ok(true) => Ok(Some(WorkerCommand::Request(postcard::from_bytes(scratch).map_err(to_io_err)?))),
+        Ok(true) => Ok(Some(WorkerCommand::Request(
+            postcard::from_bytes(scratch).map_err(to_io_err)?,
+        ))),
         Err(shm::RingError::PeerGone) => Ok(None),
         Err(e) => Err(ring_err_to_io(e)),
     }
@@ -276,7 +301,8 @@ pub fn write_response_frame_to_ring(
     notify_efd: RawFd,
 ) -> std::io::Result<()> {
     let bytes = encode_into(scratch, frame)?;
-    ring.write_frame(bytes, peer, notify_efd).map_err(ring_err_to_io)
+    ring.write_frame(bytes, peer, notify_efd)
+        .map_err(ring_err_to_io)
 }
 
 /// Splits one `ub_write` chunk into as many `Body` frames as the ring's
@@ -291,7 +317,13 @@ pub fn write_body_to_ring(
     notify_efd: RawFd,
 ) -> std::io::Result<()> {
     for sub in bytes.chunks(chunk_size) {
-        write_response_frame_to_ring(ring, peer, &ResponseFrameRef::Body(sub), scratch, notify_efd)?;
+        write_response_frame_to_ring(
+            ring,
+            peer,
+            &ResponseFrameRef::Body(sub),
+            scratch,
+            notify_efd,
+        )?;
     }
     Ok(())
 }
@@ -306,7 +338,14 @@ pub fn write_headers_to_ring(
     scratch: &mut Vec<u8>,
     notify_efd: RawFd,
 ) -> std::io::Result<()> {
-    let bytes = encode_into(scratch, &ResponseFrameRef::Headers { status, headers: headers.into(), more: false })?;
+    let bytes = encode_into(
+        scratch,
+        &ResponseFrameRef::Headers {
+            status,
+            headers: headers.into(),
+            more: false,
+        },
+    )?;
     match ring.write_frame(bytes, peer, notify_efd) {
         Ok(()) => Ok(()),
         Err(shm::RingError::FrameTooLarge) => {
@@ -316,7 +355,11 @@ pub fn write_headers_to_ring(
                 write_response_frame_to_ring(
                     ring,
                     peer,
-                    &ResponseFrameRef::Headers { status, headers: piece, more: i != last },
+                    &ResponseFrameRef::Headers {
+                        status,
+                        headers: piece,
+                        more: i != last,
+                    },
                     scratch,
                     notify_efd,
                 )?;
@@ -337,8 +380,13 @@ fn split_headers_into_frames<'b>(headers: &'b HeaderBlob<'_>) -> Vec<HeaderBlobR
 /// Sent once `execute_file` truly returns, which after
 /// `fastcgi_finish_request()` can be long after `End`. The only signal that
 /// the worker is free.
-pub fn write_worker_done_to_ring(ring: &shm::ResponseRing, peer: &shm::PeerDeath, notify_efd: RawFd) -> std::io::Result<()> {
-    ring.write_frame(&[], peer, notify_efd).map_err(ring_err_to_io)
+pub fn write_worker_done_to_ring(
+    ring: &shm::ResponseRing,
+    peer: &shm::PeerDeath,
+    notify_efd: RawFd,
+) -> std::io::Result<()> {
+    ring.write_frame(&[], peer, notify_efd)
+        .map_err(ring_err_to_io)
 }
 
 /// Reused for a worker's whole life, so a steady-state request allocates in
@@ -350,7 +398,10 @@ pub struct RingScratch {
     pub write: Vec<u8>,
 }
 
-pub fn encode_request<'a>(scratch: &'a mut Vec<u8>, req: &PhpRequest<'_>) -> std::io::Result<&'a [u8]> {
+pub fn encode_request<'a>(
+    scratch: &'a mut Vec<u8>,
+    req: &PhpRequest<'_>,
+) -> std::io::Result<&'a [u8]> {
     encode_into(scratch, req)
 }
 
@@ -361,7 +412,9 @@ pub async fn write_request_to_ring(
     bytes: &[u8],
     space_efd: &AsyncFd<OwnedFd>,
 ) -> std::io::Result<()> {
-    ring.write_frame_async(bytes, peer, space_efd).await.map_err(ring_err_to_io)
+    ring.write_frame_async(bytes, peer, space_efd)
+        .await
+        .map_err(ring_err_to_io)
 }
 
 /// Master side, async. `Ok(None)` is the trailing worker-done marker.
@@ -377,7 +430,11 @@ pub async fn read_response_frame_from_ring(
     data_efd: &AsyncFd<OwnedFd>,
 ) -> std::io::Result<Option<ResponseFrame<'static>>> {
     let channel = mapped.channel();
-    channel.response.read_frame_async(scratch, &channel.peer_death, data_efd).await.map_err(ring_err_to_io)?;
+    channel
+        .response
+        .read_frame_async(scratch, &channel.peer_death, data_efd)
+        .await
+        .map_err(ring_err_to_io)?;
     if scratch.is_empty() {
         if mapped.reclaim_is_due() {
             // fallocate is not guaranteed cheap, and it cannot safely overlap
@@ -393,10 +450,13 @@ pub async fn read_response_frame_from_ring(
 
 pub(crate) fn ring_err_to_io(e: shm::RingError) -> std::io::Error {
     match e {
-        shm::RingError::FrameTooLarge => {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "frame exceeds ring capacity")
+        shm::RingError::FrameTooLarge => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame exceeds ring capacity",
+        ),
+        shm::RingError::PeerGone => {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer process is gone")
         }
-        shm::RingError::PeerGone => std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer process is gone"),
     }
 }
 

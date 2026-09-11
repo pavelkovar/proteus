@@ -28,12 +28,24 @@ fn spawn_harness(pid: u32) -> Harness {
     let (request_tx, request_rx) = mpsc::unbounded_channel::<Arc<PhpRequest<'static>>>();
     let (response_tx, response_rx) = mpsc::channel(8);
 
-    tokio::spawn(io_task(Arc::new(master_side), pid, request_rx, response_tx, req_space_efd, resp_data_efd));
+    tokio::spawn(io_task(
+        Arc::new(master_side),
+        pid,
+        request_rx,
+        response_tx,
+        req_space_efd,
+        resp_data_efd,
+    ));
 
     // Contents are irrelevant; this only moves `io_task` on to reading.
     request_tx.send(Arc::new(dummy_request())).unwrap();
 
-    Harness { worker_side, resp_data_efd_raw, response_rx, request_tx }
+    Harness {
+        worker_side,
+        resp_data_efd_raw,
+        response_rx,
+        request_tx,
+    }
 }
 
 /// See `spawn_harness` for why most tests want no real process behind this.
@@ -81,21 +93,57 @@ async fn io_task_reassembles_a_normal_small_headers_run_end_to_end() {
     let response = &channel.response;
     let mut header_pairs = data::HeaderBlob::default();
     header_pairs.push("X-Test", "1");
-    let headers = data::ResponseFrameRef::Headers { status: 200, headers: (&header_pairs).into(), more: false };
+    let headers = data::ResponseFrameRef::Headers {
+        status: 200,
+        headers: (&header_pairs).into(),
+        more: false,
+    };
 
     write_frame(response, peer, &headers, h.resp_data_efd_raw);
-    write_frame(response, peer, &data::ResponseFrameRef::Body(b"hi"), h.resp_data_efd_raw);
-    write_frame(response, peer, &data::ResponseFrameRef::End { retiring: false }, h.resp_data_efd_raw);
+    write_frame(
+        response,
+        peer,
+        &data::ResponseFrameRef::Body(b"hi"),
+        h.resp_data_efd_raw,
+    );
+    write_frame(
+        response,
+        peer,
+        &data::ResponseFrameRef::End { retiring: false },
+        h.resp_data_efd_raw,
+    );
     data::write_worker_done_to_ring(response, peer, h.resp_data_efd_raw).unwrap();
 
     let deadline = Duration::from_secs(5);
-    let got_headers = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
-    assert!(matches!(got_headers, Some(ResponseFrame::Headers { status: 200, .. })));
-    let got_body = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
+    let got_headers = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        got_headers,
+        Some(ResponseFrame::Headers { status: 200, .. })
+    ));
+    let got_body = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(matches!(got_body, Some(ResponseFrame::Body(ref b)) if b.as_ref() == b"hi"));
-    let got_end = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
-    assert!(matches!(got_end, Some(ResponseFrame::End { retiring: false })));
-    let got_done = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
+    let got_end = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        got_end,
+        Some(ResponseFrame::End { retiring: false })
+    ));
+    let got_done = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(got_done.is_none());
 
     drop(h.request_tx); // let the task end cleanly
@@ -112,7 +160,11 @@ async fn io_task_forwards_a_complete_headers_frame_before_the_worker_sends_anyth
     let response = &channel.response;
     let mut header_pairs = data::HeaderBlob::default();
     header_pairs.push("X-Test", "1");
-    let headers = data::ResponseFrameRef::Headers { status: 200, headers: (&header_pairs).into(), more: false };
+    let headers = data::ResponseFrameRef::Headers {
+        status: 200,
+        headers: (&header_pairs).into(),
+        more: false,
+    };
     write_frame(response, peer, &headers, h.resp_data_efd_raw);
 
     let deadline = Duration::from_millis(500);
@@ -121,17 +173,45 @@ async fn io_task_forwards_a_complete_headers_frame_before_the_worker_sends_anyth
         .expect("Headers must be forwarded on its own, without waiting for a Body/End frame that was never sent")
         .unwrap()
         .unwrap();
-    assert!(matches!(got_headers, Some(ResponseFrame::Headers { status: 200, .. })));
+    assert!(matches!(
+        got_headers,
+        Some(ResponseFrame::Headers { status: 200, .. })
+    ));
 
     // Finish normally so the harness's task ends cleanly.
-    write_frame(response, peer, &data::ResponseFrameRef::Body(b"hi"), h.resp_data_efd_raw);
-    write_frame(response, peer, &data::ResponseFrameRef::End { retiring: false }, h.resp_data_efd_raw);
+    write_frame(
+        response,
+        peer,
+        &data::ResponseFrameRef::Body(b"hi"),
+        h.resp_data_efd_raw,
+    );
+    write_frame(
+        response,
+        peer,
+        &data::ResponseFrameRef::End { retiring: false },
+        h.resp_data_efd_raw,
+    );
     data::write_worker_done_to_ring(response, peer, h.resp_data_efd_raw).unwrap();
-    let got_body = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
+    let got_body = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(matches!(got_body, Some(ResponseFrame::Body(ref b)) if b.as_ref() == b"hi"));
-    let got_end = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
-    assert!(matches!(got_end, Some(ResponseFrame::End { retiring: false })));
-    let got_done = tokio::time::timeout(deadline, h.response_rx.recv()).await.unwrap().unwrap().unwrap();
+    let got_end = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        got_end,
+        Some(ResponseFrame::End { retiring: false })
+    ));
+    let got_done = tokio::time::timeout(deadline, h.response_rx.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(got_done.is_none());
 
     drop(h.request_tx);
@@ -141,15 +221,26 @@ async fn io_task_forwards_a_complete_headers_frame_before_the_worker_sends_anyth
 /// `WorkerChannel::new`, since `spawn_harness` has no liveness watcher.
 #[tokio::test]
 async fn a_stray_byte_on_the_liveness_socket_is_treated_as_fatal_same_as_eof() {
-    use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
     let (channel_fd, worker_side_mapping) = shm::create_channel().unwrap();
     drop(worker_side_mapping); // only needed to create+init the memfd
-    let (test_side, worker_liveness_side) =
-        socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::empty()).unwrap();
-    let notify =
-        shm::NotifyEfds { req_space: shm::create_notify_eventfd().unwrap(), resp_data: shm::create_notify_eventfd().unwrap() };
-    let fds = WorkerReadyFds { channel: channel_fd, liveness: worker_liveness_side, notify };
+    let (test_side, worker_liveness_side) = socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::empty(),
+    )
+    .unwrap();
+    let notify = shm::NotifyEfds {
+        req_space: shm::create_notify_eventfd().unwrap(),
+        resp_data: shm::create_notify_eventfd().unwrap(),
+    };
+    let fds = WorkerReadyFds {
+        channel: channel_fd,
+        liveness: worker_liveness_side,
+        notify,
+    };
     let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
 
     // A real worker never sends anything, so this is the protocol-violation
@@ -185,7 +276,12 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
     // released by that kill. This harness has no liveness watcher, so
     // `peer.is_dead()` never becomes true; the integration suite covers it
     // with a real forked process.
-    let child = ChildGuard(std::process::Command::new("sleep").arg("100").spawn().expect("failed to spawn sleep"));
+    let child = ChildGuard(
+        std::process::Command::new("sleep")
+            .arg("100")
+            .spawn()
+            .expect("failed to spawn sleep"),
+    );
     let child_pid = child.0.id();
 
     let h = spawn_harness(child_pid);
@@ -198,9 +294,16 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
     // accumulator, so the cap could never trip.
     let mut header_pairs = data::HeaderBlob::default();
     header_pairs.push("X-Big", &big_value);
-    let frame = data::ResponseFrameRef::Headers { status: 200, headers: (&header_pairs).into(), more: true };
+    let frame = data::ResponseFrameRef::Headers {
+        status: 200,
+        headers: (&header_pairs).into(),
+        more: true,
+    };
     let wire_size = postcard::to_allocvec(&frame).unwrap().len();
-    assert!(wire_size < shm::RESPONSE_RING_CAPACITY - 4, "one frame must still fit the ring on its own");
+    assert!(
+        wire_size < shm::RESPONSE_RING_CAPACITY - 4,
+        "one frame must still fit the ring on its own"
+    );
 
     // Exactly enough to cross the cap on the last frame. The writer only
     // blocks between frames, waiting for space the previous read freed, so it
@@ -211,10 +314,22 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
         let channel = worker_side.channel();
         let peer = &channel.peer_death;
         let response = &channel.response;
-        let frame = data::ResponseFrameRef::Headers { status: 200, headers: (&header_pairs).into(), more: true };
+        let frame = data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&header_pairs).into(),
+            more: true,
+        };
         let mut scratch = Vec::new();
         for _ in 0..frames_needed {
-            if data::write_response_frame_to_ring(response, peer, &frame, &mut scratch, resp_data_efd_raw).is_err() {
+            if data::write_response_frame_to_ring(
+                response,
+                peer,
+                &frame,
+                &mut scratch,
+                resp_data_efd_raw,
+            )
+            .is_err()
+            {
                 return; // peer already gone once io_task bails - fine
             }
         }
@@ -222,7 +337,10 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
 
     let deadline = Duration::from_secs(20);
     loop {
-        match tokio::time::timeout(deadline, response_rx.recv()).await.expect("should not hang") {
+        match tokio::time::timeout(deadline, response_rx.recv())
+            .await
+            .expect("should not hang")
+        {
             Some(Err(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
                 break;
@@ -232,7 +350,9 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
         }
     }
 
-    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
 
     // Poll for a real death rather than assume the call happened.
     let mut child = child;
@@ -259,25 +379,38 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
 ///
 /// Holding the liveness side matters: dropping it lets the watcher see EOF
 /// and set `peer_death` itself, passing the tests for the wrong reason.
-fn channel_with_live_worker_side() -> (WorkerChannel, shm::MappedChannel, shm::NotifyEfds, OwnedFd) {
-    use nix::sys::socket::{socketpair, AddressFamily, SockFlag, SockType};
+fn channel_with_live_worker_side() -> (WorkerChannel, shm::MappedChannel, shm::NotifyEfds, OwnedFd)
+{
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
     let (channel_fd, worker_side) = shm::create_channel().unwrap();
-    let (liveness_master_side, liveness_worker_side) =
-        socketpair(AddressFamily::Unix, SockType::Stream, None, SockFlag::empty()).unwrap();
-    let notify =
-        shm::NotifyEfds { req_space: shm::create_notify_eventfd().unwrap(), resp_data: shm::create_notify_eventfd().unwrap() };
+    let (liveness_master_side, liveness_worker_side) = socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::empty(),
+    )
+    .unwrap();
+    let notify = shm::NotifyEfds {
+        req_space: shm::create_notify_eventfd().unwrap(),
+        resp_data: shm::create_notify_eventfd().unwrap(),
+    };
     // Through its own copies, as a forked worker's inherited fds would be.
     let worker_notify = notify.try_clone().unwrap();
 
-    let fds = WorkerReadyFds { channel: channel_fd, liveness: liveness_master_side, notify };
+    let fds = WorkerReadyFds {
+        channel: channel_fd,
+        liveness: liveness_master_side,
+        notify,
+    };
     let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
     (channel, worker_side, worker_notify, liveness_worker_side)
 }
 
 #[tokio::test]
 async fn dropping_a_worker_channel_marks_the_peer_dead() {
-    let (channel, worker_side, _worker_notify, _liveness_worker_side) = channel_with_live_worker_side();
+    let (channel, worker_side, _worker_notify, _liveness_worker_side) =
+        channel_with_live_worker_side();
 
     assert!(
         !worker_side.channel().peer_death.is_dead(),
@@ -301,7 +434,8 @@ async fn dropping_a_worker_channel_marks_the_peer_dead() {
 /// shutdown functions.
 #[tokio::test]
 async fn a_worker_parked_on_the_request_ring_is_released_when_master_drops_the_channel() {
-    let (channel, worker_side, worker_notify, _liveness_worker_side) = channel_with_live_worker_side();
+    let (channel, worker_side, worker_notify, _liveness_worker_side) =
+        channel_with_live_worker_side();
     let req_space_raw = worker_notify.req_space.as_raw_fd();
 
     // A channel, not a join handle: a regression here never returns, and
@@ -311,21 +445,34 @@ async fn a_worker_parked_on_the_request_ring_is_released_when_master_drops_the_c
         let ch = worker_side.channel();
         let mut scratch = Vec::new();
         // No deadline: this is about release by peer death, not by timeout.
-        let result = data::read_command_from_ring(&ch.request, &ch.peer_death, &mut scratch, req_space_raw, None);
+        let result = data::read_command_from_ring(
+            &ch.request,
+            &ch.peer_death,
+            &mut scratch,
+            req_space_raw,
+            None,
+        );
         let _ = done_tx.send(matches!(result, Ok(None)));
     });
 
     // Long enough to be genuinely parked, past the fast-path check.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(done_rx.try_recv().is_err(), "the worker should still be parked, with no command sent");
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the worker should still be parked, with no command sent"
+    );
 
     drop(channel);
 
-    let released = tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
-        .await
-        .unwrap()
-        .expect("the parked worker was never released - it would sit on this futex forever");
-    assert!(released, "an abandoned worker must see Ok(None) and exit cleanly, not an error");
+    let released =
+        tokio::task::spawn_blocking(move || done_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("the parked worker was never released - it would sit on this futex forever");
+    assert!(
+        released,
+        "an abandoned worker must see Ok(None) and exit cleanly, not an error"
+    );
 }
 
 /// The same guarantee on the other ring: a worker blocked mid-response
@@ -333,7 +480,8 @@ async fn a_worker_parked_on_the_request_ring_is_released_when_master_drops_the_c
 /// one.
 #[tokio::test]
 async fn a_worker_blocked_writing_a_response_is_released_when_master_drops_the_channel() {
-    let (channel, worker_side, worker_notify, _liveness_worker_side) = channel_with_live_worker_side();
+    let (channel, worker_side, worker_notify, _liveness_worker_side) =
+        channel_with_live_worker_side();
     let resp_data_raw = worker_notify.resp_data.as_raw_fd();
 
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -344,7 +492,13 @@ async fn a_worker_blocked_writing_a_response_is_released_when_master_drops_the_c
         let frame = data::ResponseFrameRef::Body(&chunk);
         let mut scratch = Vec::new();
         loop {
-            match data::write_response_frame_to_ring(&ch.response, &ch.peer_death, &frame, &mut scratch, resp_data_raw) {
+            match data::write_response_frame_to_ring(
+                &ch.response,
+                &ch.peer_death,
+                &frame,
+                &mut scratch,
+                resp_data_raw,
+            ) {
                 Ok(()) => continue,
                 Err(e) => {
                     let _ = done_tx.send(e.kind());
@@ -355,7 +509,10 @@ async fn a_worker_blocked_writing_a_response_is_released_when_master_drops_the_c
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(done_rx.try_recv().is_err(), "the writer should still be blocked on a full response ring");
+    assert!(
+        done_rx.try_recv().is_err(),
+        "the writer should still be blocked on a full response ring"
+    );
 
     drop(channel);
 
@@ -363,5 +520,9 @@ async fn a_worker_blocked_writing_a_response_is_released_when_master_drops_the_c
         .await
         .unwrap()
         .expect("the blocked writer was never released - it would sit on this futex forever");
-    assert_eq!(kind, std::io::ErrorKind::BrokenPipe, "a released writer should report the peer as gone");
+    assert_eq!(
+        kind,
+        std::io::ErrorKind::BrokenPipe,
+        "a released writer should report the peer as gone"
+    );
 }

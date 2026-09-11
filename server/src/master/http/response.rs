@@ -1,13 +1,15 @@
 //! Assembling a `Response<ResponseBody>`: buffered, streamed static file,
 //! or streamed PHP output.
 
-use super::compression::{
-    body_from_stream, compressed_body, compression_eligible, pick_encoding_when_eligible, stream_size_gate,
-    with_content_encoding,
-};
-use super::conditional::{if_range_matches, make_etag, not_modified, weaken_etag, with_cache_headers, ConditionalHeaders};
-use super::range::{parse_range, FileBody};
 use super::ResponseBody;
+use super::compression::{
+    body_from_stream, compressed_body, compression_eligible, pick_encoding_when_eligible,
+    stream_size_gate, with_content_encoding,
+};
+use super::conditional::{
+    ConditionalHeaders, if_range_matches, make_etag, not_modified, weaken_etag, with_cache_headers,
+};
+use super::range::{FileBody, parse_range};
 use crate::ipc::data::HeaderBlob;
 use crate::master::pool_manager::BodyStream;
 use bytes::Bytes;
@@ -26,7 +28,11 @@ struct ScriptHeaders<'a> {
 /// name. Runs to the end rather than stopping once the first two are found:
 /// an absent `Content-Encoding` is only provable by looking at every header.
 fn script_headers<'b>(headers: &'b HeaderBlob<'_>) -> ScriptHeaders<'b> {
-    let mut out = ScriptHeaders { content_type: "", declared_len: None, pre_encoded: false };
+    let mut out = ScriptHeaders {
+        content_type: "",
+        declared_len: None,
+        pre_encoded: false,
+    };
     for (name, value) in headers.iter() {
         if out.content_type.is_empty() && name.eq_ignore_ascii_case("content-type") {
             out.content_type = value;
@@ -46,7 +52,9 @@ fn guess_mime_type(path: &str) -> mime_guess::Mime {
 
 /// The `Infallible` error is mapped only to unify with `streamed_body`.
 fn buffered_body(bytes: Vec<u8>) -> ResponseBody {
-    Full::new(Bytes::from(bytes)).map_err(|never: std::convert::Infallible| match never {}).boxed()
+    Full::new(Bytes::from(bytes))
+        .map_err(|never: std::convert::Infallible| match never {})
+        .boxed()
 }
 
 /// Message-framing headers are master's alone to set. A script-set
@@ -54,7 +62,9 @@ fn buffered_body(bytes: Vec<u8>) -> ResponseBody {
 /// this response - it desyncs whatever the client reads next off a reused
 /// connection.
 fn is_framing_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("transfer-encoding") || name.eq_ignore_ascii_case("connection")
+    name.eq_ignore_ascii_case("content-length")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("connection")
 }
 
 /// Appends rather than inserting, so repeated names such as `Set-Cookie`
@@ -66,7 +76,10 @@ fn is_framing_header(name: &str) -> bool {
 /// header queued after a bad one until `.body()` surfaces one accumulated
 /// error, so a name/value that cannot become valid HTTP is dropped here
 /// instead, individually, before it ever reaches the builder.
-fn apply_headers(mut builder: hyper::http::response::Builder, headers: &HeaderBlob<'_>) -> hyper::http::response::Builder {
+fn apply_headers(
+    mut builder: hyper::http::response::Builder,
+    headers: &HeaderBlob<'_>,
+) -> hyper::http::response::Builder {
     for (name, value) in headers.iter() {
         if is_framing_header(name) {
             continue;
@@ -74,7 +87,11 @@ fn apply_headers(mut builder: hyper::http::response::Builder, headers: &HeaderBl
         if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err()
             || hyper::header::HeaderValue::from_bytes(value.as_bytes()).is_err()
         {
-            tracing::warn!(r#type = "controller", header = name, "dropping a response header that is not valid HTTP");
+            tracing::warn!(
+                r#type = "controller",
+                header = name,
+                "dropping a response header that is not valid HTTP"
+            );
             continue;
         }
         builder = builder.header(name, value);
@@ -84,8 +101,14 @@ fn apply_headers(mut builder: hyper::http::response::Builder, headers: &HeaderBl
 
 /// Does not negotiate `Accept-Encoding`: every caller passes a small fixed
 /// string, never worth compressing.
-pub(crate) fn build_response(status: StatusCode, body: Vec<u8>, headers: &HeaderBlob<'_>) -> Response<ResponseBody> {
-    apply_headers(Response::builder().status(status), headers).body(buffered_body(body)).unwrap()
+pub(crate) fn build_response(
+    status: StatusCode,
+    body: Vec<u8>,
+    headers: &HeaderBlob<'_>,
+) -> Response<ResponseBody> {
+    apply_headers(Response::builder().status(status), headers)
+        .body(buffered_body(body))
+        .unwrap()
 }
 
 /// `meta` must come from the same `stat` that opened `file`; an fd stays
@@ -120,11 +143,19 @@ pub(crate) async fn build_static_response(
     let vary = compression_eligible(len as usize, min_size_bytes, content_type, mime_types);
     // `vary` is the eligibility answer already computed.
     let encoding = pick_encoding_when_eligible(vary, accept_encoding);
-    let negotiated_etag = if encoding.is_some() { identity_etag.as_deref().map(weaken_etag) } else { identity_etag.clone() };
+    let negotiated_etag = if encoding.is_some() {
+        identity_etag.as_deref().map(weaken_etag)
+    } else {
+        identity_etag.clone()
+    };
 
     if not_modified(cond, negotiated_etag.as_deref(), modified) {
-        let mut builder = with_cache_headers(Response::builder().status(StatusCode::NOT_MODIFIED), negotiated_etag.as_deref(), modified)
-            .header(hyper::header::ACCEPT_RANGES, "bytes");
+        let mut builder = with_cache_headers(
+            Response::builder().status(StatusCode::NOT_MODIFIED),
+            negotiated_etag.as_deref(),
+            modified,
+        )
+        .header(hyper::header::ACCEPT_RANGES, "bytes");
         if vary {
             builder = builder.header(hyper::header::VARY, "Accept-Encoding");
         }
@@ -142,12 +173,17 @@ pub(crate) async fn build_static_response(
                         .status(StatusCode::PARTIAL_CONTENT)
                         .header(hyper::header::CONTENT_TYPE, content_type)
                         .header(hyper::header::CONTENT_LENGTH, range_len)
-                        .header(hyper::header::CONTENT_RANGE, format!("bytes {start}-{end}/{len}"))
+                        .header(
+                            hyper::header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{len}"),
+                        )
                         .header(hyper::header::ACCEPT_RANGES, "bytes"),
                     identity_etag.as_deref(),
                     modified,
                 );
-                return builder.body(body_from_stream(FileBody::new(file, start, range_len))).unwrap();
+                return builder
+                    .body(body_from_stream(FileBody::new(file, start, range_len)))
+                    .unwrap();
             }
             Some(Err(())) => {
                 let builder = with_cache_headers(
@@ -165,7 +201,9 @@ pub(crate) async fn build_static_response(
     }
 
     let mut builder = with_cache_headers(
-        Response::builder().status(StatusCode::OK).header(hyper::header::CONTENT_TYPE, content_type),
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, content_type),
         negotiated_etag.as_deref(),
         modified,
     );
@@ -174,8 +212,14 @@ pub(crate) async fn build_static_response(
     }
     let body = match encoding {
         None => {
-            builder = builder.header(hyper::header::CONTENT_LENGTH, len).header(hyper::header::ACCEPT_RANGES, "bytes");
-            if is_head { buffered_body(Vec::new()) } else { body_from_stream(FileBody::new(file, 0, len)) }
+            builder = builder
+                .header(hyper::header::CONTENT_LENGTH, len)
+                .header(hyper::header::ACCEPT_RANGES, "bytes");
+            if is_head {
+                buffered_body(Vec::new())
+            } else {
+                body_from_stream(FileBody::new(file, 0, len))
+            }
         }
         Some(encoding) => {
             builder = with_content_encoding(builder, encoding);
@@ -207,18 +251,27 @@ pub(crate) fn build_php_stream_response(
     let (body_len, min_size) = stream_size_gate(script.declared_len, min_size_bytes);
     // A body the script already encoded must be left alone: encoding it again
     // yields two `Content-Encoding` headers and bytes no client can decode.
-    let eligible = !script.pre_encoded && compression_eligible(body_len, min_size, script.content_type, mime_types);
+    let eligible = !script.pre_encoded
+        && compression_eligible(body_len, min_size, script.content_type, mime_types);
     // Vary is about whether some Accept-Encoding could change this response,
     // not whether this client's did. A script that encoded the body did its
     // own negotiation, so that case varies too.
     let vary = eligible || script.pre_encoded;
-    let builder = if vary { builder.header(hyper::header::VARY, "Accept-Encoding") } else { builder };
+    let builder = if vary {
+        builder.header(hyper::header::VARY, "Accept-Encoding")
+    } else {
+        builder
+    };
 
     match pick_encoding_when_eligible(eligible, accept_encoding) {
         None => builder.body(body_from_stream(body)).unwrap(),
-        Some(encoding) => {
-            with_content_encoding(builder, encoding).body(compressed_body(body, encoding, script.declared_len.map(|l| l as u64))).unwrap()
-        }
+        Some(encoding) => with_content_encoding(builder, encoding)
+            .body(compressed_body(
+                body,
+                encoding,
+                script.declared_len.map(|l| l as u64),
+            ))
+            .unwrap(),
     }
 }
 

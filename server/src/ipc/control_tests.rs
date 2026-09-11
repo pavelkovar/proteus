@@ -9,7 +9,9 @@ fn set_recv_timeout_makes_a_blocking_read_time_out() {
 
     let start = std::time::Instant::now();
     let mut buf = [0u8; 8];
-    let err = a.read(&mut buf).expect_err("read on an empty, otherwise-idle socket must time out");
+    let err = a
+        .read(&mut buf)
+        .expect_err("read on an empty, otherwise-idle socket must time out");
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert!(
         start.elapsed() < Duration::from_secs(2),

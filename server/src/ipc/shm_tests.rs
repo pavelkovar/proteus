@@ -1,5 +1,5 @@
 use super::*;
-use std::alloc::{alloc, Layout};
+use std::alloc::{Layout, alloc};
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -36,13 +36,13 @@ fn write_read_roundtrip() {
 
     ring.write_frame(b"hello", peer, efd.as_raw_fd()).unwrap();
     let mut scratch = Vec::new();
-    ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap();
+    ring.read_frame(&mut scratch, peer, efd.as_raw_fd())
+        .unwrap();
     assert_eq!(scratch, b"hello");
 }
 
 #[test]
 fn multiple_frames_pipeline_without_reader() {
-
     let ring: &Ring<64> = make_ring();
     let peer = make_peer_death();
     let efd = make_notify_efd();
@@ -52,11 +52,14 @@ fn multiple_frames_pipeline_without_reader() {
     ring.write_frame(b"three", peer, efd.as_raw_fd()).unwrap();
 
     let mut scratch = Vec::new();
-    ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap();
+    ring.read_frame(&mut scratch, peer, efd.as_raw_fd())
+        .unwrap();
     assert_eq!(scratch, b"one");
-    ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap();
+    ring.read_frame(&mut scratch, peer, efd.as_raw_fd())
+        .unwrap();
     assert_eq!(scratch, b"two");
-    ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap();
+    ring.read_frame(&mut scratch, peer, efd.as_raw_fd())
+        .unwrap();
     assert_eq!(scratch, b"three");
 }
 
@@ -71,7 +74,8 @@ fn survives_wraparound() {
     for i in 0..1000u32 {
         let payload = i.to_le_bytes();
         ring.write_frame(&payload, peer, efd.as_raw_fd()).unwrap();
-        ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap();
+        ring.read_frame(&mut scratch, peer, efd.as_raw_fd())
+            .unwrap();
         assert_eq!(scratch.as_slice(), &payload);
     }
 }
@@ -83,7 +87,9 @@ fn write_frame_too_large_is_rejected_not_panicked() {
     let efd = make_notify_efd();
 
     let oversized = vec![0u8; 64];
-    let err = ring.write_frame(&oversized, peer, efd.as_raw_fd()).unwrap_err();
+    let err = ring
+        .write_frame(&oversized, peer, efd.as_raw_fd())
+        .unwrap_err();
     assert!(matches!(err, RingError::FrameTooLarge));
 }
 
@@ -95,12 +101,16 @@ fn write_frame_exact_capacity_boundary() {
     let efd = make_notify_efd();
 
     let one_over = vec![0u8; 13];
-    assert!(matches!(ring.write_frame(&one_over, peer, efd.as_raw_fd()), Err(RingError::FrameTooLarge)));
+    assert!(matches!(
+        ring.write_frame(&one_over, peer, efd.as_raw_fd()),
+        Err(RingError::FrameTooLarge)
+    ));
 
     let exact = vec![7u8; 12];
     ring.write_frame(&exact, peer, efd.as_raw_fd()).unwrap();
     let mut scratch = Vec::new();
-    ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap();
+    ring.read_frame(&mut scratch, peer, efd.as_raw_fd())
+        .unwrap();
     assert_eq!(scratch, exact);
 }
 
@@ -119,7 +129,9 @@ fn read_frame_rejects_corrupt_length_prefix_not_panicked() {
     ring.notify_data_written();
 
     let mut scratch = Vec::new();
-    let err = ring.read_frame(&mut scratch, peer, efd.as_raw_fd()).unwrap_err();
+    let err = ring
+        .read_frame(&mut scratch, peer, efd.as_raw_fd())
+        .unwrap_err();
     assert!(matches!(err, RingError::FrameTooLarge));
 }
 
@@ -187,7 +199,10 @@ fn notify_eventfd_is_gated_not_fired_on_every_frame() {
     let mut val: u64 = 0;
     let n = unsafe { libc::read(efd_raw, &mut val as *mut u64 as *mut libc::c_void, 8) };
     let err = std::io::Error::last_os_error();
-    assert_eq!(n, -1, "eventfd should have no pending count - nobody ever parked on it");
+    assert_eq!(
+        n, -1,
+        "eventfd should have no pending count - nobody ever parked on it"
+    );
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
 }
 
@@ -201,15 +216,31 @@ fn create_and_map_existing_channel_share_the_same_memory() {
     let efd_raw = efd.as_raw_fd();
 
     let proto_peer = &prototype_side.channel().peer_death;
-    prototype_side.channel().request.write_frame(b"from prototype", proto_peer, efd_raw).unwrap();
+    prototype_side
+        .channel()
+        .request
+        .write_frame(b"from prototype", proto_peer, efd_raw)
+        .unwrap();
 
     let master_peer = &master_side.channel().peer_death;
     let mut scratch = Vec::new();
-    master_side.channel().request.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .request
+        .read_frame(&mut scratch, master_peer, efd_raw)
+        .unwrap();
     assert_eq!(scratch, b"from prototype");
 
-    master_side.channel().response.write_frame(b"from master", master_peer, efd_raw).unwrap();
-    prototype_side.channel().response.read_frame(&mut scratch, proto_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .response
+        .write_frame(b"from master", master_peer, efd_raw)
+        .unwrap();
+    prototype_side
+        .channel()
+        .response
+        .read_frame(&mut scratch, proto_peer, efd_raw)
+        .unwrap();
     assert_eq!(scratch, b"from master");
 }
 
@@ -226,8 +257,8 @@ fn create_and_map_existing_channel_share_the_same_memory() {
 /// than a rare one.
 #[tokio::test]
 async fn a_published_frame_is_never_visible_before_its_payload() {
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     const PAYLOAD: usize = 32 * 1024;
     const FRAME: u64 = (LEN_PREFIX + PAYLOAD) as u64;
@@ -259,25 +290,40 @@ async fn a_published_frame_is_never_visible_before_its_payload() {
 
     let writer = std::thread::spawn(move || {
         for i in 0..FRAMES {
-            ring.write_frame(&[i as u8; PAYLOAD], peer, data_efd_raw).unwrap();
+            ring.write_frame(&[i as u8; PAYLOAD], peer, data_efd_raw)
+                .unwrap();
         }
     });
 
     let mut scratch = Vec::new();
     for i in 0..FRAMES {
-        tokio::time::timeout(Duration::from_secs(10), ring.read_frame_async(&mut scratch, peer, &data_efd))
-            .await
-            .expect("should not hang - see this test's own doc comment")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            ring.read_frame_async(&mut scratch, peer, &data_efd),
+        )
+        .await
+        .expect("should not hang - see this test's own doc comment")
+        .unwrap();
         assert_eq!(scratch.len(), PAYLOAD, "frame {i} arrived truncated");
-        assert!(scratch.iter().all(|&b| b == i as u8), "frame {i} was published before its bytes landed");
+        assert!(
+            scratch.iter().all(|&b| b == i as u8),
+            "frame {i} was published before its bytes landed"
+        );
     }
-    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
 
     done.store(true, Ordering::Relaxed);
     let samples = observer.join().unwrap();
-    assert!(samples > FRAMES as u64, "observer sampled {samples} times - too coarse to conclude anything");
-    assert!(!torn.load(Ordering::Relaxed), "write_pos was published inside a frame");
+    assert!(
+        samples > FRAMES as u64,
+        "observer sampled {samples} times - too coarse to conclude anything"
+    );
+    assert!(
+        !torn.load(Ordering::Relaxed),
+        "write_pos was published inside a frame"
+    );
 }
 
 // --- Response-ring reclaim (`fallocate(FALLOC_FL_PUNCH_HOLE)`) ---
@@ -303,16 +349,39 @@ fn reclaim_response_below_threshold_is_a_noop() {
     let master_peer = &master_side.channel().peer_death;
 
     // Under the threshold: the common case must never pay for a fallocate.
-    prototype_side.channel().response.write_frame(b"tiny", proto_peer, efd_raw).unwrap();
-    prototype_side.channel().response.write_frame(&[], proto_peer, efd_raw).unwrap(); // worker-done
+    prototype_side
+        .channel()
+        .response
+        .write_frame(b"tiny", proto_peer, efd_raw)
+        .unwrap();
+    prototype_side
+        .channel()
+        .response
+        .write_frame(&[], proto_peer, efd_raw)
+        .unwrap(); // worker-done
 
     let mut scratch = Vec::new();
-    master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
-    master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .response
+        .read_frame(&mut scratch, master_peer, efd_raw)
+        .unwrap();
+    master_side
+        .channel()
+        .response
+        .read_frame(&mut scratch, master_peer, efd_raw)
+        .unwrap();
     assert!(scratch.is_empty());
 
     master_side.reclaim_if_due();
-    assert_eq!(master_side.channel().response.reclaimed_pos.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        master_side
+            .channel()
+            .response
+            .reclaimed_pos
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 /// The request ring fills on request *count*, not size - the positions wrap,
@@ -339,8 +408,16 @@ fn reclaim_request_returns_pages_that_small_requests_accumulated() {
     let request = vec![0x5Au8; 4 * 1024];
     let mut scratch = Vec::new();
     for _ in 0..200 {
-        master_side.channel().request.write_frame(&request, master_peer, efd_raw).unwrap();
-        worker_side.channel().request.read_frame(&mut scratch, worker_peer, efd_raw).unwrap();
+        master_side
+            .channel()
+            .request
+            .write_frame(&request, master_peer, efd_raw)
+            .unwrap();
+        worker_side
+            .channel()
+            .request
+            .read_frame(&mut scratch, worker_peer, efd_raw)
+            .unwrap();
     }
     let filled = blocks_kb();
     assert!(
@@ -350,12 +427,23 @@ fn reclaim_request_returns_pages_that_small_requests_accumulated() {
 
     master_side.reclaim_if_due();
     let after = blocks_kb();
-    assert!(after < filled / 2, "reclaim freed nothing: {filled} KB -> {after} KB");
+    assert!(
+        after < filled / 2,
+        "reclaim freed nothing: {filled} KB -> {after} KB"
+    );
 
     // The ring must still work: master writes into the punched range and the
     // worker reads it back unchanged.
-    master_side.channel().request.write_frame(b"after the punch", master_peer, efd_raw).unwrap();
-    worker_side.channel().request.read_frame(&mut scratch, worker_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .request
+        .write_frame(b"after the punch", master_peer, efd_raw)
+        .unwrap();
+    worker_side
+        .channel()
+        .request
+        .read_frame(&mut scratch, worker_peer, efd_raw)
+        .unwrap();
     assert_eq!(scratch, b"after the punch");
 }
 
@@ -373,32 +461,71 @@ fn reclaim_response_after_full_drain_then_reuses_the_space_correctly() {
     const N_FRAMES: usize = 10; // 80KB, comfortably over RECLAIM_THRESHOLD
 
     for _ in 0..N_FRAMES {
-        prototype_side.channel().response.write_frame(&FRAME, proto_peer, efd_raw).unwrap();
+        prototype_side
+            .channel()
+            .response
+            .write_frame(&FRAME, proto_peer, efd_raw)
+            .unwrap();
     }
-    prototype_side.channel().response.write_frame(&[], proto_peer, efd_raw).unwrap(); // worker-done
+    prototype_side
+        .channel()
+        .response
+        .write_frame(&[], proto_peer, efd_raw)
+        .unwrap(); // worker-done
 
     let mut scratch = Vec::new();
     for _ in 0..N_FRAMES {
-        master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+        master_side
+            .channel()
+            .response
+            .read_frame(&mut scratch, master_peer, efd_raw)
+            .unwrap();
         assert_eq!(scratch, FRAME);
     }
-    master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .response
+        .read_frame(&mut scratch, master_peer, efd_raw)
+        .unwrap();
     assert!(scratch.is_empty());
 
     master_side.reclaim_if_due();
-    assert!(master_side.channel().response.reclaimed_pos.load(Ordering::Relaxed) > 0);
+    assert!(
+        master_side
+            .channel()
+            .response
+            .reclaimed_pos
+            .load(Ordering::Relaxed)
+            > 0
+    );
 
     // Reuses the exact space the punch touched.
     const FRAME2: [u8; 8192] = [0xCD; 8192];
     for _ in 0..N_FRAMES {
-        prototype_side.channel().response.write_frame(&FRAME2, proto_peer, efd_raw).unwrap();
+        prototype_side
+            .channel()
+            .response
+            .write_frame(&FRAME2, proto_peer, efd_raw)
+            .unwrap();
     }
-    prototype_side.channel().response.write_frame(&[], proto_peer, efd_raw).unwrap();
+    prototype_side
+        .channel()
+        .response
+        .write_frame(&[], proto_peer, efd_raw)
+        .unwrap();
     for _ in 0..N_FRAMES {
-        master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+        master_side
+            .channel()
+            .response
+            .read_frame(&mut scratch, master_peer, efd_raw)
+            .unwrap();
         assert_eq!(scratch, FRAME2);
     }
-    master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .response
+        .read_frame(&mut scratch, master_peer, efd_raw)
+        .unwrap();
     assert!(scratch.is_empty());
 }
 
@@ -426,26 +553,59 @@ fn reclaim_after_multiple_wraps_frees_the_whole_ring_not_just_the_final_lap() {
     let mut scratch = Vec::new();
     for _ in 0..ROUNDS {
         for _ in 0..FRAMES_PER_ROUND {
-            prototype_side.channel().response.write_frame(&FRAME, proto_peer, efd_raw).unwrap();
+            prototype_side
+                .channel()
+                .response
+                .write_frame(&FRAME, proto_peer, efd_raw)
+                .unwrap();
         }
-        prototype_side.channel().response.write_frame(&[], proto_peer, efd_raw).unwrap(); // worker-done
+        prototype_side
+            .channel()
+            .response
+            .write_frame(&[], proto_peer, efd_raw)
+            .unwrap(); // worker-done
         for _ in 0..FRAMES_PER_ROUND {
-            master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+            master_side
+                .channel()
+                .response
+                .read_frame(&mut scratch, master_peer, efd_raw)
+                .unwrap();
             assert_eq!(scratch, FRAME);
         }
-        master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+        master_side
+            .channel()
+            .response
+            .read_frame(&mut scratch, master_peer, efd_raw)
+            .unwrap();
         assert!(scratch.is_empty());
         // Accumulate past a full lap before reclaiming at all.
     }
 
-    let read_pos = master_side.channel().response.read_pos.load(Ordering::Relaxed);
-    assert!(read_pos > RESPONSE_RING_CAPACITY as u64, "test setup must span more than one full lap");
+    let read_pos = master_side
+        .channel()
+        .response
+        .read_pos
+        .load(Ordering::Relaxed);
+    assert!(
+        read_pos > RESPONSE_RING_CAPACITY as u64,
+        "test setup must span more than one full lap"
+    );
 
     let after_writes = blocks();
-    assert!(after_writes > baseline, "the writes above should have actually allocated pages");
+    assert!(
+        after_writes > baseline,
+        "the writes above should have actually allocated pages"
+    );
 
     master_side.reclaim_if_due();
-    assert_eq!(master_side.channel().response.reclaimed_pos.load(Ordering::Relaxed), read_pos);
+    assert_eq!(
+        master_side
+            .channel()
+            .response
+            .reclaimed_pos
+            .load(Ordering::Relaxed),
+        read_pos
+    );
 
     let after_reclaim = blocks();
     let allocated_by_writes = after_writes - baseline;
@@ -479,21 +639,44 @@ fn reclaim_is_skipped_while_the_writer_still_has_data_in_flight() {
     const FRAME: [u8; 8192] = [0xAB; 8192];
     let mut scratch = Vec::new();
     for _ in 0..10 {
-        prototype_side.channel().response.write_frame(&FRAME, proto_peer, efd_raw).unwrap();
-        master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+        prototype_side
+            .channel()
+            .response
+            .write_frame(&FRAME, proto_peer, efd_raw)
+            .unwrap();
+        master_side
+            .channel()
+            .response
+            .read_frame(&mut scratch, master_peer, efd_raw)
+            .unwrap();
     }
 
     // One frame the reader has not taken: the ring is no longer empty.
-    prototype_side.channel().response.write_frame(&FRAME, proto_peer, efd_raw).unwrap();
+    prototype_side
+        .channel()
+        .response
+        .write_frame(&FRAME, proto_peer, efd_raw)
+        .unwrap();
     let before = blocks();
     master_side.reclaim_if_due();
-    assert_eq!(blocks(), before, "a ring with data in flight was punched anyway");
+    assert_eq!(
+        blocks(),
+        before,
+        "a ring with data in flight was punched anyway"
+    );
 
     // Draining it makes the same call proceed, so the skip was the check and
     // not some unrelated reason to do nothing.
-    master_side.channel().response.read_frame(&mut scratch, master_peer, efd_raw).unwrap();
+    master_side
+        .channel()
+        .response
+        .read_frame(&mut scratch, master_peer, efd_raw)
+        .unwrap();
     master_side.reclaim_if_due();
-    assert!(blocks() < before, "reclaim did not resume once the ring drained");
+    assert!(
+        blocks() < before,
+        "reclaim did not resume once the ring drained"
+    );
 }
 
 // --- Master-side async wait path (`*_async`, eventfd-backed) ---
@@ -505,14 +688,18 @@ async fn read_frame_async_returns_immediately_when_data_already_present() {
     let ring: &Ring<64> = make_ring();
     let peer = make_peer_death();
     let write_efd = make_notify_efd();
-    ring.write_frame(b"already here", peer, write_efd.as_raw_fd()).unwrap();
+    ring.write_frame(b"already here", peer, write_efd.as_raw_fd())
+        .unwrap();
 
     let read_efd = AsyncFd::new(make_notify_efd()).unwrap();
     let mut scratch = Vec::new();
-    tokio::time::timeout(Duration::from_secs(2), ring.read_frame_async(&mut scratch, peer, &read_efd))
-        .await
-        .expect("should not need to wait")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        ring.read_frame_async(&mut scratch, peer, &read_efd),
+    )
+    .await
+    .expect("should not need to wait")
+    .unwrap();
     assert_eq!(scratch, b"already here");
 }
 
@@ -525,7 +712,9 @@ async fn write_frame_async_then_blocking_read_frame_roundtrip() {
     // Unused here; just needs to be a real fd.
     let data_efd = make_notify_efd();
 
-    ring.write_frame_async(b"hello async", peer, &space_efd).await.unwrap();
+    ring.write_frame_async(b"hello async", peer, &space_efd)
+        .await
+        .unwrap();
 
     let data_efd_raw = data_efd.as_raw_fd();
     let handle = std::thread::spawn(move || {
@@ -533,7 +722,9 @@ async fn write_frame_async_then_blocking_read_frame_roundtrip() {
         ring.read_frame(&mut scratch, peer, data_efd_raw).unwrap();
         scratch
     });
-    let scratch = tokio::task::spawn_blocking(move || handle.join().unwrap()).await.unwrap();
+    let scratch = tokio::task::spawn_blocking(move || handle.join().unwrap())
+        .await
+        .unwrap();
     assert_eq!(scratch, b"hello async");
 }
 
@@ -551,17 +742,23 @@ async fn blocking_write_frame_wakes_a_parked_read_frame_async() {
 
     let writer = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(150));
-        ring.write_frame(b"woke you up", peer, data_efd_raw).unwrap();
+        ring.write_frame(b"woke you up", peer, data_efd_raw)
+            .unwrap();
     });
 
     let mut scratch = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), ring.read_frame_async(&mut scratch, peer, &data_efd))
-        .await
-        .expect("blocking writer's eventfd_write should have woken this before the timeout")
-        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ring.read_frame_async(&mut scratch, peer, &data_efd),
+    )
+    .await
+    .expect("blocking writer's eventfd_write should have woken this before the timeout")
+    .unwrap();
     assert_eq!(scratch, b"woke you up");
 
-    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
     drop(space_efd);
 }
 
@@ -582,12 +779,17 @@ async fn peer_death_wakes_a_parked_wait_for_data_async() {
     });
 
     let mut scratch = Vec::new();
-    let result = tokio::time::timeout(Duration::from_secs(5), ring.read_frame_async(&mut scratch, peer, &data_efd))
-        .await
-        .expect("peer-death eventfd_notify should have woken this before the timeout");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        ring.read_frame_async(&mut scratch, peer, &data_efd),
+    )
+    .await
+    .expect("peer-death eventfd_notify should have woken this before the timeout");
     assert!(matches!(result, Err(RingError::PeerGone)));
 
-    tokio::task::spawn_blocking(move || killer.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || killer.join().unwrap())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -603,20 +805,26 @@ async fn worker_blocking_write_and_master_async_read_survive_real_contention() {
 
     let writer = std::thread::spawn(move || {
         for i in 0..N as u32 {
-            ring.write_frame(&i.to_le_bytes(), peer, data_efd_raw).unwrap();
+            ring.write_frame(&i.to_le_bytes(), peer, data_efd_raw)
+                .unwrap();
         }
     });
 
     let mut scratch = Vec::new();
     for i in 0..N as u32 {
-        tokio::time::timeout(Duration::from_secs(10), ring.read_frame_async(&mut scratch, peer, &data_efd))
-            .await
-            .expect("should not hang - see this test's own doc comment")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            ring.read_frame_async(&mut scratch, peer, &data_efd),
+        )
+        .await
+        .expect("should not hang - see this test's own doc comment")
+        .unwrap();
         assert_eq!(scratch.as_slice(), &i.to_le_bytes());
     }
 
-    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -638,13 +846,18 @@ async fn master_async_write_and_worker_blocking_read_survive_real_contention() {
     });
 
     for i in 0..N as u32 {
-        tokio::time::timeout(Duration::from_secs(10), ring.write_frame_async(&i.to_le_bytes(), peer, &space_efd))
-            .await
-            .expect("should not hang - see the sibling test's own doc comment")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            ring.write_frame_async(&i.to_le_bytes(), peer, &space_efd),
+        )
+        .await
+        .expect("should not hang - see the sibling test's own doc comment")
+        .unwrap();
     }
 
-    tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || reader.join().unwrap())
+        .await
+        .unwrap();
 }
 
 /// `MappedChannel`'s `Send` and `Sync` are hand-written. Every other
@@ -655,8 +868,8 @@ async fn master_async_write_and_worker_blocking_read_survive_real_contention() {
 /// at the same time covers `Sync`.
 #[tokio::test]
 async fn a_mapped_channel_survives_being_shared_across_threads() {
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     const N: usize = 2_000;
 
@@ -671,7 +884,10 @@ async fn a_mapped_channel_survives_being_shared_across_threads() {
     let writer = std::thread::spawn(move || {
         let channel = worker_side.channel();
         for i in 0..N as u32 {
-            channel.response.write_frame(&i.to_le_bytes(), &channel.peer_death, data_efd_raw).unwrap();
+            channel
+                .response
+                .write_frame(&i.to_le_bytes(), &channel.peer_death, data_efd_raw)
+                .unwrap();
         }
     });
 
@@ -694,34 +910,53 @@ async fn a_mapped_channel_survives_being_shared_across_threads() {
         let channel = master_side.channel();
         tokio::time::timeout(
             Duration::from_secs(10),
-            channel.response.read_frame_async(&mut scratch, &channel.peer_death, &data_efd),
+            channel
+                .response
+                .read_frame_async(&mut scratch, &channel.peer_death, &data_efd),
         )
         .await
         .expect("should not hang - the real pairing, see this module's own note")
         .unwrap();
-        assert_eq!(scratch.as_slice(), &i.to_le_bytes(), "frame {i} came back wrong");
+        assert_eq!(
+            scratch.as_slice(),
+            &i.to_le_bytes(),
+            "frame {i} came back wrong"
+        );
     }
-    tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+    tokio::task::spawn_blocking(move || writer.join().unwrap())
+        .await
+        .unwrap();
 
     stop.store(true, Ordering::Relaxed);
     let seen = observer.join().unwrap();
-    assert!(seen > 0, "the observer never saw the mapping advance - it was not really sharing it");
+    assert!(
+        seen > 0,
+        "the observer never saw the mapping advance - it was not really sharing it"
+    );
 }
 
 // --- `NotifyEfds::try_clone` (fd-lifetime independence) ---
 
 #[test]
 fn try_clone_gives_a_different_fd_number_for_the_same_underlying_eventfd() {
-    let notify = NotifyEfds { req_space: make_notify_efd(), resp_data: make_notify_efd() };
+    let notify = NotifyEfds {
+        req_space: make_notify_efd(),
+        resp_data: make_notify_efd(),
+    };
     let cloned = notify.try_clone().unwrap();
-
 
     assert_ne!(notify.req_space.as_raw_fd(), cloned.req_space.as_raw_fd());
 
     // Same underlying eventfd.
     eventfd_notify(cloned.req_space.as_raw_fd());
     let mut buf = [0u8; 8];
-    let n = unsafe { libc::read(notify.req_space.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, 8) };
+    let n = unsafe {
+        libc::read(
+            notify.req_space.as_raw_fd(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            8,
+        )
+    };
     assert_eq!(n, 8);
     assert_eq!(u64::from_ne_bytes(buf), 1);
 }
@@ -730,7 +965,10 @@ fn try_clone_gives_a_different_fd_number_for_the_same_underlying_eventfd() {
 fn try_clone_survives_the_original_being_dropped() {
     // Closing the original must neither invalidate the clone nor let the
     // reused fd number alias it.
-    let notify = NotifyEfds { req_space: make_notify_efd(), resp_data: make_notify_efd() };
+    let notify = NotifyEfds {
+        req_space: make_notify_efd(),
+        resp_data: make_notify_efd(),
+    };
     let cloned = notify.try_clone().unwrap();
     let cloned_raw = cloned.req_space.as_raw_fd();
 
@@ -755,16 +993,22 @@ fn declare_waiting_retracts_the_claim_unless_the_caller_will_actually_park() {
     let peer = make_peer_death();
     let state = AtomicU32::new(EMPTY);
 
-
     let park = Ring::<64>::declare_waiting(&state, peer, || true).unwrap();
     assert!(!park, "no park is needed once the condition holds");
-    assert_eq!(state.load(Ordering::SeqCst), EMPTY, "claim must be retracted, not left set");
+    assert_eq!(
+        state.load(Ordering::SeqCst),
+        EMPTY,
+        "claim must be retracted, not left set"
+    );
 
     // The claim must stay published for `take_waiter` to see.
     let park = Ring::<64>::declare_waiting(&state, peer, || false).unwrap();
     assert!(park);
-    assert_eq!(state.load(Ordering::SeqCst), WAITING, "the claim is what makes the notify fire at all");
-
+    assert_eq!(
+        state.load(Ordering::SeqCst),
+        WAITING,
+        "the claim is what makes the notify fire at all"
+    );
 
     peer.mark_dead();
     let err = Ring::<64>::declare_waiting(&state, peer, || false).unwrap_err();
@@ -788,11 +1032,17 @@ fn mark_peer_dead_stamps_over_a_published_claim_so_futex_wait_cannot_sleep() {
 
     // The state a waiter leaves behind on the brink of parking.
     channel.request.data_state.store(WAITING, Ordering::SeqCst);
-    channel.response.space_state.store(WAITING, Ordering::SeqCst);
+    channel
+        .response
+        .space_state
+        .store(WAITING, Ordering::SeqCst);
 
     channel.mark_peer_dead();
 
-    assert!(channel.peer_death.is_dead(), "peer_death stays the authority");
+    assert!(
+        channel.peer_death.is_dead(),
+        "peer_death stays the authority"
+    );
     for (name, word) in [
         ("request.data_state", &channel.request.data_state),
         ("request.space_state", &channel.request.space_state),
@@ -817,9 +1067,16 @@ fn a_waiter_bounced_by_the_dead_stamp_finds_peer_death_already_set() {
     channel.mark_peer_dead();
 
     // Stands in for the retry loop after an EAGAIN.
-    let err = Ring::<REQUEST_RING_CAPACITY>::declare_waiting(&channel.request.data_state, &channel.peer_death, || false)
-        .unwrap_err();
-    assert!(matches!(err, RingError::PeerGone), "the retry must exit, not re-park");
+    let err = Ring::<REQUEST_RING_CAPACITY>::declare_waiting(
+        &channel.request.data_state,
+        &channel.peer_death,
+        || false,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, RingError::PeerGone),
+        "the retry must exit, not re-park"
+    );
 }
 
 /// `take_waiter` may clobber `DEAD` back to `EMPTY`; this pins that it stays
@@ -835,8 +1092,14 @@ fn a_notify_landing_after_peer_death_does_not_resurrect_the_ring() {
 
     let mut scratch = Vec::new();
     let efd = make_notify_efd();
-    let err = channel.request.read_frame(&mut scratch, &channel.peer_death, efd.as_raw_fd()).unwrap_err();
-    assert!(matches!(err, RingError::PeerGone), "peer_death must still be the authority after the word was cleared");
+    let err = channel
+        .request
+        .read_frame(&mut scratch, &channel.peer_death, efd.as_raw_fd())
+        .unwrap_err();
+    assert!(
+        matches!(err, RingError::PeerGone),
+        "peer_death must still be the authority after the word was cleared"
+    );
 }
 
 /// A tiny ring against tiny frames, so nearly every frame round-trips
@@ -850,7 +1113,6 @@ fn a_notify_landing_after_peer_death_does_not_resurrect_the_ring() {
 #[tokio::test]
 async fn tight_park_wake_handoff_never_loses_a_wakeup() {
     const N: u32 = 20_000;
-
 
     {
         let ring: &'static Ring<16> = make_ring();
@@ -867,14 +1129,18 @@ async fn tight_park_wake_handoff_never_loses_a_wakeup() {
             }
         });
         for i in 0..N {
-            tokio::time::timeout(Duration::from_secs(10), ring.write_frame_async(&i.to_le_bytes(), peer, &space_efd))
-                .await
-                .expect("hung waiting for space - a wakeup was lost")
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                ring.write_frame_async(&i.to_le_bytes(), peer, &space_efd),
+            )
+            .await
+            .expect("hung waiting for space - a wakeup was lost")
+            .unwrap();
         }
-        tokio::task::spawn_blocking(move || reader.join().unwrap()).await.unwrap();
+        tokio::task::spawn_blocking(move || reader.join().unwrap())
+            .await
+            .unwrap();
     }
-
 
     {
         let ring: &'static Ring<16> = make_ring();
@@ -885,17 +1151,23 @@ async fn tight_park_wake_handoff_never_loses_a_wakeup() {
 
         let writer = std::thread::spawn(move || {
             for i in 0..N {
-                ring.write_frame(&i.to_le_bytes(), peer, data_efd_raw).unwrap();
+                ring.write_frame(&i.to_le_bytes(), peer, data_efd_raw)
+                    .unwrap();
             }
         });
         let mut scratch = Vec::new();
         for i in 0..N {
-            tokio::time::timeout(Duration::from_secs(10), ring.read_frame_async(&mut scratch, peer, &data_efd))
-                .await
-                .expect("hung waiting for data - a wakeup was lost")
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                ring.read_frame_async(&mut scratch, peer, &data_efd),
+            )
+            .await
+            .expect("hung waiting for data - a wakeup was lost")
+            .unwrap();
             assert_eq!(scratch.as_slice(), &i.to_le_bytes());
         }
-        tokio::task::spawn_blocking(move || writer.join().unwrap()).await.unwrap();
+        tokio::task::spawn_blocking(move || writer.join().unwrap())
+            .await
+            .unwrap();
     }
 }

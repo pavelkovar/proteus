@@ -3,7 +3,7 @@
 
 use crate::config::PhpOptions;
 use crate::ipc::{CONFIG_FD, CONTROL_FD};
-use crate::prototype::{ProtoConfig, INTERNAL_PROTOTYPE_ARG};
+use crate::prototype::{INTERNAL_PROTOTYPE_ARG, ProtoConfig};
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{FromRawFd, IntoRawFd};
@@ -15,7 +15,10 @@ use tokio_seqpacket::UnixSeqpacket;
 /// clobber it. The caller closes the result after the `dup2`s consuming it.
 ///
 /// Must stay async-signal-safe: this runs between `fork` and `exec`.
-unsafe fn relocate_above(fd: std::os::fd::RawFd, floor: std::os::fd::RawFd) -> std::io::Result<std::os::fd::RawFd> {
+unsafe fn relocate_above(
+    fd: std::os::fd::RawFd,
+    floor: std::os::fd::RawFd,
+) -> std::io::Result<std::os::fd::RawFd> {
     let moved = unsafe { libc::fcntl(fd, libc::F_DUPFD, floor + 1) };
     if moved < 0 {
         return Err(std::io::Error::last_os_error());
@@ -53,7 +56,10 @@ pub fn spawn(
         php_mod_path: php_mod_path.to_string(),
         max_requests,
         idle_timeout_seconds,
-        options: PhpOptions { admin: options.admin.clone(), user: options.user.clone() },
+        options: PhpOptions {
+            admin: options.admin.clone(),
+            user: options.user.clone(),
+        },
         environment: environment.clone(),
     };
     let config_json = serde_json::to_vec(&proto_config).unwrap_or_else(|_| b"{}".to_vec());
@@ -113,7 +119,6 @@ pub fn spawn(
     let write_result = {
         let mut w = unsafe { std::fs::File::from_raw_fd(config_write_fd) };
         w.write_all(&config_json)
-
     };
     if let Err(e) = write_result {
         // The child is already running and would otherwise block forever on

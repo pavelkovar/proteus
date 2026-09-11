@@ -8,10 +8,10 @@ use crate::ipc::data::{self, PhpRequest, ResponseFrame};
 use crate::ipc::shm;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use tokio::io::unix::AsyncFd;
-use tokio::io::AsyncReadExt;
-use tokio::net::UnixStream as TokioUnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::AsyncReadExt;
+use tokio::io::unix::AsyncFd;
+use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::mpsc;
 
 /// Bounds one run of `Headers` frames. The run length is worker-controlled,
@@ -53,7 +53,11 @@ impl Drop for WorkerChannel {
 impl WorkerChannel {
     /// Spawns the IO task and liveness watcher, both torn down on drop.
     pub fn new(fds: WorkerReadyFds, pid: u32) -> std::io::Result<Self> {
-        let WorkerReadyFds { channel: channel_fd, liveness: liveness_fd, notify } = fds;
+        let WorkerReadyFds {
+            channel: channel_fd,
+            liveness: liveness_fd,
+            notify,
+        } = fds;
         let mapped = Arc::new(shm::map_existing_channel(channel_fd)?);
 
         // Its own dup'd fds, so it can never notify through a number the IO
@@ -63,24 +67,41 @@ impl WorkerChannel {
         let resp_data_efd = AsyncFd::new(notify.resp_data)?;
 
         let worker_gone = Arc::new(AtomicBool::new(false));
-        spawn_liveness_watcher(liveness_fd, Arc::clone(&mapped), Arc::clone(&worker_gone), watcher_notify)?;
+        spawn_liveness_watcher(
+            liveness_fd,
+            Arc::clone(&mapped),
+            Arc::clone(&worker_gone),
+            watcher_notify,
+        )?;
 
         let (request_tx, request_rx) = mpsc::unbounded_channel::<Arc<PhpRequest<'static>>>();
         let (response_tx, response_rx) = mpsc::channel(8);
         {
             let mapped = Arc::clone(&mapped);
-            tokio::spawn(io_task(mapped, pid, request_rx, response_tx, req_space_efd, resp_data_efd));
+            tokio::spawn(io_task(
+                mapped,
+                pid,
+                request_rx,
+                response_tx,
+                req_space_efd,
+                resp_data_efd,
+            ));
         }
 
-        Ok(WorkerChannel { request_tx, response_rx, worker_gone, mapped })
+        Ok(WorkerChannel {
+            request_tx,
+            response_rx,
+            worker_gone,
+            mapped,
+        })
     }
 
     /// Never blocks, so it is safe to call from async code without a timeout
     /// of its own. The encode happens in `io_task`.
     pub fn write_request(&self, req: Arc<PhpRequest<'static>>) -> std::io::Result<()> {
-        self.request_tx
-            .send(req)
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker IO task has exited"))
+        self.request_tx.send(req).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker IO task has exited")
+        })
     }
 
     /// The next frame. Callers loop until `End`.
@@ -92,7 +113,10 @@ impl WorkerChannel {
                 "expected a ResponseFrame, got the trailing worker-done marker instead",
             )),
             Some(Err(e)) => Err(e),
-            None => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker IO task has exited")),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "worker IO task has exited",
+            )),
         }
     }
 
@@ -106,7 +130,10 @@ impl WorkerChannel {
                 "expected the worker-done marker, got a framed ResponseFrame instead",
             )),
             Some(Err(e)) => Err(e),
-            None => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker IO task has exited")),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "worker IO task has exited",
+            )),
         }
     }
 
@@ -115,7 +142,6 @@ impl WorkerChannel {
     pub fn worker_has_exited(&self) -> bool {
         self.worker_gone.load(Ordering::Relaxed)
     }
-
 }
 
 /// Ends once `request_tx` drops or the ring reports the peer gone, both
@@ -134,7 +160,9 @@ async fn io_task(
     // neither encodes nor decodes with an allocation.
     let mut encode_scratch = Vec::new();
     'commands: loop {
-        let Some(req) = request_rx.recv().await else { return };
+        let Some(req) = request_rx.recv().await else {
+            return;
+        };
 
         let encoded: &[u8] = match data::encode_request(&mut encode_scratch, &req) {
             Ok(bytes) => bytes,
@@ -143,7 +171,13 @@ async fn io_task(
                 return;
             }
         };
-        if let Err(e) = data::write_request_to_ring(&channel.request, &channel.peer_death, encoded, &req_space_efd).await
+        if let Err(e) = data::write_request_to_ring(
+            &channel.request,
+            &channel.peer_death,
+            encoded,
+            &req_space_efd,
+        )
+        .await
         {
             let _ = response_tx.send(Err(e)).await;
             return;
@@ -153,15 +187,21 @@ async fn io_task(
         let mut pending_headers: Option<(u16, data::HeaderBlob)> = None;
         let mut pending_headers_bytes: usize = 0;
         loop {
-            match data::read_response_frame_from_ring(&mapped, &mut scratch, &resp_data_efd).await
-            {
-                Ok(Some(ResponseFrame::Headers { status, headers, more })) => {
+            match data::read_response_frame_from_ring(&mapped, &mut scratch, &resp_data_efd).await {
+                Ok(Some(ResponseFrame::Headers {
+                    status,
+                    headers,
+                    more,
+                })) => {
                     pending_headers_bytes += scratch.len();
                     if pending_headers_bytes > MAX_PENDING_HEADERS_BYTES {
                         // Abandoning the ring is not enough: the worker would
                         // park forever in its untimed wait_for_space, whose
                         // only other escape is real process death.
-                        pool_manager::sigkill(pid, "worker sent an oversized run of Headers frames");
+                        pool_manager::sigkill(
+                            pid,
+                            "worker sent an oversized run of Headers frames",
+                        );
                         let _ = response_tx
                             .send(Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -179,8 +219,16 @@ async fn io_task(
                     // whose header() calls and first output are not
                     // back-to-back from paying a round-trip of TTFB.
                     if !more {
-                        let (status, headers) = pending_headers.take().expect("just inserted above");
-                        if response_tx.send(Ok(Some(ResponseFrame::Headers { status, headers, more: false }))).await.is_err()
+                        let (status, headers) =
+                            pending_headers.take().expect("just inserted above");
+                        if response_tx
+                            .send(Ok(Some(ResponseFrame::Headers {
+                                status,
+                                headers,
+                                more: false,
+                            })))
+                            .await
+                            .is_err()
                         {
                             return;
                         }
@@ -191,7 +239,14 @@ async fn io_task(
                     // straight past End; without the flush its collected
                     // headers would be silently dropped.
                     if let Some((status, headers)) = pending_headers.take() {
-                        if response_tx.send(Ok(Some(ResponseFrame::Headers { status, headers, more: false }))).await.is_err()
+                        if response_tx
+                            .send(Ok(Some(ResponseFrame::Headers {
+                                status,
+                                headers,
+                                more: false,
+                            })))
+                            .await
+                            .is_err()
                         {
                             return;
                         }
@@ -203,7 +258,14 @@ async fn io_task(
                 }
                 Ok(Some(frame)) => {
                     if let Some((status, headers)) = pending_headers.take() {
-                        if response_tx.send(Ok(Some(ResponseFrame::Headers { status, headers, more: false }))).await.is_err()
+                        if response_tx
+                            .send(Ok(Some(ResponseFrame::Headers {
+                                status,
+                                headers,
+                                more: false,
+                            })))
+                            .await
+                            .is_err()
                         {
                             return;
                         }

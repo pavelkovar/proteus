@@ -4,13 +4,13 @@
 //! A child module rather than a sibling, so these `impl PoolManager` methods
 //! still reach private fields.
 
-use super::{sigkill, PooledWorker, PoolManager, TempBodyFile};
+use super::{PoolManager, PooledWorker, TempBodyFile, sigkill};
 use crate::ipc::data::{HeaderBlob, PhpRequest, ResponseFrame};
 use bytes::Bytes;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
-use tokio::sync::{mpsc, OwnedSemaphorePermit};
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Headers known; the body may still be arriving.
@@ -58,28 +58,46 @@ impl PoolManager {
         let pid = worker.pid;
         // No lock and no lookup: the counters hang off the `Arc` already held.
         worker.meta.mark_busy(Instant::now(), self.started_at);
-        match self.start_streaming(worker, req, permit, body_cleanup).await {
+        match self
+            .start_streaming(worker, req, permit, body_cleanup)
+            .await
+        {
             Ok(started) => Ok(started),
-            Err(StartAttempt::TimedOut(permit, _body_cleanup)) => Err(DispatchAttemptError::TimedOut(permit)),
+            Err(StartAttempt::TimedOut(permit, _body_cleanup)) => {
+                Err(DispatchAttemptError::TimedOut(permit))
+            }
             Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)) => {
                 self.remove_worker_meta(pid);
-                Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup))
+                Err(DispatchAttemptError::WorkerUnavailable(
+                    e,
+                    permit,
+                    body_cleanup,
+                ))
             }
         }
     }
 
     /// The retry forces a fresh spawn rather than another `get_worker()`,
     /// which could pop a second stale worker from the same recycle burst.
-    pub async fn dispatch(self: &Arc<Self>, req: &Arc<PhpRequest<'static>>, body_cleanup: Option<TempBodyFile>) -> DispatchOutcome {
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        req: &Arc<PhpRequest<'static>>,
+        body_cleanup: Option<TempBodyFile>,
+    ) -> DispatchOutcome {
         self.requests_total.fetch_add(1, Relaxed);
 
         // Rejects immediately rather than waiting out queue_timeout.
-        let Some(queue_guard) = super::QueueDepthGuard::try_new(&self.queue_depth, self.queue_max_depth) else {
+        let Some(queue_guard) =
+            super::QueueDepthGuard::try_new(&self.queue_depth, self.queue_max_depth)
+        else {
             self.queue_timeouts.fetch_add(1, Relaxed);
             return DispatchOutcome::QueueTimeout;
         };
-        let acquire_result =
-            tokio::time::timeout(self.queue_timeout, Arc::clone(&self.semaphore).acquire_owned()).await;
+        let acquire_result = tokio::time::timeout(
+            self.queue_timeout,
+            Arc::clone(&self.semaphore).acquire_owned(),
+        )
+        .await;
         drop(queue_guard);
         let permit = match acquire_result {
             Ok(Ok(permit)) => permit,
@@ -92,10 +110,18 @@ impl PoolManager {
 
         let worker = match self.get_worker().await {
             Ok(w) => w,
-            Err(e) => return self.give_up(&format!("failed to obtain a worker ({e}) - prototype may be dead"), permit),
+            Err(e) => {
+                return self.give_up(
+                    &format!("failed to obtain a worker ({e}) - prototype may be dead"),
+                    permit,
+                );
+            }
         };
         let pid = worker.pid;
-        let (permit, body_cleanup) = match self.try_dispatch_to(worker, req, permit, body_cleanup).await {
+        let (permit, body_cleanup) = match self
+            .try_dispatch_to(worker, req, permit, body_cleanup)
+            .await
+        {
             Ok(started) => return DispatchOutcome::Ok(started),
             Err(DispatchAttemptError::TimedOut(permit)) => return self.timed_out(pid, permit),
             Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
@@ -108,22 +134,36 @@ impl PoolManager {
                 // Probably self-retired is not certainly: otherwise this
                 // worker is now untracked, and `mark_peer_dead` cannot reach
                 // one that is wedged rather than parked.
-                sigkill(pid, "pooled worker failed its dispatch, replaced by a fresh spawn");
+                sigkill(
+                    pid,
+                    "pooled worker failed its dispatch, replaced by a fresh spawn",
+                );
                 (permit, body_cleanup)
             }
         };
 
         let worker = match self.spawn_worker().await {
             Ok(w) => w,
-            Err(e) => return self.give_up(&format!("fresh worker spawn also failed ({e}), giving up on this request"), permit),
+            Err(e) => {
+                return self.give_up(
+                    &format!("fresh worker spawn also failed ({e}), giving up on this request"),
+                    permit,
+                );
+            }
         };
         let pid = worker.pid;
-        match self.try_dispatch_to(worker, req, permit, body_cleanup).await {
+        match self
+            .try_dispatch_to(worker, req, permit, body_cleanup)
+            .await
+        {
             Ok(started) => DispatchOutcome::Ok(started),
             Err(DispatchAttemptError::TimedOut(permit)) => self.timed_out(pid, permit),
             Err(DispatchAttemptError::WorkerUnavailable(e, permit, _body_cleanup)) => {
                 sigkill(pid, "freshly spawned worker failed its dispatch too");
-                self.give_up(&format!("freshly spawned worker pid={pid} STILL failed ({e}), giving up"), permit)
+                self.give_up(
+                    &format!("freshly spawned worker pid={pid} STILL failed ({e}), giving up"),
+                    permit,
+                )
             }
         }
     }
@@ -164,10 +204,15 @@ impl PoolManager {
         })
         .await;
         let (status, headers) = match first {
-            Ok(Ok(ResponseFrame::Headers { status, headers, .. })) => (status, headers),
+            Ok(Ok(ResponseFrame::Headers {
+                status, headers, ..
+            })) => (status, headers),
             Ok(Ok(_unexpected)) => {
                 return Err(StartAttempt::WorkerUnavailable(
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "expected a Headers frame first"),
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "expected a Headers frame first",
+                    ),
                     permit,
                     body_cleanup,
                 ));
@@ -193,10 +238,16 @@ impl PoolManager {
 
         let pool = Arc::clone(self);
         tokio::spawn(async move {
-            pool.drive_stream_to_completion(worker, permit, body_tx, body_cleanup).await;
+            pool.drive_stream_to_completion(worker, permit, body_tx, body_cleanup)
+                .await;
         });
 
-        Ok(StreamedResponse { status, headers, body: ReceiverStream::new(body_rx), worker_pid: pid })
+        Ok(StreamedResponse {
+            status,
+            headers,
+            body: ReceiverStream::new(body_rx),
+            worker_pid: pid,
+        })
     }
 
     /// Owns the worker and permit for the rest of the response, returning it
@@ -213,12 +264,22 @@ impl PoolManager {
     ) {
         let pid = worker.pid;
         let retiring = loop {
-            match tokio::time::timeout(self.request_timeout, worker.channel.read_response_frame()).await {
+            match tokio::time::timeout(self.request_timeout, worker.channel.read_response_frame())
+                .await
+            {
                 Ok(Ok(ResponseFrame::Body(chunk))) => {
-                    if body_tx.send(Ok(Bytes::from(chunk.into_owned()))).await.is_err() {
+                    if body_tx
+                        .send(Ok(Bytes::from(chunk.into_owned())))
+                        .await
+                        .is_err()
+                    {
                         // Client gone: the worker's state can no longer be
                         // trusted enough to pool it, but this is not its fault.
-                        tracing::debug!(r#type = "controller", pid, "body receiver dropped (client gone), killing worker");
+                        tracing::debug!(
+                            r#type = "controller",
+                            pid,
+                            "body receiver dropped (client gone), killing worker"
+                        );
                         self.kill_worker(pid, permit);
                         return;
                     }
@@ -226,21 +287,37 @@ impl PoolManager {
                 Ok(Ok(ResponseFrame::End { retiring })) => break retiring,
                 Ok(Ok(ResponseFrame::Headers { .. })) => {
                     let _ = body_tx
-                        .send(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "unexpected second Headers frame")))
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "unexpected second Headers frame",
+                        )))
                         .await;
-                    tracing::error!(r#type = "controller", pid, "worker sent a second Headers frame, protocol violation");
+                    tracing::error!(
+                        r#type = "controller",
+                        pid,
+                        "worker sent a second Headers frame, protocol violation"
+                    );
                     self.watchdog_kills.fetch_add(1, Relaxed);
                     self.kill_worker(pid, permit);
                     return;
                 }
                 Ok(Err(e)) => {
-                    let _ = body_tx.send(Err(std::io::Error::new(e.kind(), e.to_string()))).await;
-                    self.read_failed(pid, permit, &format!("response stream read failed ({e}), not returning it to the pool"));
+                    let _ = body_tx
+                        .send(Err(std::io::Error::new(e.kind(), e.to_string())))
+                        .await;
+                    self.read_failed(
+                        pid,
+                        permit,
+                        &format!("response stream read failed ({e}), not returning it to the pool"),
+                    );
                     return;
                 }
                 Err(_elapsed) => {
                     let _ = body_tx
-                        .send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "worker exceeded request_timeout mid-response")))
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "worker exceeded request_timeout mid-response",
+                        )))
                         .await;
                     tracing::warn!(
                         r#type = "controller",
@@ -259,7 +336,11 @@ impl PoolManager {
         if retiring {
             // The worker exits right after this, so there is no done marker
             // coming and nothing to return to the pool.
-            tracing::debug!(r#type = "controller", pid, "worker self-retired after limits.requests");
+            tracing::debug!(
+                r#type = "controller",
+                pid,
+                "worker self-retired after limits.requests"
+            );
             self.recycled_request_limit.fetch_add(1, Relaxed);
             self.remove_worker_meta(pid);
             drop(permit);
@@ -274,7 +355,13 @@ impl PoolManager {
                 drop(permit);
             }
             Ok(Err(e)) => {
-                self.read_failed(pid, permit, &format!("trailing worker-done read failed ({e}), not returning it to the pool"));
+                self.read_failed(
+                    pid,
+                    permit,
+                    &format!(
+                        "trailing worker-done read failed ({e}), not returning it to the pool"
+                    ),
+                );
             }
             Err(_elapsed) => {
                 tracing::warn!(

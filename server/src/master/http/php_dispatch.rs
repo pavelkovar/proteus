@@ -1,9 +1,9 @@
 //! Request-body collection (with disk spillover) and dispatch to a PHP
 //! worker.
 
+use super::AppState;
 use super::proxy::{resolve_https, resolve_server_name_port};
 use super::routing::{ActionBody, DispatchResult, RequestContext, ResolvedScript};
-use super::AppState;
 use crate::ipc::data::{HeaderBlob, PhpRequest, RequestBody};
 use crate::master::pool_manager::{DispatchOutcome, TempBodyFile};
 use http_body_util::{BodyExt, Limited};
@@ -56,14 +56,21 @@ static BODY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// pid plus a counter, so no randomness is needed to avoid collisions.
 fn temp_body_path() -> PathBuf {
     let n = BODY_FILE_COUNTER.fetch_add(1, Relaxed);
-    std::env::temp_dir().join(format!("{}-body-{}-{n}", crate::APP_NAME, std::process::id()))
+    std::env::temp_dir().join(format!(
+        "{}-body-{}-{n}",
+        crate::APP_NAME,
+        std::process::id()
+    ))
 }
 
 enum CollectedBody {
     Inline(Vec<u8>),
     /// Counted as bytes arrive rather than stat()ed later, CONTENT_LENGTH
     /// being needed before the file is ever opened.
-    Spilled { path: PathBuf, len: u64 },
+    Spilled {
+        path: PathBuf,
+        len: u64,
+    },
 }
 
 enum BodyCollectError {
@@ -183,7 +190,10 @@ async fn collect_body_streaming(
     }
 
     Ok(match spilled {
-        Some((_, path)) => CollectedBody::Spilled { path, len: total_len },
+        Some((_, path)) => CollectedBody::Spilled {
+            path,
+            len: total_len,
+        },
         None => CollectedBody::Inline(inline),
     })
 }
@@ -198,7 +208,11 @@ pub(crate) async fn build_php_request(
     ctx: RequestContext<'_>,
     max_body_size: usize,
 ) -> Result<(PhpRequest<'static>, Option<TempBodyFile>), DispatchResult> {
-    let RequestContext { client_ip, listen_addr, is_trusted_peer } = ctx;
+    let RequestContext {
+        client_ip,
+        listen_addr,
+        is_trusted_peer,
+    } = ctx;
 
     let method = method_cow(req.method());
     let uri = req
@@ -215,7 +229,11 @@ pub(crate) async fn build_php_request(
         .to_string();
     // One sized allocation for the whole set; the per-entry term covers the
     // two NUL terminators.
-    let header_bytes: usize = req.headers().iter().map(|(name, value)| name.as_str().len() + value.len() + 2).sum();
+    let header_bytes: usize = req
+        .headers()
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len() + 2)
+        .sum();
     let mut headers = HeaderBlob::with_capacity(header_bytes);
     for (name, value) in req.headers() {
         // A non-UTF-8 value cannot become a $_SERVER string.
@@ -225,20 +243,35 @@ pub(crate) async fn build_php_request(
     }
 
     // The same trusted-peer gate as X-Forwarded-For.
-    let (server_name, server_port) = resolve_server_name_port(req.headers(), is_trusted_peer, listen_addr);
+    let (server_name, server_port) =
+        resolve_server_name_port(req.headers(), is_trusted_peer, listen_addr);
     let server_protocol = Cow::Borrowed(version_str(req.version()));
     let https = resolve_https(req.headers(), is_trusted_peer);
 
-    let body_read_timeout =
-        (state.config.connection.body_read_timeout > 0).then(|| std::time::Duration::from_secs(state.config.connection.body_read_timeout));
-    let (body, body_cleanup) = match collect_body_streaming(req.into_body(), max_body_size, body_read_timeout).await {
+    let body_read_timeout = (state.config.connection.body_read_timeout > 0)
+        .then(|| std::time::Duration::from_secs(state.config.connection.body_read_timeout));
+    let (body, body_cleanup) = match collect_body_streaming(
+        req.into_body(),
+        max_body_size,
+        body_read_timeout,
+    )
+    .await
+    {
         Ok(CollectedBody::Inline(bytes)) => (RequestBody::Inline(Cow::Owned(bytes)), None),
         Ok(CollectedBody::Spilled { path, len }) => {
             // Master created the file as itself, so it must be handed over.
             // Skipped when the worker shares master's identity.
             let (uid, gid) = state.pool.worker_uid_gid();
-            if (uid, gid) != (nix::unistd::getuid().as_raw(), nix::unistd::getgid().as_raw())
-                && let Err(e) = nix::unistd::chown(&path, Some(nix::unistd::Uid::from_raw(uid)), Some(nix::unistd::Gid::from_raw(gid)))
+            if (uid, gid)
+                != (
+                    nix::unistd::getuid().as_raw(),
+                    nix::unistd::getgid().as_raw(),
+                )
+                && let Err(e) = nix::unistd::chown(
+                    &path,
+                    Some(nix::unistd::Uid::from_raw(uid)),
+                    Some(nix::unistd::Gid::from_raw(gid)),
+                )
             {
                 tracing::warn!(r#type = "controller", path = %path.display(), uid, gid, error = %e, "failed to chown spilled body file, failing the request");
                 let _cleanup = TempBodyFile::new(path);
@@ -253,7 +286,10 @@ pub(crate) async fn build_php_request(
                 ));
             }
             (
-                RequestBody::File { path: Cow::Owned(path.to_string_lossy().into_owned()), len },
+                RequestBody::File {
+                    path: Cow::Owned(path.to_string_lossy().into_owned()),
+                    len,
+                },
                 Some(TempBodyFile::new(path)),
             )
         }
@@ -314,7 +350,11 @@ pub(crate) async fn build_php_request(
     ))
 }
 
-pub(crate) async fn dispatch_php(state: &AppState, req: PhpRequest<'static>, body_cleanup: Option<TempBodyFile>) -> DispatchResult {
+pub(crate) async fn dispatch_php(
+    state: &AppState,
+    req: PhpRequest<'static>,
+    body_cleanup: Option<TempBodyFile>,
+) -> DispatchResult {
     // Shared rather than borrowed: it is encoded on another task, and a
     // retry re-sends it without re-encoding.
     let req = std::sync::Arc::new(req);
@@ -322,21 +362,40 @@ pub(crate) async fn dispatch_php(state: &AppState, req: PhpRequest<'static>, bod
         // Still arriving; passed through rather than buffered.
         DispatchOutcome::Ok(resp) => {
             let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK);
-            DispatchResult::new(ActionBody::PhpStream { status, headers: resp.headers, body: resp.body }, "php", resp.worker_pid)
+            DispatchResult::new(
+                ActionBody::PhpStream {
+                    status,
+                    headers: resp.headers,
+                    body: resp.body,
+                },
+                "php",
+                resp.worker_pid,
+            )
         }
-        DispatchOutcome::Timeout => {
-            php_error_response(StatusCode::GATEWAY_TIMEOUT, b"504 worker did not respond in time\n")
-        }
-        DispatchOutcome::QueueTimeout => {
-            php_error_response(StatusCode::SERVICE_UNAVAILABLE, b"503 no worker capacity available\n")
-        }
-        DispatchOutcome::Failed => {
-            php_error_response(StatusCode::INTERNAL_SERVER_ERROR, b"500 worker dispatch failed\n")
-        }
+        DispatchOutcome::Timeout => php_error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            b"504 worker did not respond in time\n",
+        ),
+        DispatchOutcome::QueueTimeout => php_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            b"503 no worker capacity available\n",
+        ),
+        DispatchOutcome::Failed => php_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"500 worker dispatch failed\n",
+        ),
     }
 }
 
 /// Shared shape for the failure arms.
 fn php_error_response(status: StatusCode, body: &'static [u8]) -> DispatchResult {
-    DispatchResult::new(ActionBody::Buffered { status, body: body.to_vec(), headers: HeaderBlob::default() }, "php", 0)
+    DispatchResult::new(
+        ActionBody::Buffered {
+            status,
+            body: body.to_vec(),
+            headers: HeaderBlob::default(),
+        },
+        "php",
+        0,
+    )
 }

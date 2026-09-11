@@ -52,22 +52,29 @@ fn main() {
     let config_path = args
         .get(1)
         .unwrap_or_else(|| panic!("usage: {APP_NAME} <config.json>"));
-    let config_text =
-        std::fs::read_to_string(config_path).unwrap_or_else(|e| panic!("reading {config_path}: {e}"));
-    let config: Config = config::parse(&config_text).unwrap_or_else(|e| panic!("{config_path}: {e}"));
+    let config_text = std::fs::read_to_string(config_path)
+        .unwrap_or_else(|e| panic!("reading {config_path}: {e}"));
+    let config: Config =
+        config::parse(&config_text).unwrap_or_else(|e| panic!("{config_path}: {e}"));
 
     let validation_errors = config::validate(&config);
     if !validation_errors.is_empty() {
         for e in &validation_errors {
             eprintln!("[master] invalid config: {e}");
         }
-        panic!("invalid config ({} error(s)), see above", validation_errors.len());
+        panic!(
+            "invalid config ({} error(s)), see above",
+            validation_errors.len()
+        );
     }
 
     logging::init(true);
     enable_child_subreaper();
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("failed to build tokio runtime");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
     rt.block_on(run_master(config));
 }
 
@@ -81,11 +88,15 @@ async fn run_master(config: Config) {
 
     // Scale-down is the worker's own decision; master only holds the floor,
     // since a worker cannot know whether the pool can spare it.
-    tokio::spawn(
-        Arc::clone(&pool).maintain_pool_loop(config.php.processes.spare, std::time::Duration::from_secs(1)),
-    );
+    tokio::spawn(Arc::clone(&pool).maintain_pool_loop(
+        config.php.processes.spare,
+        std::time::Duration::from_secs(1),
+    ));
 
-    let fs_cache = FsCache::new(config.fs_cache.max_entries, std::time::Duration::from_millis(config.fs_cache.ttl_ms));
+    let fs_cache = FsCache::new(
+        config.fs_cache.max_entries,
+        std::time::Duration::from_millis(config.fs_cache.ttl_ms),
+    );
     let state = Arc::new(AppState::new(pool, config, fs_cache));
     master::http::serve(state).await;
 }

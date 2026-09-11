@@ -32,7 +32,11 @@ pub(crate) struct FsCache {
 
 impl FsCache {
     pub(crate) fn new(max_entries: usize, ttl: Duration) -> Self {
-        FsCache { entries: BoundedMap::new(), max_entries, ttl }
+        FsCache {
+            entries: BoundedMap::new(),
+            max_entries,
+            ttl,
+        }
     }
 
     /// `None` means uncached or expired: go and check for real. A zero `ttl`
@@ -52,10 +56,21 @@ impl FsCache {
             return;
         }
         let ttl = self.ttl;
-        if !self.entries.has_room_for(&path, self.max_entries, |e: &Entry| e.cached_at.elapsed() >= ttl) {
+        if !self
+            .entries
+            .has_room_for(&path, self.max_entries, |e: &Entry| {
+                e.cached_at.elapsed() >= ttl
+            })
+        {
             return;
         }
-        self.entries.insert(path, Entry { kind, cached_at: Instant::now() });
+        self.entries.insert(
+            path,
+            Entry {
+                kind,
+                cached_at: Instant::now(),
+            },
+        );
     }
 }
 

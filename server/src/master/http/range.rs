@@ -32,7 +32,11 @@ pub(crate) fn parse_range(range: &str, len: u64) -> Option<Result<(u64, u64), ()
         return Some(Ok((len - suffix_len, len - 1)));
     }
     let start: u64 = start_s.parse().ok()?;
-    let end: Option<u64> = if end_s.is_empty() { None } else { Some(end_s.parse().ok()?) };
+    let end: Option<u64> = if end_s.is_empty() {
+        None
+    } else {
+        Some(end_s.parse().ok()?)
+    };
     if len == 0 || start >= len {
         return Some(Err(()));
     }
@@ -57,7 +61,10 @@ const MAX_SYNC_CHUNKS: u8 = 8;
 /// already in page cache, so a hit can be served without a trip through the
 /// blocking pool.
 fn pread_nowait(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    let iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
     // The offset is split because the kernel rebuilds it as
     // `(pos_h << 32) | pos_l`, and widened because every argument but the
     // flags is an `unsigned long` there.
@@ -83,7 +90,10 @@ fn pread_nowait(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::R
 /// being servable without waiting. XFS also answers `EAGAIN` when it cannot
 /// take the inode lock, so `EAGAIN` says nothing about page cache either.
 fn nowait_unsupported(e: &std::io::Error) -> bool {
-    matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL))
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOSYS) | Some(libc::EINVAL)
+    )
 }
 
 /// Either the fd is ours to read from or a blocking read has it, never both
@@ -110,7 +120,12 @@ pub(crate) struct FileBody {
 
 impl FileBody {
     pub(crate) fn new(file: std::fs::File, offset: u64, len: u64) -> Self {
-        FileBody { state: ReadState::Idle(file), offset, remaining: len, sync_chunks: 0 }
+        FileBody {
+            state: ReadState::Idle(file),
+            offset,
+            remaining: len,
+            sync_chunks: 0,
+        }
     }
 
     /// Nothing left to read before `remaining` runs out means the file shrank
@@ -119,7 +134,10 @@ impl FileBody {
     fn advance(&mut self, bytes: Bytes) -> Option<std::io::Result<Bytes>> {
         if bytes.is_empty() {
             self.remaining = 0;
-            return Some(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "file shrank during read")));
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file shrank during read",
+            )));
         }
         self.offset += bytes.len() as u64;
         self.remaining = self.remaining.saturating_sub(bytes.len() as u64);

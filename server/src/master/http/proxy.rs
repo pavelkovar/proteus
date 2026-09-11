@@ -55,8 +55,15 @@ const MAX_FORWARDED_HOPS: usize = 32;
 /// against. Every exit but one yields the peer: anything unparseable,
 /// overlong or unvouched-for fails closed rather than being skipped to keep
 /// walking left into client-controlled entries.
-pub(crate) fn resolve_client_ip(peer: Peer, headers: &HeaderMap, trusted_proxies: &[ipnetwork::IpNetwork]) -> ClientIdentity {
-    let Peer { identity: peer, is_trusted_proxy } = peer;
+pub(crate) fn resolve_client_ip(
+    peer: Peer,
+    headers: &HeaderMap,
+    trusted_proxies: &[ipnetwork::IpNetwork],
+) -> ClientIdentity {
+    let Peer {
+        identity: peer,
+        is_trusted_proxy,
+    } = peer;
     if !is_trusted_proxy {
         return peer;
     }
@@ -106,7 +113,11 @@ fn canonical(ip: IpAddr) -> IpAddr {
 
 /// `X-Forwarded-Host`, from a trusted peer only, beats `Host`, which in turn
 /// falls back to this listener's own bind address.
-pub(crate) fn resolve_server_name_port(headers: &HeaderMap, is_trusted_peer: bool, listen_addr: &str) -> (String, u16) {
+pub(crate) fn resolve_server_name_port(
+    headers: &HeaderMap,
+    is_trusted_peer: bool,
+    listen_addr: &str,
+) -> (String, u16) {
     let fallback_port = listen_addr
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok())
@@ -114,15 +125,26 @@ pub(crate) fn resolve_server_name_port(headers: &HeaderMap, is_trusted_peer: boo
     let fallback_name = listen_addr.rsplit_once(':').map_or(listen_addr, |(h, _)| h);
 
     let host = is_trusted_peer
-        .then(|| headers.get("x-forwarded-host").and_then(|v| v.to_str().ok()))
+        .then(|| {
+            headers
+                .get("x-forwarded-host")
+                .and_then(|v| v.to_str().ok())
+        })
         .flatten()
-        .or_else(|| headers.get(hyper::header::HOST).and_then(|v| v.to_str().ok()));
+        .or_else(|| {
+            headers
+                .get(hyper::header::HOST)
+                .and_then(|v| v.to_str().ok())
+        });
 
     let Some(host) = host else {
         return (fallback_name.to_string(), fallback_port);
     };
     let (name, port) = split_host_port(host);
-    (name.to_string(), port.and_then(|p| p.parse().ok()).unwrap_or(fallback_port))
+    (
+        name.to_string(),
+        port.and_then(|p| p.parse().ok()).unwrap_or(fallback_port),
+    )
 }
 
 /// A bracketed IPv6 literal carries colons of its own, so splitting on the

@@ -5,9 +5,9 @@ use std::fmt;
 use std::fmt::Write as _;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
-use tracing_subscriber::fmt::FmtContext;
 use tracing_subscriber::registry::LookupSpan;
 
 /// Every line carries a `type` field, so one mixed stream stays filterable.
@@ -24,7 +24,10 @@ pub(crate) fn init(background_writer: bool) {
     let (writer, guard) = tracing_appender::non_blocking(std::io::stdout());
     // Nothing narrower than the process outlives logging.
     Box::leak(Box::new(guard));
-    tracing_subscriber::fmt().with_writer(writer).event_format(FlatJson).init();
+    tracing_subscriber::fmt()
+        .with_writer(writer)
+        .event_format(FlatJson)
+        .init();
 }
 
 struct FlatJson;
@@ -44,7 +47,10 @@ where
         SystemTime.format_time(&mut writer)?;
         write!(writer, "\",\"level\":\"{}\"", event.metadata().level())?;
 
-        let mut visitor = JsonFieldVisitor { writer: &mut writer, result: Ok(()) };
+        let mut visitor = JsonFieldVisitor {
+            writer: &mut writer,
+            result: Ok(()),
+        };
         event.record(&mut visitor);
         visitor.result?;
 

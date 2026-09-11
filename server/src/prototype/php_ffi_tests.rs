@@ -20,7 +20,11 @@ fn cgi_var_buf_rolls_back_an_entry_with_an_embedded_nul() {
     vars.push("BAD", format_args!("has\0nul"));
     vars.push("AFTER", format_args!("also-ok"));
     let ptrs = vars.pointers();
-    assert_eq!(ptrs.len(), 2, "the NUL-containing entry must be dropped, not just truncated");
+    assert_eq!(
+        ptrs.len(),
+        2,
+        "the NUL-containing entry must be dropped, not just truncated"
+    );
     let as_str = |p: *const c_char| unsafe { std::ffi::CStr::from_ptr(p) }.to_str().unwrap();
     assert_eq!(as_str(ptrs[0]), "BEFORE=ok");
     assert_eq!(as_str(ptrs[1]), "AFTER=also-ok");
@@ -30,12 +34,16 @@ fn cgi_var_buf_rolls_back_an_entry_with_an_embedded_nul() {
 fn parses_captured_header_lines() {
     assert_eq!(parse_headers(b"").iter().count(), 0);
     assert_eq!(
-        parse_headers(b"X-Test: hello\nSet-Cookie: a=1").iter().collect::<Vec<_>>(),
+        parse_headers(b"X-Test: hello\nSet-Cookie: a=1")
+            .iter()
+            .collect::<Vec<_>>(),
         vec![("X-Test", "hello"), ("Set-Cookie", "a=1")]
     );
     // A value containing its own colon must not be truncated.
     assert_eq!(
-        parse_headers(b"Location: https://example.com/x").iter().collect::<Vec<_>>(),
+        parse_headers(b"Location: https://example.com/x")
+            .iter()
+            .collect::<Vec<_>>(),
         vec![("Location", "https://example.com/x")]
     );
 }
@@ -45,11 +53,33 @@ fn parses_captured_header_lines() {
 /// so removing this filter leaves the observable behaviour identical.
 #[test]
 fn suppressed_request_headers_cover_underscore_framing_and_httpoxy() {
-    for name in ["X_Foo_Bar", "x_foo", "Content-Type", "content-length", "CONTENT-TYPE", "Proxy", "PROXY", "pRoXy"] {
-        assert!(suppressed_request_header(name), "{name} must never reach $_SERVER");
+    for name in [
+        "X_Foo_Bar",
+        "x_foo",
+        "Content-Type",
+        "content-length",
+        "CONTENT-TYPE",
+        "Proxy",
+        "PROXY",
+        "pRoXy",
+    ] {
+        assert!(
+            suppressed_request_header(name),
+            "{name} must never reach $_SERVER"
+        );
     }
-    for name in ["X-Foo-Bar", "User-Agent", "Cookie", "Authorization", "Proxy-Authorization", "X-Proxy"] {
-        assert!(!suppressed_request_header(name), "{name} is a legitimate header and must pass through");
+    for name in [
+        "X-Foo-Bar",
+        "User-Agent",
+        "Cookie",
+        "Authorization",
+        "Proxy-Authorization",
+        "X-Proxy",
+    ] {
+        assert!(
+            !suppressed_request_header(name),
+            "{name} is a legitimate header and must pass through"
+        );
     }
 }
 
@@ -85,5 +115,8 @@ fn chunk_trampoline_drops_an_unrecognized_kind_rather_than_treating_it_as_end() 
         chunk_trampoline(99, 0, std::ptr::null(), 0, user_data);
     }
 
-    assert!(seen.is_empty(), "an unrecognized kind must not be forwarded as any chunk, least of all End: got {seen:?}");
+    assert!(
+        seen.is_empty(),
+        "an unrecognized kind must not be forwarded as any chunk, least of all End: got {seen:?}"
+    );
 }
