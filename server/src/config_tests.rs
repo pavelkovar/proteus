@@ -227,6 +227,26 @@ fn validate_rejects_a_zero_limits_requests() {
     );
 }
 
+/// A `/0` entry hands every client on the Internet the power to set its own
+/// `X-Forwarded-For` identity, which is exactly the rate-limit bypass the
+/// trusted-proxy gate exists to close.
+#[test]
+fn validate_rejects_a_trusted_proxies_entry_covering_every_address() {
+    for cidr in ["0.0.0.0/0", "::/0"] {
+        let json = base_config_json("", "").replace(r#""listen""#, &format!(r#""trusted_proxies": ["{cidr}"], "listen""#));
+        let cfg: Config = serde_json::from_str(&json).expect("should parse");
+        let errors = validate(&cfg);
+        assert!(errors.iter().any(|e| e.contains("trusted_proxies")), "expected a trusted_proxies error for {cidr}, got: {errors:?}");
+    }
+}
+
+#[test]
+fn validate_accepts_a_narrow_trusted_proxies_entry() {
+    let json = base_config_json("", "").replace(r#""listen""#, r#""trusted_proxies": ["10.0.0.0/8", "192.168.0.0/16"], "listen""#);
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(validate(&cfg), Vec::<String>::new());
+}
+
 #[test]
 fn validate_rejects_a_zero_queue_timeout() {
     let json = base_config_json("", "").replace(r#""timeout": 5"#, r#""timeout": 0"#);

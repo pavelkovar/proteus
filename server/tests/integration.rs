@@ -566,6 +566,125 @@ async fn rate_limit_only_applies_to_matching_user_agents_and_recovers_with_retry
     }
 }
 
+/// End to end over a real socket: the unit tests pin the resolver, this pins
+/// that `handle()` actually feeds the limiter the resolved identity. A client
+/// that is not a configured trusted proxy must share one bucket no matter
+/// what it forwards, and the same server must still split clients that a
+/// trusted proxy vouches for.
+#[tokio::test]
+async fn x_forwarded_for_cannot_buy_extra_rate_limit_budget() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "rate-limit-spoof",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "rate_limit": { "requests": 3, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
+        }),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    let mut statuses = Vec::new();
+    for n in 1..=6 {
+        let resp = client
+            .get(&url)
+            .header("User-Agent", "GPTBot/1.0")
+            .header("X-Forwarded-For", format!("1.1.1.{n}"))
+            .send()
+            .await
+            .unwrap();
+        statuses.push(resp.status().as_u16());
+    }
+    assert_eq!(statuses, vec![200, 200, 200, 429, 429, 429], "trusted_proxies is empty, so a rotating X-Forwarded-For must buy nothing");
+}
+
+/// The other half: with the peer configured as a trusted proxy, its
+/// `X-Forwarded-For` decides the bucket, so one client exhausting its budget
+/// must not spend another's.
+#[tokio::test]
+async fn a_trusted_proxy_gets_a_bucket_per_forwarded_client() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "rate-limit-proxied",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "trusted_proxies": ["127.0.0.1/32"],
+            "rate_limit": { "requests": 2, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
+        }),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    let get = async |forwarded_for: &str| {
+        client
+            .get(&url)
+            .header("User-Agent", "GPTBot/1.0")
+            .header("X-Forwarded-For", forwarded_for)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    };
+
+    assert_eq!(get("198.51.100.20").await, 200);
+    assert_eq!(get("198.51.100.20").await, 200);
+    assert_eq!(get("198.51.100.20").await, 429, "the first forwarded client's own burst must run out");
+    assert_eq!(get("198.51.100.21").await, 200, "a different forwarded client must have its own budget");
+}
+
+/// A proxy serves many clients down one keep-alive connection, so caching a
+/// resolved identity per connection would report them all as the first.
+#[tokio::test]
+async fn one_keep_alive_connection_resolves_each_request_forwarded_client() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "xff-per-request",
+        www.to_str().unwrap(),
+        serde_json::json!({ "trusted_proxies": ["127.0.0.1/32"] }),
+    )
+    .await;
+
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.unwrap();
+
+    let mut seen = Vec::new();
+    for client in ["198.51.100.20", "198.51.100.21"] {
+        stream
+            .write_all(format!("GET /app HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: {client}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        // The connection stays open for the next request, so read_to_end
+        // would block until the idle timeout.
+        let mut buf = Vec::new();
+        loop {
+            let mut chunk = [0u8; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk))
+                .await
+                .expect("timed out waiting for a response")
+                .unwrap();
+            assert_ne!(n, 0, "server closed the connection mid-exchange");
+            buf.extend_from_slice(&chunk[..n]);
+            if String::from_utf8_lossy(&buf).contains("REMOTE_ADDR=") {
+                break;
+            }
+        }
+        let body = String::from_utf8_lossy(&buf).to_string();
+        let addr = body.split("REMOTE_ADDR=").nth(1).and_then(|rest| rest.split('\n').next()).unwrap().trim().to_string();
+        seen.push(addr);
+    }
+
+    assert_eq!(
+        seen,
+        vec!["198.51.100.20".to_string(), "198.51.100.21".to_string()],
+        "the second request on the same connection must not inherit the first's client"
+    );
+}
+
 /// Hitting the pending-headers cap must not simply abandon the response ring
 /// while the worker, still mid-write, blocks forever in an untimed wait with
 /// nothing left to free space or kill it. It is dropped from `/status`
@@ -1296,15 +1415,18 @@ async fn header_with_a_literal_underscore_never_reaches_php() {
 }
 
 /// The standard CGI vars, plus `php.environment` reaching `getenv()`. The
-/// Host- and forwarded-derived values are trusted only from a loopback peer,
-/// which this client always is.
+/// forwarded-derived values need this client's loopback address to be a
+/// configured trusted proxy; nothing is trusted implicitly.
 #[tokio::test]
 async fn php_receives_server_vars_and_environment() {
     let www = fixtures_dir().join("www");
     let server = start_server(
         "servervars",
         www.to_str().unwrap(),
-        serde_json::json!({ "php": { "environment": { "TEST_ENV_VAR": "hello-env" } } }),
+        serde_json::json!({
+            "trusted_proxies": ["127.0.0.1/32"],
+            "php": { "environment": { "TEST_ENV_VAR": "hello-env" } }
+        }),
     )
     .await;
 

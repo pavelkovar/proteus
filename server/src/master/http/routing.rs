@@ -3,6 +3,7 @@
 
 use super::fs_cache::{FsCache, FsKind};
 use super::php_dispatch::{build_php_request, dispatch_php};
+use super::proxy::ClientIdentity;
 use super::AppState;
 use crate::config::{Config, RouteActionConfig};
 use crate::ipc::data::HeaderBlob;
@@ -10,8 +11,8 @@ use crate::master::pool_manager::BodyStream;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
-use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Below this the hint costs more than it buys: the kernel's own default
 /// readahead window already covers a file this small.
@@ -106,7 +107,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// Per-connection facts, as one `Copy` struct rather than positional args.
 #[derive(Clone, Copy)]
 pub(crate) struct RequestContext<'a> {
-    pub(crate) client_ip: IpAddr,
+    pub(crate) client_ip: ClientIdentity,
     pub(crate) listen_addr: &'a str,
     pub(crate) is_trusted_peer: bool,
 }
@@ -133,12 +134,14 @@ pub(crate) struct DispatchResult {
     pub(crate) action_body: ActionBody,
     pub(crate) log_action: &'static str,
     pub(crate) worker_pid: u32,
-    pub(crate) php_target: String,
+    /// `Option` rather than an empty `Arc<str>`, which allocates just to say
+    /// "no target".
+    pub(crate) php_target: Option<Arc<str>>,
 }
 
 impl DispatchResult {
     pub(crate) fn new(action_body: ActionBody, log_action: &'static str, worker_pid: u32) -> Self {
-        DispatchResult { action_body, log_action, worker_pid, php_target: String::new() }
+        DispatchResult { action_body, log_action, worker_pid, php_target: None }
     }
 }
 
@@ -230,7 +233,7 @@ pub(crate) async fn dispatch_action(
                     None => DispatchResult::new(ActionBody::not_found(), "php-no-script", 0),
                 };
                 // Every outcome from here belongs to this one target.
-                result.php_target = target.clone();
+                result.php_target = Some(Arc::clone(target));
                 return result;
             }
         }

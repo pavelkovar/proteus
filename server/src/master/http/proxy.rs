@@ -3,42 +3,105 @@
 use hyper::HeaderMap;
 use std::net::IpAddr;
 
-/// Trusts the header only if `peer_ip` is itself trusted.
-///
-/// Walks right to left and stops at the first untrusted hop: everything to
-/// its right was appended by proxies already trusted, everything to its left
-/// is as client-controlled as that hop. An unparseable hop stops the walk
-/// rather than being skipped, since skipping would keep walking left into
-/// client-controlled territory on the word of a hop that failed validation.
-pub(crate) fn resolve_client_ip(
-    peer_ip: IpAddr,
-    is_peer_trusted: bool,
-    headers: &HeaderMap,
-    trusted_check: impl Fn(IpAddr) -> bool,
-) -> IpAddr {
-    if !is_peer_trusted {
-        return peer_ip;
+/// A client IP that has passed the trusted-proxy gate. Keep `resolve_client_ip`
+/// its only constructor: a second one is a way to hand a consumer an address
+/// that never went through the gate.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct ClientIdentity(IpAddr);
+
+impl ClientIdentity {
+    pub(crate) fn ip(self) -> IpAddr {
+        self.0
     }
-    let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
-        return peer_ip;
-    };
-    for hop in xff.split(',').rev() {
-        let Ok(ip) = hop.trim().parse::<IpAddr>() else {
-            return peer_ip;
-        };
-        if !trusted_check(ip) {
-            return ip;
-        }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(ip: IpAddr) -> Self {
+        ClientIdentity(canonical(ip))
     }
-    peer_ip
 }
 
-/// An empty `trusted_proxies` means loopback only.
-pub(crate) fn ip_is_trusted_proxy(ip: IpAddr, trusted_proxies: &[ipnetwork::IpNetwork]) -> bool {
-    if trusted_proxies.is_empty() {
-        return ip.is_loopback();
+impl std::fmt::Display for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
+}
+
+/// The connection's own end, fixed for as long as it stays open: neither the
+/// peer address nor `trusted_proxies` can change under it.
+#[derive(Clone, Copy)]
+pub(crate) struct Peer {
+    identity: ClientIdentity,
+    is_trusted_proxy: bool,
+}
+
+impl Peer {
+    pub(crate) fn resolve(ip: IpAddr, trusted_proxies: &[ipnetwork::IpNetwork]) -> Self {
+        Peer {
+            identity: ClientIdentity(canonical(ip)),
+            is_trusted_proxy: ip_is_trusted_proxy(ip, trusted_proxies),
+        }
+    }
+
+    pub(crate) fn is_trusted_proxy(self) -> bool {
+        self.is_trusted_proxy
+    }
+}
+
+/// Past this a chain is padding, not a deployment.
+const MAX_FORWARDED_HOPS: usize = 32;
+
+/// The real client behind `peer`, from `X-Forwarded-For` only if `peer` is
+/// itself a trusted proxy and `trusted_proxies` is the list it was resolved
+/// against. Every exit but one yields the peer: anything unparseable,
+/// overlong or unvouched-for fails closed rather than being skipped to keep
+/// walking left into client-controlled entries.
+pub(crate) fn resolve_client_ip(peer: Peer, headers: &HeaderMap, trusted_proxies: &[ipnetwork::IpNetwork]) -> ClientIdentity {
+    let Peer { identity: peer, is_trusted_proxy } = peer;
+    if !is_trusted_proxy {
+        return peer;
+    }
+    let mut hops = 0;
+    // RFC 9110 §5.3: repeated field lines are one list in the order received.
+    // Reading only the first lets a client send its own line ahead of the one
+    // its proxy appends and so choose its own identity.
+    for value in headers.get_all("x-forwarded-for").iter().rev() {
+        let Ok(list) = value.to_str() else {
+            return peer;
+        };
+        for hop in list.split(',').rev() {
+            hops += 1;
+            if hops > MAX_FORWARDED_HOPS {
+                return peer;
+            }
+            let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+                return peer;
+            };
+            if !ip_is_trusted_proxy(ip, trusted_proxies) {
+                return ClientIdentity(canonical(ip));
+            }
+        }
+    }
+    peer
+}
+
+/// Empty trusts nothing, so no configuration is the safe configuration.
+pub(crate) fn ip_is_trusted_proxy(ip: IpAddr, trusted_proxies: &[ipnetwork::IpNetwork]) -> bool {
+    let ip = canonical(ip);
     trusted_proxies.iter().any(|net| net.contains(ip))
+}
+
+/// One address, one spelling: a dual-stack listener reports an IPv4 peer as
+/// `::ffff:a.b.c.d`, which an operator's IPv4 CIDR would otherwise silently
+/// fail to match. Not `to_ipv4`, which also unwraps the deprecated
+/// IPv4-compatible form and would turn `::1` into `0.0.0.1`.
+fn canonical(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        IpAddr::V4(_) => ip,
+    }
 }
 
 /// `X-Forwarded-Host`, from a trusted peer only, beats `Host`, which in turn

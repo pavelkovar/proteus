@@ -28,7 +28,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Instant;
@@ -126,14 +125,14 @@ impl BodyOutcome {
 /// Holds the raw `Uri`, both because a log records what the client actually
 /// sent and because it is refcounted and already cloned.
 struct PendingAccessLog {
-    client_ip: IpAddr,
+    client_ip: ClientIdentity,
     method: Method,
     uri: hyper::Uri,
     status: StatusCode,
     start: Instant,
     action: &'static str,
     worker_pid: u32,
-    php_target: String,
+    php_target: Option<Arc<str>>,
 }
 
 impl PendingAccessLog {
@@ -148,7 +147,7 @@ impl PendingAccessLog {
             duration_ms = self.start.elapsed().as_millis() as u64,
             worker_pid = self.worker_pid,
             action = self.action,
-            php_target = %self.php_target,
+            php_target = self.php_target.as_deref().unwrap_or(""),
             body = body.as_str(),
         );
     }
@@ -217,7 +216,7 @@ fn early_reject(
 async fn handle(
     req: Request<Incoming>,
     state: Arc<AppState>,
-    peer_ip: IpAddr,
+    peer: Peer,
     listen_addr: &str,
     conn: Arc<ConnState>,
 ) -> Result<Response<ResponseBody>, std::convert::Infallible> {
@@ -231,10 +230,8 @@ async fn handle(
     // Ahead of path decoding/routing/body collection: resolving these needs
     // no work beyond the headers already in hand, so a client about to be
     // rate-limited or otherwise rejected never pays for any of that first.
-    let is_trusted_peer = ip_is_trusted_proxy(peer_ip, &state.config.trusted_proxies);
-    let client_ip = resolve_client_ip(peer_ip, is_trusted_peer, req.headers(), |ip| {
-        ip_is_trusted_proxy(ip, &state.config.trusted_proxies)
-    });
+    let is_trusted_peer = peer.is_trusted_proxy();
+    let client_ip = resolve_client_ip(peer, req.headers(), &state.config.trusted_proxies);
 
     if let Some(limiter) = &state.rate_limiter {
         // `client_ip` is this limiter's whole identity for a client, so a
@@ -249,7 +246,7 @@ async fn handle(
             if let Ok(value) = hyper::header::HeaderValue::from_str(&limiter.period_seconds().to_string()) {
                 resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
             }
-            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rate-limited", worker_pid: 0, php_target: String::new() };
+            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rate-limited", worker_pid: 0, php_target: None };
             return early_reject(resp, log, in_flight, conn_busy);
         }
     }
@@ -261,7 +258,7 @@ async fn handle(
         Err(reason) => {
             let resp = build_response(StatusCode::BAD_REQUEST, b"400 invalid path\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
             tracing::debug!(r#type = "controller", ?reason, raw_path = uri.path(), "rejected an undecodable request path");
-            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: String::new() };
+            let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: None };
             return early_reject(resp, log, in_flight, conn_busy);
         }
     };
@@ -288,7 +285,7 @@ async fn handle(
     // without repeating the check would silently admit traversal.
     if path_escapes_root(path) {
         let resp = build_response(StatusCode::BAD_REQUEST, b"400 invalid path\n".to_vec(), &crate::ipc::data::HeaderBlob::default());
-        let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: String::new() };
+        let log = PendingAccessLog { client_ip, method, uri, status: resp.status(), start, action: "rejected", worker_pid: 0, php_target: None };
         return early_reject(resp, log, in_flight, conn_busy);
     }
 
@@ -501,7 +498,7 @@ pub async fn serve(state: Arc<AppState>) {
                     let _slot = slot;
                     set_nodelay_or_log(&stream);
                     let io = TokioIo::new(stream);
-                    let peer_ip = peer.ip();
+                    let peer_identity = Peer::resolve(peer.ip(), &state.config.trusted_proxies);
                     let conn = Arc::new(ConnState::new());
                     let service = {
                         let conn = Arc::clone(&conn);
@@ -509,7 +506,7 @@ pub async fn serve(state: Arc<AppState>) {
                             let state = state.clone();
                             let listen_addr = listen_addr.clone();
                             let conn = Arc::clone(&conn);
-                            async move { handle(req, state, peer_ip, &listen_addr, conn).await }
+                            async move { handle(req, state, peer_identity, &listen_addr, conn).await }
                         })
                     };
                     let mut connection = std::pin::pin!(hyper::server::conn::http1::Builder::new()

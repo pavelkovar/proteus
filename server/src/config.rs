@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Braced form only, so a regex like `~\.php$` in `match.uri` is never
 /// mistaken for a placeholder. Expanding raw text rather than a parsed tree
@@ -55,8 +56,10 @@ pub struct Config {
     /// Bytes of request body to accept before a 413.
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
-    /// Direct TCP peers trusted to set `X-Forwarded-*`. Empty means loopback
-    /// only.
+    /// CIDRs of the direct TCP peers whose `X-Forwarded-*` is believed; empty
+    /// (the default) believes none of them. An entry grants everything it
+    /// covers the power to name the client identity behind it, so list the
+    /// proxy's own addresses as narrowly as they are known.
     #[serde(default)]
     pub trusted_proxies: Vec<ipnetwork::IpNetwork>,
     #[serde(default)]
@@ -171,7 +174,7 @@ pub enum RouteActionConfig {
         fallback: Option<Box<RouteActionConfig>>,
     },
 
-    Php { target: String },
+    Php { target: Arc<str> },
     /// Bare status, no body. `u16` so a bad value fails `validate` with a
     /// real message rather than a byte-offset parse error.
     Return { status: u16 },
@@ -574,6 +577,15 @@ pub fn validate(cfg: &Config) -> Vec<String> {
             errors.push("rate_limit.period_seconds must be at least 1 (0 would never refill)".to_string());
         }
     }
+    for net in &cfg.trusted_proxies {
+        if net.prefix() == 0 {
+            errors.push(format!(
+                "trusted_proxies entry {net} covers every address, which would let any client pick its own \
+                 X-Forwarded-For identity and so bypass the per-client rate limit; list the proxy addresses \
+                 explicitly"
+            ));
+        }
+    }
     for route in &cfg.routes {
         validate_action(&route.action, &cfg.php.targets, &mut errors);
     }
@@ -584,7 +596,7 @@ pub fn validate(cfg: &Config) -> Vec<String> {
 fn validate_action(action: &RouteActionConfig, targets: &HashMap<String, Target>, errors: &mut Vec<String>) {
     match action {
         RouteActionConfig::Php { target } => {
-            if !targets.contains_key(target) {
+            if !targets.contains_key(&**target) {
                 errors.push(format!("route target {target:?} is not defined in php.targets"));
             }
         }

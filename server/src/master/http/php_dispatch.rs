@@ -303,7 +303,7 @@ pub(crate) async fn build_php_request(
             query_string: Cow::Owned(query_string),
             content_type: Cow::Owned(content_type),
             headers,
-            client_ip,
+            client_ip: client_ip.ip(),
             body,
             server_name: Cow::Owned(server_name),
             server_port,

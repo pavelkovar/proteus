@@ -1,13 +1,14 @@
-//! Per-client-IP token-bucket rate limiting, scoped by `User-Agent` so it
-//! can target crawlers without touching ordinary visitors.
+//! Per-client token-bucket rate limiting, scoped by `User-Agent` so it can
+//! target crawlers without touching ordinary visitors. Keyed on an opaque
+//! `ClientIdentity`, so where that identity came from is not decided here.
 //!
-//! A repeat check against an already-tracked IP never takes an exclusive
+//! A repeat check against an already-tracked client never takes an exclusive
 //! lock: `DashMap` gives that only its own per-shard lock, and the bucket
 //! itself is one `AtomicU64` updated via `compare_exchange`.
 
 use super::bounded_map::BoundedMap;
+use super::proxy::ClientIdentity;
 use crate::config::MatchPattern;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
@@ -78,7 +79,7 @@ impl Bucket {
 }
 
 pub(crate) struct RateLimiter {
-    map: BoundedMap<IpAddr, Bucket>,
+    map: BoundedMap<ClientIdentity, Bucket>,
     epoch: Instant,
     capacity: u32,
     period_secs: u64,
@@ -117,26 +118,26 @@ impl RateLimiter {
         self.period_secs
     }
 
-    /// `true` if `ip` may proceed - and has just consumed one token - `false`
-    /// if it is currently out of budget. Only meaningful once `should_limit`
-    /// has already said yes.
-    pub(crate) fn check(&self, ip: IpAddr) -> bool {
+    /// `true` if `client` may proceed - and has just consumed one token -
+    /// `false` if it is currently out of budget. Only meaningful once
+    /// `should_limit` has already said yes.
+    pub(crate) fn check(&self, client: ClientIdentity) -> bool {
         let now_secs = self.epoch.elapsed().as_secs();
 
-        // Fast path: an already-tracked IP only ever needs DashMap's own
-        // fine-grained per-shard lock, never a lock shared with unrelated IPs.
-        if let Some(bucket) = self.map.get(&ip) {
+        // Fast path: an already-tracked client only ever needs DashMap's own
+        // fine-grained per-shard lock, never one shared with unrelated clients.
+        if let Some(bucket) = self.map.get(&client) {
             return bucket.try_consume(now_secs, self.capacity, self.period_secs);
         }
 
-        // Rare path: first sighting of this IP (or it was swept below).
+        // Rare path: first sighting of this client (or it was swept below).
         // Fails open rather than evicting a client actively being limited
         // if the table is still full even after sweeping idle entries.
-        if !self.map.has_room_for(&ip, self.max_tracked, |bucket| bucket.is_full(now_secs, self.capacity, self.period_secs)) {
+        if !self.map.has_room_for(&client, self.max_tracked, |bucket| bucket.is_full(now_secs, self.capacity, self.period_secs)) {
             return true;
         }
         self.map
-            .entry(ip)
+            .entry(client)
             .or_insert_with(|| Bucket::new(now_secs, self.capacity))
             .try_consume(now_secs, self.capacity, self.period_secs)
     }

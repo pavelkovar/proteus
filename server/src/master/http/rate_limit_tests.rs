@@ -1,9 +1,52 @@
+use super::super::proxy::{resolve_client_ip, Peer};
 use super::*;
+use hyper::HeaderMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
-fn ip(last: u8) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(127, 0, 0, last))
+fn ip(last: u8) -> ClientIdentity {
+    ClientIdentity::for_test(IpAddr::V4(Ipv4Addr::new(127, 0, 0, last)))
+}
+
+/// Resolves the way `handle()` does. A hand-built identity would let a
+/// spoofing test pass while the live call site stayed bypassable.
+fn identity_for(peer: &str, xff: &str, trusted: &[&str]) -> ClientIdentity {
+    let trusted: Vec<ipnetwork::IpNetwork> = trusted.iter().map(|c| c.parse().unwrap()).collect();
+    let peer = Peer::resolve(peer.parse().unwrap(), &trusted);
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", xff.parse().unwrap());
+    resolve_client_ip(peer, &headers, &trusted)
+}
+
+/// The reason identity resolution sits outside this module: a client
+/// connected directly rewrites `X-Forwarded-For` freely and must still land
+/// in the single bucket its peer address earns it.
+#[test]
+fn a_direct_client_rotating_x_forwarded_for_cannot_escape_its_bucket() {
+    const BURST: u32 = 5;
+    let limiter = RateLimiter::new(BURST, 3600, Vec::new());
+
+    let allowed = (0..50)
+        .filter(|n| {
+            let spoofed = format!("1.1.1.{n}");
+            limiter.check(identity_for("203.0.113.10", &spoofed, &["10.0.0.0/8"]))
+        })
+        .count();
+
+    assert_eq!(allowed, BURST as usize, "a direct client must exhaust one shared bucket no matter what it forwards");
+}
+
+/// The other half of the contract: a real proxy deployment must still limit
+/// its clients individually rather than collapsing them onto the proxy.
+#[test]
+fn two_clients_behind_one_trusted_proxy_keep_separate_buckets() {
+    let limiter = RateLimiter::new(1, 3600, Vec::new());
+    let first = identity_for("10.0.0.20", "198.51.100.20", &["10.0.0.0/8"]);
+    let second = identity_for("10.0.0.20", "198.51.100.21", &["10.0.0.0/8"]);
+
+    assert!(limiter.check(first));
+    assert!(!limiter.check(first), "first client's burst is exhausted");
+    assert!(limiter.check(second), "a second client behind the same proxy must have its own budget");
 }
 
 #[test]

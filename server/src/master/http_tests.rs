@@ -2,6 +2,7 @@ use super::*;
 use super::compression::*;
 use crate::config::{Config, Limits, MatchPattern, PhpConfig, Processes, QueueConfig, Route, RouteActionConfig, RouteMatch};
 use hyper::HeaderMap;
+use std::net::IpAddr;
 
 fn test_config(routes: Vec<Route>) -> Config {
     Config {
@@ -99,7 +100,7 @@ fn php_target_is_carried_into_the_decision() {
         },
     ]);
     match match_route(&cfg, "/api/whoami", "GET", "") {
-        RouteDecision::Matched { action: RouteActionConfig::Php { target } } => assert_eq!(target, "api"),
+        RouteDecision::Matched { action: RouteActionConfig::Php { target } } => assert_eq!(&**target, "api"),
         other => panic!("expected Php, got {other:?}"),
     }
     match match_route(&cfg, "/legacy/x.php", "GET", "") {
@@ -199,7 +200,7 @@ fn match_route_requires_a_uri_pattern_to_match_when_present() {
         RouteActionConfig::Php { target: "joomla".into() },
     )]);
     match match_route(&cfg, "/index.php", "GET", "") {
-        RouteDecision::Matched { action: RouteActionConfig::Php { target }, .. } => assert_eq!(target, "joomla"),
+        RouteDecision::Matched { action: RouteActionConfig::Php { target }, .. } => assert_eq!(&**target, "joomla"),
         other => panic!("expected Php, got {other:?}"),
     }
     assert_eq!(match_route(&cfg, "/index.html", "GET", ""), RouteDecision::NoMatch);
@@ -309,37 +310,121 @@ fn match_route_ands_host_with_uri_and_method() {
 }
 
 #[test]
-fn ip_is_trusted_proxy_falls_back_to_loopback_when_unconfigured() {
-    assert!(ip_is_trusted_proxy("127.0.0.1".parse().unwrap(), &[]));
-    assert!(!ip_is_trusted_proxy("203.0.113.1".parse().unwrap(), &[]));
-}
-
-#[test]
 fn ip_is_trusted_proxy_matches_a_configured_cidr() {
     let trusted_proxies: Vec<ipnetwork::IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
     assert!(ip_is_trusted_proxy("10.1.2.3".parse().unwrap(), &trusted_proxies));
-    // A configured list opts out of the loopback fallback entirely.
     assert!(!ip_is_trusted_proxy("127.0.0.1".parse().unwrap(), &trusted_proxies));
     assert!(!ip_is_trusted_proxy("203.0.113.1".parse().unwrap(), &trusted_proxies));
 }
 
+/// Nothing is trusted by default - loopback included, or any local process
+/// able to open a socket could pick its own `REMOTE_ADDR` and rate-limit
+/// bucket.
 #[test]
-fn client_ip_falls_back_to_peer_when_untrusted() {
-    let peer: IpAddr = "203.0.113.1".parse().unwrap();
+fn ip_is_trusted_proxy_trusts_nobody_when_the_list_is_empty() {
+    for ip in ["127.0.0.1", "::1", "10.0.0.1", "203.0.113.1"] {
+        assert!(!ip_is_trusted_proxy(ip.parse().unwrap(), &[]), "{ip}");
+    }
+}
+
+/// A dual-stack listener reports an IPv4 peer in mapped form; an operator's
+/// IPv4 CIDR has to keep matching it.
+#[test]
+fn ip_is_trusted_proxy_matches_an_ipv4_cidr_against_an_ipv4_mapped_peer() {
+    let trusted_proxies: Vec<ipnetwork::IpNetwork> = vec!["10.0.0.0/8".parse().unwrap()];
+    assert!(ip_is_trusted_proxy("::ffff:10.0.0.20".parse().unwrap(), &trusted_proxies));
+}
+
+fn trusted_nets(cidrs: &[&str]) -> Vec<ipnetwork::IpNetwork> {
+    cidrs.iter().map(|c| c.parse().unwrap()).collect()
+}
+
+/// Mirrors `handle()`, config list included, so a test cannot pass against a
+/// gate the live call site never applies.
+fn resolve(peer: &str, xff: &[&str], trusted: &[&str]) -> IpAddr {
+    let trusted = trusted_nets(trusted);
+    let peer = Peer::resolve(peer.parse().unwrap(), &trusted);
     let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
-    // Not loopback, so the header must be ignored entirely.
-    let resolved = resolve_client_ip(peer, peer.is_loopback(), &headers, |ip| ip.is_loopback());
-    assert_eq!(resolved, peer);
+    for line in xff {
+        headers.append("x-forwarded-for", line.parse().unwrap());
+    }
+    resolve_client_ip(peer, &headers, &trusted).ip()
+}
+
+/// The bypass this whole gate exists to prevent.
+#[test]
+fn a_direct_client_cannot_choose_its_own_identity_with_x_forwarded_for() {
+    assert_eq!(resolve("203.0.113.10", &["198.51.100.20"], &["10.0.0.0/8"]), "203.0.113.10".parse::<IpAddr>().unwrap());
 }
 
 #[test]
-fn client_ip_uses_header_from_trusted_peer() {
-    let peer: IpAddr = "127.0.0.1".parse().unwrap();
-    let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
-    let resolved = resolve_client_ip(peer, peer.is_loopback(), &headers, |ip| ip.is_loopback());
-    assert_eq!(resolved, "203.0.113.7".parse::<IpAddr>().unwrap());
+fn a_trusted_proxys_x_forwarded_for_is_honoured() {
+    assert_eq!(resolve("10.0.0.20", &["198.51.100.20"], &["10.0.0.0/8"]), "198.51.100.20".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn the_walk_passes_every_trusted_hop_and_stops_at_the_client() {
+    assert_eq!(resolve("10.0.0.20", &["198.51.100.20, 10.0.0.10, 10.0.0.20"], &["10.0.0.0/8"]), "198.51.100.20".parse::<IpAddr>().unwrap());
+}
+
+/// Everything left of the first untrusted hop was written by something this
+/// server has no reason to believe, so the walk must stop there rather than
+/// run on to the leftmost entry.
+#[test]
+fn the_walk_stops_at_the_first_untrusted_hop_not_the_leftmost_one() {
+    assert_eq!(
+        resolve("10.0.0.20", &["1.1.1.1, 203.0.113.9, 10.0.0.10"], &["10.0.0.0/8"]),
+        "203.0.113.9".parse::<IpAddr>().unwrap(),
+        "a client-supplied prefix must not be reachable past an untrusted hop"
+    );
+}
+
+/// hyper keeps repeated field lines separate, so reading only the first would
+/// hand the identity to whichever line the client sent - its own, ahead of
+/// the one the proxy appends.
+#[test]
+fn a_client_prepended_header_line_cannot_outrank_the_one_its_proxy_appends() {
+    assert_eq!(resolve("10.0.0.20", &["1.1.1.1", "198.51.100.20"], &["10.0.0.0/8"]), "198.51.100.20".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn a_malformed_hop_falls_back_to_the_peer() {
+    let peer = "10.0.0.20".parse::<IpAddr>().unwrap();
+    for xff in ["not-an-ip", "9.9.9.9, not-an-ip", "", "   ", "198.51.100.20:443", "198.51.100.20, ,10.0.0.10", "for=198.51.100.20"] {
+        assert_eq!(resolve("10.0.0.20", &[xff], &["10.0.0.0/8"]), peer, "{xff:?}");
+    }
+}
+
+#[test]
+fn a_missing_header_falls_back_to_the_peer() {
+    assert_eq!(resolve("10.0.0.20", &[], &["10.0.0.0/8"]), "10.0.0.20".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn surrounding_whitespace_in_the_chain_is_tolerated() {
+    assert_eq!(resolve("10.0.0.20", &["  198.51.100.20 ,\t10.0.0.10  "], &["10.0.0.0/8"]), "198.51.100.20".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn ipv6_hops_resolve_against_an_ipv6_trusted_cidr() {
+    assert_eq!(resolve("fd00::20", &["2001:db8::50, fd00::10"], &["fd00::/8", "10.0.0.0/8"]), "2001:db8::50".parse::<IpAddr>().unwrap());
+}
+
+/// Both forms of the same address must land on one identity, or a client
+/// reaching a dual-stack listener would get a second rate-limit bucket.
+#[test]
+fn ipv4_mapped_addresses_collapse_onto_their_ipv4_form() {
+    assert_eq!(resolve("::ffff:203.0.113.10", &[], &["10.0.0.0/8"]), "203.0.113.10".parse::<IpAddr>().unwrap());
+    assert_eq!(resolve("10.0.0.20", &["::ffff:198.51.100.20"], &["10.0.0.0/8"]), "198.51.100.20".parse::<IpAddr>().unwrap());
+}
+
+/// The client entry sits past the cap, so an uncapped walk reaches it and a
+/// capped one must not.
+#[test]
+fn an_overlong_chain_falls_back_to_the_peer() {
+    let padding = std::iter::repeat_n("10.0.0.1", 200).collect::<Vec<_>>();
+    let chain = format!("203.0.113.50,{}", padding.join(","));
+    assert_eq!(resolve("10.0.0.20", &[&chain], &["10.0.0.0/8"]), "10.0.0.20".parse::<IpAddr>().unwrap());
 }
 
 #[test]
@@ -384,26 +469,6 @@ fn server_name_port_handles_bracketed_ipv6_host_with_and_without_a_port() {
 
     headers.insert("host", "[::1]:8080".parse().unwrap());
     assert_eq!(resolve_server_name_port(&headers, true, "0.0.0.0:80"), ("[::1]".to_string(), 8080));
-}
-
-#[test]
-fn client_ip_walks_past_trusted_hops_in_multi_hop_header() {
-    let peer: IpAddr = "127.0.0.1".parse().unwrap();
-    let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", "198.51.100.9, 127.0.0.1".parse().unwrap());
-    let resolved = resolve_client_ip(peer, peer.is_loopback(), &headers, |ip| ip.is_loopback());
-    assert_eq!(resolved, "198.51.100.9".parse::<IpAddr>().unwrap());
-}
-
-/// An unparseable hop must stop the walk, not be skipped: skipping keeps
-/// walking left into hops that may be entirely client-controlled.
-#[test]
-fn client_ip_fails_closed_on_an_unparseable_hop_instead_of_skipping_it() {
-    let peer: IpAddr = "127.0.0.1".parse().unwrap();
-    let mut headers = HeaderMap::new();
-    headers.insert("x-forwarded-for", "9.9.9.9, not-an-ip".parse().unwrap());
-    let resolved = resolve_client_ip(peer, peer.is_loopback(), &headers, |ip| ip.is_loopback());
-    assert_eq!(resolved, peer, "an unparseable rightmost hop must fall back to peer_ip, not resolve to 9.9.9.9");
 }
 
 #[test]
