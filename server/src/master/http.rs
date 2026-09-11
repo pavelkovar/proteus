@@ -511,6 +511,32 @@ async fn wait_until_idle(conn: &ConnState, idle_timeout: std::time::Duration) {
     }
 }
 
+/// Holds the connection in the kernel until the request arrives, so a peer
+/// that only completes the handshake costs no accept, task or connection
+/// slot. One second: a longer hold blinds `header_read_timeout`, which
+/// cannot see how long the kernel already waited.
+fn set_defer_accept_or_log(listener: &TcpListener, listen: &str) {
+    use std::os::fd::AsRawFd;
+    let secs: libc::c_int = 1;
+    let rc = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_DEFER_ACCEPT,
+            std::ptr::from_ref(&secs).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        tracing::warn!(
+            r#type = "controller",
+            %listen,
+            error = %std::io::Error::last_os_error(),
+            "setsockopt(TCP_DEFER_ACCEPT) failed, an idle peer now costs a connection slot"
+        );
+    }
+}
+
 /// Traffic here is small and latency-sensitive, never the bulk transfer
 /// Nagle helps. Left on, Nagle plus the client's delayed ACK is the classic
 /// fixed-40ms-per-request bug.
@@ -595,6 +621,7 @@ pub async fn serve(state: Arc<AppState>) {
 
     for listen in &state.config.listen {
         let listener = TcpListener::bind(listen).await.expect("bind failed");
+        set_defer_accept_or_log(&listener, listen);
         tracing::info!(r#type = "controller", %listen, "listening");
         let state = state.clone();
         // The closure needs an owned copy per call, and a refcount bump
