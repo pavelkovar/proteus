@@ -43,6 +43,10 @@ const LEN_PREFIX: usize = 4;
 pub enum RingError {
     FrameTooLarge,
     PeerGone,
+    /// A length prefix was published without the payload behind it, which
+    /// `raw_write_frame` makes impossible: the peer is scribbling on the
+    /// cursors, so the ring cannot be read any further.
+    Truncated,
 }
 
 /// Returns on expiry exactly as it does on a wake, so callers must recheck
@@ -537,13 +541,16 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
             .store(w + (LEN_PREFIX + payload.len()) as u64, Ordering::Release);
     }
 
+    /// Copies out without touching `read_pos`, so the bytes stay available
+    /// to a later consuming read.
+    ///
     /// # Safety
-    /// Single-consumer only - concurrent callers would race `read_pos`.
-    /// `dst` must be valid for `len` bytes of writes; every one of them is
-    /// written, so it need not be initialized beforehand.
-    unsafe fn raw_read_into(&self, dst: *mut u8, len: usize) {
-        let r = self.read_pos.load(Ordering::Relaxed);
-        let start = (r & Self::MASK) as usize;
+    /// `pos..pos + len` must have been published by the writer, which for a
+    /// reader means seen through an acquire load of `write_pos`. `dst` must
+    /// be valid for `len` bytes of writes; every one of them is written, so
+    /// it need not be initialized beforehand.
+    unsafe fn peek_into(&self, pos: u64, dst: *mut u8, len: usize) {
+        let start = (pos & Self::MASK) as usize;
         let base = self.buf.get() as *const u8;
         unsafe {
             if start + len <= CAPACITY {
@@ -554,6 +561,14 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
                 std::ptr::copy_nonoverlapping(base, dst.add(first), len - first);
             }
         }
+    }
+
+    /// # Safety
+    /// Single-consumer only - concurrent callers would race `read_pos`.
+    /// Same requirement on `dst` as `peek_into`, at the current `read_pos`.
+    unsafe fn raw_read_into(&self, dst: *mut u8, len: usize) {
+        let r = self.read_pos.load(Ordering::Relaxed);
+        unsafe { self.peek_into(r, dst, len) };
         self.read_pos.store(r + len as u64, Ordering::Release);
     }
 
@@ -656,24 +671,55 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         Ok(())
     }
 
+    /// Reads one whole frame if the writer has already published one.
+    /// `Ok(false)` means the ring is empty right now - never end of stream.
+    ///
+    /// Consumes either the whole frame or nothing, so an async caller can be
+    /// cancelled around it without desyncing `read_pos`. Frees space through
+    /// the futex, so the writer must be one that waits on it rather than on
+    /// an eventfd.
+    pub fn try_read_frame(
+        &self,
+        scratch: &mut Vec<u8>,
+        peer: &PeerDeath,
+    ) -> Result<bool, RingError> {
+        let r = self.read_pos.load(Ordering::Relaxed); // consumer-only
+        if !self.has_data(r, LEN_PREFIX) {
+            if peer.is_dead() {
+                return Err(RingError::PeerGone);
+            }
+            return Ok(false);
+        }
+        let mut len_buf = [0u8; LEN_PREFIX];
+        unsafe { self.peek_into(r, len_buf.as_mut_ptr(), LEN_PREFIX) };
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len > CAPACITY - LEN_PREFIX {
+            return Err(RingError::FrameTooLarge);
+        }
+        if !self.has_data(r, LEN_PREFIX + len) {
+            return Err(RingError::Truncated);
+        }
+        unsafe {
+            self.raw_read(&mut len_buf);
+            self.read_into_scratch(scratch, len);
+        }
+        // The writer here is always a worker, so always a futex waiter.
+        self.notify_space_freed();
+        Ok(true)
+    }
+
     pub async fn read_frame_async(
         &self,
         scratch: &mut Vec<u8>,
         peer: &PeerDeath,
         data_efd: &AsyncFd<OwnedFd>,
     ) -> Result<(), RingError> {
-        self.wait_for_data_async(LEN_PREFIX, peer, data_efd).await?;
-        let mut len_buf = [0u8; 4];
-        unsafe { self.raw_read(&mut len_buf) };
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len > CAPACITY - LEN_PREFIX {
-            return Err(RingError::FrameTooLarge);
+        loop {
+            if self.try_read_frame(scratch, peer)? {
+                return Ok(());
+            }
+            self.wait_for_data_async(LEN_PREFIX, peer, data_efd).await?;
         }
-        self.wait_for_data_async(len, peer, data_efd).await?;
-        unsafe { self.read_into_scratch(scratch, len) };
-        // The writer here is always a worker, so always a futex waiter.
-        self.notify_space_freed();
-        Ok(())
     }
 }
 
@@ -794,7 +840,8 @@ pub fn create_channel() -> std::io::Result<(OwnedFd, MappedChannel)> {
     use std::os::fd::FromRawFd;
 
     let name = c"proteus-worker-channel";
-    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    let raw_fd =
+        unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw_fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -803,9 +850,30 @@ pub fn create_channel() -> std::io::Result<(OwnedFd, MappedChannel)> {
     if unsafe { libc::ftruncate(raw_fd, size_of::<Channel>() as libc::off_t) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    seal_size(&fd)?;
     let ptr = mmap_channel(raw_fd)?;
     Channel::init_in_place(ptr.as_ptr());
     Ok((fd, MappedChannel { ptr, fd: None }))
+}
+
+/// A worker holds this same descriptor, and only the seal stops it shrinking
+/// the file: master's mapping past the new end would raise SIGBUS on the next
+/// access, killing the process the worker is isolated from.
+///
+/// Not `F_SEAL_WRITE`, which both sides need; `F_SEAL_SEAL` closes the
+/// follow-up of adding one. Hole punching is not a resize, so reclaim still
+/// works.
+fn seal_size(fd: &OwnedFd) -> std::io::Result<()> {
+    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+
+    fcntl(
+        fd,
+        FcntlArg::F_ADD_SEALS(
+            SealFlag::F_SEAL_SHRINK | SealFlag::F_SEAL_GROW | SealFlag::F_SEAL_SEAL,
+        ),
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(())
 }
 
 /// Master side. The channel is already initialized by `create_channel`;

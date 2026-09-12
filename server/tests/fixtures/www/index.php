@@ -35,6 +35,19 @@ if (strpos($_SERVER['REQUEST_URI'], '/fastcgi-finish') !== false) {
 // Emits its first chunk immediately and keeps streaming, opening a window
 // where the handler has returned but the body has not finished. Must stay
 // ahead of /slow, whose path is a substring of this one.
+// `flush()` alone leaves small writes in PHP's own output layer, so a test
+// that wants real streaming has to push that too.
+if (strpos($_SERVER['REQUEST_URI'], '/flush-stream') !== false) {
+    header('Content-Type: text/plain');
+    for ($i = 0; $i < 5; $i++) {
+        echo "chunk-$i\n";
+        @ob_flush();
+        @flush();
+        usleep(200000);
+    }
+    exit;
+}
+
 if (strpos($_SERVER['REQUEST_URI'], '/slow-stream') !== false) {
     header('Content-Type: text/plain');
     for ($i = 0; $i < 5; $i++) {

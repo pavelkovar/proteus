@@ -1,16 +1,17 @@
 use super::*;
-use crate::ipc::data::{self, ResponseFrame};
+use crate::ipc::data;
+use bytes::Bytes;
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
-/// A real `io_task` over a real memfd channel, with the handles a test needs
-/// to act as the worker would - writing into the response ring directly,
-/// without a second process.
+/// A real `WorkerChannel` over a real memfd channel, with the handles a test
+/// needs to act as the worker would - writing into the response ring
+/// directly, without a second process.
 struct Harness {
     worker_side: shm::MappedChannel,
+    req_space_efd_raw: std::os::fd::RawFd,
     resp_data_efd_raw: std::os::fd::RawFd,
-    response_rx: mpsc::Receiver<std::io::Result<Option<ResponseFrame<'static>>>>,
-    request_tx: mpsc::UnboundedSender<Arc<PhpRequest<'static>>>,
+    channel: WorkerChannel,
 }
 
 /// Bypasses `WorkerChannel::new`, so no liveness watcher exists here and
@@ -22,29 +23,19 @@ fn spawn_harness(pid: u32) -> Harness {
     let master_side = shm::map_existing_channel(fd).unwrap();
     let req_space_efd_owned = shm::create_notify_eventfd().unwrap();
     let resp_data_efd_owned = shm::create_notify_eventfd().unwrap();
+    let req_space_efd_raw = req_space_efd_owned.as_raw_fd();
     let resp_data_efd_raw = resp_data_efd_owned.as_raw_fd();
-    let req_space_efd = AsyncFd::new(req_space_efd_owned).unwrap();
-    let resp_data_efd = AsyncFd::new(resp_data_efd_owned).unwrap();
-    let (request_tx, request_rx) = mpsc::unbounded_channel::<Arc<PhpRequest<'static>>>();
-    let (response_tx, response_rx) = mpsc::channel(8);
-
-    tokio::spawn(io_task(
-        Arc::new(master_side),
-        pid,
-        request_rx,
-        response_tx,
-        req_space_efd,
-        resp_data_efd,
-    ));
-
-    // Contents are irrelevant; this only moves `io_task` on to reading.
-    request_tx.send(Arc::new(dummy_request())).unwrap();
 
     Harness {
         worker_side,
+        req_space_efd_raw,
         resp_data_efd_raw,
-        response_rx,
-        request_tx,
+        channel: WorkerChannel::for_test(
+            pid,
+            Arc::new(master_side),
+            AsyncFd::new(req_space_efd_owned).unwrap(),
+            AsyncFd::new(resp_data_efd_owned).unwrap(),
+        ),
     }
 }
 
@@ -86,7 +77,230 @@ fn write_frame(
 }
 
 #[tokio::test]
-async fn io_task_reassembles_a_normal_small_headers_run_end_to_end() {
+async fn write_request_publishes_the_request_for_the_worker_to_read() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+    h.channel.write_request(&dummy_request()).await.unwrap();
+
+    let channel = h.worker_side.channel();
+    let mut scratch = Vec::new();
+    let command = data::read_command_from_ring(
+        &channel.request,
+        &channel.peer_death,
+        &mut scratch,
+        h.req_space_efd_raw,
+        Some(std::time::Instant::now() + Duration::from_secs(5)),
+    )
+    .unwrap()
+    .unwrap();
+    match command {
+        data::WorkerCommand::Request(req) => assert_eq!(req.script_name, "/x.php"),
+        // What an expired deadline yields, so this is also "nothing arrived".
+        data::WorkerCommand::Retire => panic!("no request reached the ring"),
+    }
+}
+
+#[tokio::test]
+async fn try_read_response_frame_reports_nothing_ready_rather_than_end_of_stream() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+    assert!(
+        h.channel.try_read_response_frame().is_none(),
+        "an empty ring is not end of stream"
+    );
+
+    let channel = h.worker_side.channel();
+    let mut header_pairs = data::HeaderBlob::default();
+    header_pairs.push("X-Test", "1");
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&header_pairs).into(),
+            more: false,
+        },
+        h.resp_data_efd_raw,
+    );
+
+    let got = h
+        .channel
+        .try_read_response_frame()
+        .expect("the frame was published")
+        .unwrap();
+    assert!(matches!(got, WorkerEvent::Headers { status: 200, .. }));
+    assert!(h.channel.try_read_response_frame().is_none());
+}
+
+/// The accumulator outlives a single call, so a run that straddles two
+/// non-blocking reads must still arrive downstream as one frame.
+#[tokio::test]
+async fn a_headers_run_split_across_non_blocking_reads_is_still_joined() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+    let channel = h.worker_side.channel();
+
+    let mut first = data::HeaderBlob::default();
+    first.push("X-One", "1");
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&first).into(),
+            more: true,
+        },
+        h.resp_data_efd_raw,
+    );
+    assert!(
+        h.channel.try_read_response_frame().is_none(),
+        "an unfinished run must not be handed out"
+    );
+
+    let mut second = data::HeaderBlob::default();
+    second.push("X-Two", "2");
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&second).into(),
+            more: false,
+        },
+        h.resp_data_efd_raw,
+    );
+
+    let got = h
+        .channel
+        .try_read_response_frame()
+        .expect("the run finished")
+        .unwrap();
+    let WorkerEvent::Headers { headers, .. } = got else {
+        panic!("expected the joined Headers frame");
+    };
+    let names: Vec<&str> = headers.iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["X-One", "X-Two"]);
+}
+
+/// The cap bounds one request's run, not a worker's whole life: without the
+/// reset, a worker serving enough requests is eventually killed for headers
+/// it never held at once. Reads the counter directly because provoking this
+/// end to end costs two requests of 16 MiB.
+#[tokio::test]
+async fn the_headers_run_budget_is_reset_for_each_request() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+    let channel = h.worker_side.channel();
+
+    let mut header_pairs = data::HeaderBlob::default();
+    header_pairs.push("X-Test", "1");
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&header_pairs).into(),
+            more: false,
+        },
+        h.resp_data_efd_raw,
+    );
+    tokio::time::timeout(Duration::from_secs(5), h.channel.read_response_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.channel.pending_headers_bytes > 0);
+    h.channel.deferred = Some(Some(WorkerEvent::Body(Bytes::from_static(b"stale"))));
+
+    h.channel.write_request(&dummy_request()).await.unwrap();
+    assert_eq!(h.channel.pending_headers_bytes, 0);
+    assert!(
+        h.channel.deferred.is_none(),
+        "a new request must not inherit the previous response's frame"
+    );
+}
+
+/// The non-blocking path is the one `drain_ready` uses right after the
+/// headers, so it is exactly where a flush-displaced frame would go missing.
+#[tokio::test]
+async fn a_non_blocking_read_hands_out_the_frame_a_flush_displaced() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+    let channel = h.worker_side.channel();
+
+    let mut header_pairs = data::HeaderBlob::default();
+    header_pairs.push("X-One", "1");
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&header_pairs).into(),
+            more: true,
+        },
+        h.resp_data_efd_raw,
+    );
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Body(b"hi"),
+        h.resp_data_efd_raw,
+    );
+
+    let got = tokio::time::timeout(Duration::from_secs(5), h.channel.read_response_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(got, WorkerEvent::Headers { .. }));
+
+    let got = h
+        .channel
+        .try_read_response_frame()
+        .expect("the displaced body frame must still be there")
+        .unwrap();
+    assert!(matches!(got, WorkerEvent::Body(ref b) if b.as_ref() == b"hi"));
+}
+
+/// A run can also be ended by the next frame arriving rather than by a
+/// `more: false` one, and the joined headers must still come out ahead of it.
+#[tokio::test]
+async fn a_headers_run_ended_by_a_body_frame_keeps_the_workers_order() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+    let channel = h.worker_side.channel();
+
+    let mut header_pairs = data::HeaderBlob::default();
+    header_pairs.push("X-One", "1");
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Headers {
+            status: 200,
+            headers: (&header_pairs).into(),
+            more: true,
+        },
+        h.resp_data_efd_raw,
+    );
+    write_frame(
+        &channel.response,
+        &channel.peer_death,
+        &data::ResponseFrameRef::Body(b"hi"),
+        h.resp_data_efd_raw,
+    );
+
+    let deadline = Duration::from_secs(5);
+    let got = tokio::time::timeout(deadline, h.channel.read_response_frame())
+        .await
+        .unwrap()
+        .unwrap();
+    let WorkerEvent::Headers { headers, .. } = got else {
+        panic!("the pending run must be flushed before the body frame");
+    };
+    let names: Vec<&str> = headers.iter().map(|(name, _)| name).collect();
+    assert_eq!(names, ["X-One"]);
+
+    let got = tokio::time::timeout(deadline, h.channel.read_response_frame())
+        .await
+        .expect("the body frame the flush displaced must still be handed out")
+        .unwrap();
+    assert!(matches!(got, WorkerEvent::Body(ref b) if b.as_ref() == b"hi"));
+}
+
+#[tokio::test]
+async fn a_normal_small_headers_run_is_reassembled_end_to_end() {
     let mut h = spawn_harness(NO_REAL_WORKER_PID);
     let channel = h.worker_side.channel();
     let peer = &channel.peer_death;
@@ -115,42 +329,32 @@ async fn io_task_reassembles_a_normal_small_headers_run_end_to_end() {
     data::write_worker_done_to_ring(response, peer, h.resp_data_efd_raw).unwrap();
 
     let deadline = Duration::from_secs(5);
-    let got_headers = tokio::time::timeout(deadline, h.response_rx.recv())
+    let got_headers = tokio::time::timeout(deadline, h.channel.read_response_frame())
         .await
-        .unwrap()
         .unwrap()
         .unwrap();
     assert!(matches!(
         got_headers,
-        Some(ResponseFrame::Headers { status: 200, .. })
+        WorkerEvent::Headers { status: 200, .. }
     ));
-    let got_body = tokio::time::timeout(deadline, h.response_rx.recv())
+    let got_body = tokio::time::timeout(deadline, h.channel.read_response_frame())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(matches!(got_body, Some(ResponseFrame::Body(ref b)) if b.as_ref() == b"hi"));
-    let got_end = tokio::time::timeout(deadline, h.response_rx.recv())
+    assert!(matches!(got_body, WorkerEvent::Body(ref b) if b.as_ref() == b"hi"));
+    let got_end = tokio::time::timeout(deadline, h.channel.read_response_frame())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(matches!(
-        got_end,
-        Some(ResponseFrame::End { retiring: false })
-    ));
-    let got_done = tokio::time::timeout(deadline, h.response_rx.recv())
+    assert!(matches!(got_end, WorkerEvent::End { retiring: false }));
+    tokio::time::timeout(deadline, h.channel.read_worker_done())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(got_done.is_none());
-
-    drop(h.request_tx); // let the task end cleanly
 }
 
 #[tokio::test]
-async fn io_task_forwards_a_complete_headers_frame_before_the_worker_sends_anything_else() {
+async fn a_complete_headers_frame_is_forwarded_before_the_worker_sends_anything_else() {
     // `more: false` alone must be enough: inferring the run's end from the
     // next frame instead costs a full ring round-trip of TTFB whenever a
     // script's header() calls and first output are not back-to-back.
@@ -168,14 +372,13 @@ async fn io_task_forwards_a_complete_headers_frame_before_the_worker_sends_anyth
     write_frame(response, peer, &headers, h.resp_data_efd_raw);
 
     let deadline = Duration::from_millis(500);
-    let got_headers = tokio::time::timeout(deadline, h.response_rx.recv())
+    let got_headers = tokio::time::timeout(deadline, h.channel.read_response_frame())
         .await
         .expect("Headers must be forwarded on its own, without waiting for a Body/End frame that was never sent")
-        .unwrap()
         .unwrap();
     assert!(matches!(
         got_headers,
-        Some(ResponseFrame::Headers { status: 200, .. })
+        WorkerEvent::Headers { status: 200, .. }
     ));
 
     // Finish normally so the harness's task ends cleanly.
@@ -192,29 +395,20 @@ async fn io_task_forwards_a_complete_headers_frame_before_the_worker_sends_anyth
         h.resp_data_efd_raw,
     );
     data::write_worker_done_to_ring(response, peer, h.resp_data_efd_raw).unwrap();
-    let got_body = tokio::time::timeout(deadline, h.response_rx.recv())
+    let got_body = tokio::time::timeout(deadline, h.channel.read_response_frame())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(matches!(got_body, Some(ResponseFrame::Body(ref b)) if b.as_ref() == b"hi"));
-    let got_end = tokio::time::timeout(deadline, h.response_rx.recv())
+    assert!(matches!(got_body, WorkerEvent::Body(ref b) if b.as_ref() == b"hi"));
+    let got_end = tokio::time::timeout(deadline, h.channel.read_response_frame())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(matches!(
-        got_end,
-        Some(ResponseFrame::End { retiring: false })
-    ));
-    let got_done = tokio::time::timeout(deadline, h.response_rx.recv())
+    assert!(matches!(got_end, WorkerEvent::End { retiring: false }));
+    tokio::time::timeout(deadline, h.channel.read_worker_done())
         .await
         .unwrap()
-        .unwrap()
         .unwrap();
-    assert!(got_done.is_none());
-
-    drop(h.request_tx);
 }
 
 /// Any byte on the liveness socket is as fatal as EOF. Goes through the real
@@ -267,7 +461,7 @@ impl Drop for ChildGuard {
 }
 
 #[tokio::test]
-async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
+async fn a_worker_that_never_stops_sending_headers_frames_is_rejected() {
     // A `Headers` run is worker-controlled and, unlike `Body`, bounded by no
     // channel capacity. Uses a real disposable child's pid so a wrong or
     // missing kill shows up as a process still alive at the end.
@@ -287,7 +481,7 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
     let h = spawn_harness(child_pid);
     let resp_data_efd_raw = h.resp_data_efd_raw;
     let worker_side = h.worker_side;
-    let mut response_rx = h.response_rx;
+    let mut channel = h.channel;
 
     let big_value = "v".repeat(250_000);
     // The run must never close: a `more: false` frame flushes and clears the
@@ -330,22 +524,22 @@ async fn io_task_rejects_a_worker_that_never_stops_sending_headers_frames() {
             )
             .is_err()
             {
-                return; // peer already gone once io_task bails - fine
+                return; // peer already gone once the reader bails - fine
             }
         }
     });
 
     let deadline = Duration::from_secs(20);
     loop {
-        match tokio::time::timeout(deadline, response_rx.recv())
+        match tokio::time::timeout(deadline, channel.read_response_frame())
             .await
             .expect("should not hang")
         {
-            Some(Err(e)) => {
+            Err(e) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
                 break;
             }
-            Some(Ok(Some(ResponseFrame::Headers { .. }))) => continue, // still within the (temporary) run
+            Ok(WorkerEvent::Headers { .. }) => continue, // still within the (temporary) run
             other => panic!("expected an error once the cap was crossed, got {other:?}"),
         }
     }

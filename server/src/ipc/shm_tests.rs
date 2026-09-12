@@ -41,6 +41,131 @@ fn write_read_roundtrip() {
     assert_eq!(scratch, b"hello");
 }
 
+/// A worker holds this same descriptor for its whole life. Unsealed, it
+/// could shrink the file and turn master's next access past the new end into
+/// SIGBUS - killing the process it is supposed to be isolated from.
+#[test]
+fn the_channel_memfd_cannot_be_resized_by_whoever_holds_it() {
+    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+
+    let (fd, _mapping) = create_channel().unwrap();
+    let raw = fd.as_raw_fd();
+    let full = size_of::<Channel>() as libc::off_t;
+
+    assert_eq!(
+        unsafe { libc::ftruncate(raw, full / 2) },
+        -1,
+        "a worker must not be able to shrink the channel under master"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EPERM)
+    );
+    assert_eq!(unsafe { libc::ftruncate(raw, full * 2) }, -1, "nor grow it");
+
+    // The seal set is closed too, so nothing can be added behind master's
+    // back. Not `F_SEAL_WRITE`, which the live writable mapping already
+    // refuses with EBUSY and so proves nothing about the seal.
+    assert!(
+        fcntl(&fd, FcntlArg::F_ADD_SEALS(SealFlag::F_SEAL_FUTURE_WRITE)).is_err(),
+        "the seal set must itself be sealed"
+    );
+}
+
+#[test]
+fn try_read_frame_reports_an_empty_ring_without_consuming_anything() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+    let mut scratch = Vec::new();
+
+    assert!(!ring.try_read_frame(&mut scratch, peer).unwrap());
+
+    ring.write_frame(b"hello", peer, efd.as_raw_fd()).unwrap();
+    assert!(ring.try_read_frame(&mut scratch, peer).unwrap());
+    assert_eq!(scratch, b"hello");
+    assert!(!ring.try_read_frame(&mut scratch, peer).unwrap());
+}
+
+/// `raw_write_frame` publishes the prefix and the payload with one store, so
+/// this state is unreachable through the ring's own API - but a reader that
+/// trusted the prefix would consume it, leave `read_pos` mid-frame, and then
+/// parse payload bytes as the next frame's length. Constructed by hand
+/// because cancellation safety rests on the read being all-or-nothing.
+#[test]
+fn a_length_prefix_published_without_its_payload_is_refused_not_half_read() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let mut scratch = Vec::new();
+
+    // Six of the eight payload bytes published: enough that a check which
+    // forgot the prefix would accept the frame and read two bytes of
+    // whatever the buffer held.
+    unsafe { ring.copy_at(0, &8u32.to_le_bytes()) };
+    ring.write_pos
+        .store(LEN_PREFIX as u64 + 6, Ordering::Release);
+
+    assert!(matches!(
+        ring.try_read_frame(&mut scratch, peer),
+        Err(RingError::Truncated)
+    ));
+    // Same answer the second time: the first call must not have moved
+    // `read_pos` past the prefix it rejected.
+    assert!(matches!(
+        ring.try_read_frame(&mut scratch, peer),
+        Err(RingError::Truncated)
+    ));
+}
+
+/// `try_read_frame` is the whole non-blocking path, so an empty ring behind
+/// a dead peer must report the death rather than look like "not yet" - a
+/// caller polling it alone would otherwise spin forever.
+#[test]
+fn try_read_frame_reports_a_dead_peer_rather_than_an_empty_ring() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let mut scratch = Vec::new();
+
+    assert!(!ring.try_read_frame(&mut scratch, peer).unwrap());
+    peer.mark_dead();
+    assert!(matches!(
+        ring.try_read_frame(&mut scratch, peer),
+        Err(RingError::PeerGone)
+    ));
+}
+
+/// The sync path reads `buf` behind an acquire load of `write_pos` alone, so
+/// a real producer on another thread is the only way to show that ordering
+/// actually holds.
+#[test]
+fn try_read_frame_never_sees_a_payload_before_its_publisher_finished() {
+    const FRAMES: usize = 20_000;
+    let ring: &Ring<4096> = make_ring();
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+    let efd_raw = efd.as_raw_fd();
+
+    let writer = std::thread::spawn(move || {
+        for i in 0..FRAMES {
+            let payload = [i as u8; 64];
+            ring.write_frame(&payload, peer, efd_raw).unwrap();
+        }
+    });
+
+    let mut scratch = Vec::new();
+    for i in 0..FRAMES {
+        while !ring.try_read_frame(&mut scratch, peer).unwrap() {
+            std::hint::spin_loop();
+        }
+        assert_eq!(scratch.len(), 64, "frame {i} came back the wrong length");
+        assert!(
+            scratch.iter().all(|&b| b == i as u8),
+            "frame {i} was read before its publisher finished writing it"
+        );
+    }
+    writer.join().unwrap();
+}
+
 #[test]
 fn multiple_frames_pipeline_without_reader() {
     let ring: &Ring<64> = make_ring();

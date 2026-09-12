@@ -205,9 +205,9 @@ pub enum ResponseFrame<'a> {
 
 impl ResponseFrame<'_> {
     /// The response path's one unavoidable copy: a decoded frame borrows the
-    /// ring scratch that the next read overwrites, but frames outlive that by
-    /// crossing a channel. The request path needs no equivalent, being
-    /// consumed before the next read.
+    /// ring scratch that the next read overwrites, and a non-blocking sweep
+    /// collects several frames before handing any of them on. The request
+    /// path needs no equivalent, being consumed before the next read.
     pub fn into_owned(self) -> ResponseFrame<'static> {
         match self {
             ResponseFrame::Headers {
@@ -417,6 +417,36 @@ pub async fn write_request_to_ring(
         .map_err(ring_err_to_io)
 }
 
+/// What a non-blocking read of the response ring found. `Empty` is only ever
+/// "nothing published yet"; end of stream is `WorkerDone`.
+pub enum ReadyResponse {
+    Frame(ResponseFrame<'static>),
+    WorkerDone,
+    Empty,
+}
+
+/// Master side, non-blocking. Reports the worker-done marker without
+/// reclaiming on it, which `read_response_frame_from_ring` does and this
+/// cannot: reclaim has to be awaited.
+pub fn try_read_response_frame_from_ring(
+    mapped: &Arc<shm::MappedChannel>,
+    scratch: &mut Vec<u8>,
+) -> std::io::Result<ReadyResponse> {
+    let channel = mapped.channel();
+    if !channel
+        .response
+        .try_read_frame(scratch, &channel.peer_death)
+        .map_err(ring_err_to_io)?
+    {
+        return Ok(ReadyResponse::Empty);
+    }
+    if scratch.is_empty() {
+        return Ok(ReadyResponse::WorkerDone);
+    }
+    let frame: ResponseFrame<'_> = postcard::from_bytes(scratch).map_err(to_io_err)?;
+    Ok(ReadyResponse::Frame(frame.into_owned()))
+}
+
 /// Master side, async. `Ok(None)` is the trailing worker-done marker.
 ///
 /// Reclaims the rings on its way out of that marker, which is the one moment
@@ -457,6 +487,10 @@ pub(crate) fn ring_err_to_io(e: shm::RingError) -> std::io::Error {
         shm::RingError::PeerGone => {
             std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer process is gone")
         }
+        shm::RingError::Truncated => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer published a frame header without its payload",
+        ),
     }
 }
 

@@ -1,18 +1,18 @@
-//! Master-side bridge from the ring protocol onto async. One tokio task per
-//! worker owns the ring calls and parks on an eventfd, so no tokio worker
-//! thread ever blocks on a futex.
+//! Master-side bridge from the ring protocol onto async. Ring calls run on
+//! the caller's own task and park on an eventfd, so no tokio worker thread
+//! ever blocks on a futex.
 
 use super::pool_manager;
 use crate::ipc::control::WorkerReadyFds;
-use crate::ipc::data::{self, PhpRequest, ResponseFrame};
+use crate::ipc::data::{self, PhpRequest, ReadyResponse, ResponseFrame};
 use crate::ipc::shm;
+use bytes::Bytes;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixStream as TokioUnixStream;
-use tokio::sync::mpsc;
 
 /// Bounds one run of `Headers` frames. The run length is worker-controlled,
 /// so leaving it unbounded is an amplification risk against a shared process,
@@ -20,20 +20,54 @@ use tokio::sync::mpsc;
 const MAX_PENDING_HEADERS_BYTES: usize = 16 * 1024 * 1024;
 
 /// One pooled worker's data channel, reused for that worker's whole life.
+///
+/// Every method drives the ring on the calling task, so a caller's timeout
+/// may drop one mid-flight: none publishes half a request or consumes half a
+/// frame, and a partly-joined `Headers` run resumes on the next read.
 pub struct WorkerChannel {
-    /// Unbounded, so sending never blocks and `write_request` can stay sync.
-    /// Carries the request rather than pre-encoded bytes, letting `io_task`
-    /// encode into a buffer it reuses; the `Arc` makes a dispatch retry a
-    /// refcount bump instead of a second encode.
-    request_tx: mpsc::UnboundedSender<Arc<PhpRequest<'static>>>,
-    /// Bounded, so a slow HTTP client backpressures the IO task instead of
-    /// letting it buffer a whole unread response.
-    response_rx: mpsc::Receiver<std::io::Result<Option<ResponseFrame<'static>>>>,
+    pid: u32,
+    mapped: Arc<shm::MappedChannel>,
+    req_space_efd: AsyncFd<OwnedFd>,
+    resp_data_efd: AsyncFd<OwnedFd>,
+    /// Reused for the worker's whole life, so a steady-state request neither
+    /// encodes nor decodes with an allocation.
+    read_scratch: Vec<u8>,
+    encode_scratch: Vec<u8>,
+    /// A run of `Headers` frames, joined so nothing downstream sees the
+    /// split. `None` means no run is in progress.
+    pending_headers: Option<(u16, data::HeaderBlob<'static>)>,
+    pending_headers_bytes: usize,
+    /// The event that flushing a headers run displaced, held so the next read
+    /// hands it out in the order the worker wrote it. `Some(None)` is the
+    /// worker-done marker.
+    deferred: Option<Option<WorkerEvent>>,
     /// A plain flag rather than a `watch`: nothing awaits it, and it is read
     /// on every pop from the idle pool, where an atomic load beats
     /// `watch::Receiver::borrow` taking an internal read lock.
     worker_gone: Arc<AtomicBool>,
-    mapped: Arc<shm::MappedChannel>,
+}
+
+/// One response event, as the rest of master sees it. Distinct from the wire
+/// `ResponseFrame`, whose `more` flag describes a split this side has already
+/// joined back together and must not be able to express afterwards.
+#[derive(Debug)]
+pub enum WorkerEvent {
+    Headers {
+        status: u16,
+        headers: data::HeaderBlob<'static>,
+    },
+    Body(Bytes),
+    End {
+        retiring: bool,
+    },
+}
+
+/// One raw ring frame, after the headers-run accumulator has seen it.
+enum Absorbed {
+    /// Hand this to the caller; `None` is the worker-done marker.
+    Ready(Option<WorkerEvent>),
+    /// Joined onto a run still in progress, so read again.
+    Folded,
 }
 
 /// Dropping a `WorkerChannel` means master is giving up on the worker; the
@@ -51,7 +85,7 @@ impl Drop for WorkerChannel {
 }
 
 impl WorkerChannel {
-    /// Spawns the IO task and liveness watcher, both torn down on drop.
+    /// Spawns the liveness watcher, torn down on drop.
     pub fn new(fds: WorkerReadyFds, pid: u32) -> std::io::Result<Self> {
         let WorkerReadyFds {
             channel: channel_fd,
@@ -60,8 +94,8 @@ impl WorkerChannel {
         } = fds;
         let mapped = Arc::new(shm::map_existing_channel(channel_fd)?);
 
-        // Its own dup'd fds, so it can never notify through a number the IO
-        // task has closed and the OS has reused.
+        // Its own dup'd fds, so it can never notify through a number this
+        // channel has closed and the OS has reused.
         let watcher_notify = notify.try_clone()?;
         let req_space_efd = AsyncFd::new(notify.req_space)?;
         let resp_data_efd = AsyncFd::new(notify.resp_data)?;
@@ -74,67 +108,186 @@ impl WorkerChannel {
             watcher_notify,
         )?;
 
-        let (request_tx, request_rx) = mpsc::unbounded_channel::<Arc<PhpRequest<'static>>>();
-        let (response_tx, response_rx) = mpsc::channel(8);
-        {
-            let mapped = Arc::clone(&mapped);
-            tokio::spawn(io_task(
-                mapped,
-                pid,
-                request_rx,
-                response_tx,
-                req_space_efd,
-                resp_data_efd,
-            ));
-        }
-
         Ok(WorkerChannel {
-            request_tx,
-            response_rx,
-            worker_gone,
+            pid,
             mapped,
+            req_space_efd,
+            resp_data_efd,
+            read_scratch: Vec::new(),
+            encode_scratch: Vec::new(),
+            pending_headers: None,
+            pending_headers_bytes: 0,
+            deferred: None,
+            worker_gone,
         })
     }
 
-    /// Never blocks, so it is safe to call from async code without a timeout
-    /// of its own. The encode happens in `io_task`.
-    pub fn write_request(&self, req: Arc<PhpRequest<'static>>) -> std::io::Result<()> {
-        self.request_tx.send(req).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "worker IO task has exited")
-        })
-    }
-
-    /// The next frame. Callers loop until `End`.
-    pub async fn read_response_frame(&mut self) -> std::io::Result<ResponseFrame<'static>> {
-        match self.response_rx.recv().await {
-            Some(Ok(Some(frame))) => Ok(frame),
-            Some(Ok(None)) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "expected a ResponseFrame, got the trailing worker-done marker instead",
-            )),
-            Some(Err(e)) => Err(e),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "worker IO task has exited",
-            )),
+    /// Bypasses the liveness watcher, so `peer.is_dead()` never becomes true
+    /// on its own whatever `pid` is.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        pid: u32,
+        mapped: Arc<shm::MappedChannel>,
+        req_space_efd: AsyncFd<OwnedFd>,
+        resp_data_efd: AsyncFd<OwnedFd>,
+    ) -> Self {
+        WorkerChannel {
+            pid,
+            mapped,
+            req_space_efd,
+            resp_data_efd,
+            read_scratch: Vec::new(),
+            encode_scratch: Vec::new(),
+            pending_headers: None,
+            pending_headers_bytes: 0,
+            deferred: None,
+            worker_gone: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// A real frame arriving here means the wire desynced, which is a hard
+    /// Publishes one request and resets the per-response state. Waits only
+    /// for ring space before writing in one step, so a caller's timeout
+    /// firing here leaves the worker nothing to read.
+    pub async fn write_request(&mut self, req: &PhpRequest<'_>) -> std::io::Result<()> {
+        self.pending_headers = None;
+        self.pending_headers_bytes = 0;
+        self.deferred = None;
+
+        let Self {
+            mapped,
+            encode_scratch,
+            req_space_efd,
+            ..
+        } = self;
+        let channel = mapped.channel();
+        let encoded = data::encode_request(encode_scratch, req)?;
+        data::write_request_to_ring(
+            &channel.request,
+            &channel.peer_death,
+            encoded,
+            req_space_efd,
+        )
+        .await
+    }
+
+    /// The next frame if the worker has already published one. `None` means
+    /// nothing has arrived yet, never end of stream - a caller that treats it
+    /// as EOF would truncate the response.
+    pub fn try_read_response_frame(&mut self) -> Option<std::io::Result<WorkerEvent>> {
+        if let Some(ready) = self.deferred.take() {
+            return Some(ready.ok_or_else(unexpected_marker));
+        }
+        loop {
+            let Self {
+                mapped,
+                read_scratch,
+                ..
+            } = self;
+            let raw = match data::try_read_response_frame_from_ring(mapped, read_scratch) {
+                Ok(ReadyResponse::Frame(frame)) => Some(frame),
+                Ok(ReadyResponse::WorkerDone) => None,
+                Ok(ReadyResponse::Empty) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            match self.absorb(raw) {
+                Ok(Absorbed::Ready(frame)) => {
+                    return Some(frame.ok_or_else(unexpected_marker));
+                }
+                Ok(Absorbed::Folded) => continue,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+
+    /// The next event. Callers loop until `End`.
+    pub async fn read_response_frame(&mut self) -> std::io::Result<WorkerEvent> {
+        self.next_frame().await?.ok_or_else(unexpected_marker)
+    }
+
+    /// A real event arriving here means the wire desynced, which is a hard
     /// error rather than something to swallow.
     pub async fn read_worker_done(&mut self) -> std::io::Result<()> {
-        match self.response_rx.recv().await {
-            Some(Ok(None)) => Ok(()),
-            Some(Ok(Some(_))) => Err(std::io::Error::new(
+        match self.next_frame().await? {
+            None => Ok(()),
+            Some(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "expected the worker-done marker, got a framed ResponseFrame instead",
-            )),
-            Some(Err(e)) => Err(e),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "worker IO task has exited",
+                "expected the worker-done marker, got a response frame instead",
             )),
         }
+    }
+
+    /// `Ok(None)` is the trailing worker-done marker.
+    async fn next_frame(&mut self) -> std::io::Result<Option<WorkerEvent>> {
+        if let Some(ready) = self.deferred.take() {
+            return Ok(ready);
+        }
+        loop {
+            let Self {
+                mapped,
+                read_scratch,
+                resp_data_efd,
+                ..
+            } = self;
+            let raw =
+                data::read_response_frame_from_ring(mapped, read_scratch, resp_data_efd).await?;
+            if let Absorbed::Ready(frame) = self.absorb(raw)? {
+                return Ok(frame);
+            }
+        }
+    }
+
+    /// Joins a run of `Headers` frames back together, forwarding on the run's
+    /// last frame rather than waiting for the next one to imply the run
+    /// ended: a script whose `header()` calls and first output are not
+    /// back-to-back would otherwise pay a round-trip of TTFB.
+    fn absorb(&mut self, raw: Option<ResponseFrame<'static>>) -> std::io::Result<Absorbed> {
+        let Some(ResponseFrame::Headers {
+            status,
+            headers,
+            more,
+        }) = raw
+        else {
+            let displaced = raw.map(|frame| match frame {
+                ResponseFrame::Body(chunk) => WorkerEvent::Body(Bytes::from(chunk.into_owned())),
+                ResponseFrame::End { retiring } => WorkerEvent::End { retiring },
+                ResponseFrame::Headers { .. } => unreachable!("matched above"),
+            });
+            // A worker that fails mid-run still writes the done marker
+            // straight past End; without this flush its collected headers
+            // would be silently dropped.
+            let Some((status, headers)) = self.pending_headers.take() else {
+                return Ok(Absorbed::Ready(displaced));
+            };
+            self.deferred = Some(displaced);
+            return Ok(Absorbed::Ready(Some(WorkerEvent::Headers {
+                status,
+                headers,
+            })));
+        };
+
+        self.pending_headers_bytes += self.read_scratch.len();
+        if self.pending_headers_bytes > MAX_PENDING_HEADERS_BYTES {
+            // Abandoning the ring is not enough: the worker would park
+            // forever in its untimed wait_for_space, whose only other escape
+            // is real process death.
+            pool_manager::sigkill(self.pid, "worker sent an oversized run of Headers frames");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "worker sent an oversized run of Headers frames",
+            ));
+        }
+        match &mut self.pending_headers {
+            Some((_, acc)) => acc.append(&headers),
+            None => self.pending_headers = Some((status, headers)),
+        }
+        if more {
+            return Ok(Absorbed::Folded);
+        }
+        let (status, headers) = self.pending_headers.take().expect("just inserted above");
+        Ok(Absorbed::Ready(Some(WorkerEvent::Headers {
+            status,
+            headers,
+        })))
     }
 
     /// A worker can retire on its own idle timeout while still parked in the
@@ -144,141 +297,11 @@ impl WorkerChannel {
     }
 }
 
-/// Ends once `request_tx` drops or the ring reports the peer gone, both
-/// fatal for this connection.
-async fn io_task(
-    mapped: Arc<shm::MappedChannel>,
-    pid: u32,
-    mut request_rx: mpsc::UnboundedReceiver<Arc<PhpRequest<'static>>>,
-    response_tx: mpsc::Sender<std::io::Result<Option<ResponseFrame<'static>>>>,
-    req_space_efd: AsyncFd<OwnedFd>,
-    resp_data_efd: AsyncFd<OwnedFd>,
-) {
-    let channel = mapped.channel();
-    let mut scratch = Vec::new();
-    // Both reused for the worker's whole life, so a steady-state request
-    // neither encodes nor decodes with an allocation.
-    let mut encode_scratch = Vec::new();
-    'commands: loop {
-        let Some(req) = request_rx.recv().await else {
-            return;
-        };
-
-        let encoded: &[u8] = match data::encode_request(&mut encode_scratch, &req) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                let _ = response_tx.send(Err(e)).await;
-                return;
-            }
-        };
-        if let Err(e) = data::write_request_to_ring(
-            &channel.request,
-            &channel.peer_death,
-            encoded,
-            &req_space_efd,
-        )
-        .await
-        {
-            let _ = response_tx.send(Err(e)).await;
-            return;
-        }
-        // Accumulates a run of Headers frames so nothing downstream sees the
-        // split. None means no run in progress.
-        let mut pending_headers: Option<(u16, data::HeaderBlob)> = None;
-        let mut pending_headers_bytes: usize = 0;
-        loop {
-            match data::read_response_frame_from_ring(&mapped, &mut scratch, &resp_data_efd).await {
-                Ok(Some(ResponseFrame::Headers {
-                    status,
-                    headers,
-                    more,
-                })) => {
-                    pending_headers_bytes += scratch.len();
-                    if pending_headers_bytes > MAX_PENDING_HEADERS_BYTES {
-                        // Abandoning the ring is not enough: the worker would
-                        // park forever in its untimed wait_for_space, whose
-                        // only other escape is real process death.
-                        pool_manager::sigkill(
-                            pid,
-                            "worker sent an oversized run of Headers frames",
-                        );
-                        let _ = response_tx
-                            .send(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "worker sent an oversized run of Headers frames",
-                            )))
-                            .await;
-                        return;
-                    }
-                    match &mut pending_headers {
-                        Some((_, acc)) => acc.append(&headers),
-                        None => pending_headers = Some((status, headers)),
-                    }
-                    // Forwarding on the run's last frame, rather than waiting
-                    // for the next one to imply the run ended, keeps a script
-                    // whose header() calls and first output are not
-                    // back-to-back from paying a round-trip of TTFB.
-                    if !more {
-                        let (status, headers) =
-                            pending_headers.take().expect("just inserted above");
-                        if response_tx
-                            .send(Ok(Some(ResponseFrame::Headers {
-                                status,
-                                headers,
-                                more: false,
-                            })))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // A worker that fails mid-run still writes this marker
-                    // straight past End; without the flush its collected
-                    // headers would be silently dropped.
-                    if let Some((status, headers)) = pending_headers.take()
-                        && response_tx
-                            .send(Ok(Some(ResponseFrame::Headers {
-                                status,
-                                headers,
-                                more: false,
-                            })))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
-                    if response_tx.send(Ok(None)).await.is_err() {
-                        return;
-                    }
-                    continue 'commands;
-                }
-                Ok(Some(frame)) => {
-                    if let Some((status, headers)) = pending_headers.take()
-                        && response_tx
-                            .send(Ok(Some(ResponseFrame::Headers {
-                                status,
-                                headers,
-                                more: false,
-                            })))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
-                    if response_tx.send(Ok(Some(frame))).await.is_err() {
-                        return;
-                    }
-                }
-                Err(e) => {
-                    let _ = response_tx.send(Err(e)).await;
-                    return;
-                }
-            }
-        }
-    }
+fn unexpected_marker() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "expected a response frame, got the trailing worker-done marker instead",
+    )
 }
 
 /// Watches for the worker's exit: EOF is expected, and any byte arriving is

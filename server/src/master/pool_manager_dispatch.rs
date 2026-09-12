@@ -5,16 +5,51 @@
 //! still reach private fields.
 
 use super::{PoolManager, PooledWorker, TempBodyFile, sigkill};
-use crate::ipc::data::{HeaderBlob, PhpRequest, ResponseFrame};
+use crate::ipc::data::{HeaderBlob, PhpRequest};
+use crate::master::worker_channel::WorkerEvent;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Headers known; the body may still be arriving.
-pub type BodyStream = ReceiverStream<std::io::Result<Bytes>>;
+pub type BodyStream =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
+
+/// Past this a worker is streaming rather than answering, so the rest of its
+/// output belongs on the stream instead of in one buffered reply. One body
+/// frame, which is also the overshoot of a budget checked before each read:
+/// the sweep holds at most two frames however fast the worker refills.
+const MAX_DRAINED_PREFIX_BYTES: usize = crate::worker::COALESCE_FLUSH_THRESHOLD;
+
+/// One buffer for the whole reply, without copying the common case of a
+/// response the worker wrote in a single frame.
+fn join(mut chunks: Vec<Bytes>) -> Bytes {
+    if chunks.len() == 1 {
+        return chunks.pop().expect("just checked");
+    }
+    let mut body = Vec::with_capacity(chunks.iter().map(Bytes::len).sum());
+    for chunk in &chunks {
+        body.extend_from_slice(chunk);
+    }
+    Bytes::from(body)
+}
+
+/// What a non-blocking sweep of the response ring found.
+enum Drained {
+    /// `End` reached: nothing is left for a streaming task to carry.
+    Complete { body: Bytes, retiring: bool },
+    /// Nothing more was ready; `prefix` has to lead the stream.
+    Pending { prefix: Vec<Bytes> },
+    /// The worker broke protocol or the channel failed.
+    Broken {
+        prefix: Vec<Bytes>,
+        error: std::io::Error,
+    },
+}
 
 pub struct StreamedResponse {
     pub status: u16,
@@ -184,9 +219,9 @@ impl PoolManager {
         DispatchOutcome::Failed
     }
 
-    /// Returns once the first Headers frame arrives, handing the rest to a
-    /// task that owns it. `permit` is never dropped here - it goes back
-    /// through `StartAttempt` for a retry to reuse.
+    /// Returns once the first `Headers` frame arrives: whatever the worker
+    /// has already finished goes out with it, and anything still coming is
+    /// carried by a spawned task. Error paths hand `permit` back for a retry.
     async fn start_streaming(
         self: &Arc<Self>,
         mut worker: PooledWorker,
@@ -196,17 +231,16 @@ impl PoolManager {
     ) -> Result<StreamedResponse, StartAttempt> {
         let pid = worker.pid;
         let channel = &mut worker.channel;
-        // write_request never blocks, so one window covers it and the first
-        // response frame together.
+        // One window covers publishing the request and waiting for the first
+        // response frame: a worker that never drains the request ring is as
+        // stuck as one that never answers.
         let first = tokio::time::timeout(self.request_timeout, async {
-            channel.write_request(Arc::clone(req))?;
+            channel.write_request(req).await?;
             channel.read_response_frame().await
         })
         .await;
         let (status, headers) = match first {
-            Ok(Ok(ResponseFrame::Headers {
-                status, headers, ..
-            })) => (status, headers),
+            Ok(Ok(WorkerEvent::Headers { status, headers })) => (status, headers),
             Ok(Ok(_unexpected)) => {
                 return Err(StartAttempt::WorkerUnavailable(
                     std::io::Error::new(
@@ -232,22 +266,101 @@ impl PoolManager {
             }
         };
 
-        // Bounded, so a slow client backpressures the send rather than
-        // hoarding a whole unstreamed response in memory.
-        let (body_tx, body_rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
+        // A short response is usually already queued behind the headers, so
+        // taking what is there without ever waiting lets the whole reply go
+        // out in one write.
+        match Self::drain_ready(channel) {
+            // Must be ready on its first poll: a body that answers Pending
+            // once is a body the head has already gone out without.
+            Drained::Complete { body, retiring } => {
+                let pool = Arc::clone(self);
+                tokio::spawn(async move {
+                    pool.finish_after_end(worker, permit, retiring, body_cleanup)
+                        .await;
+                });
+                Ok(StreamedResponse {
+                    status,
+                    headers,
+                    body: Box::pin(tokio_stream::iter([Ok(body)])),
+                    worker_pid: pid,
+                })
+            }
+            // Already-read bytes still go out, then the error ends the
+            // stream; the worker cannot be pooled after this.
+            Drained::Broken { prefix, error } => {
+                self.kill_worker(pid, permit);
+                drop(body_cleanup);
+                Ok(StreamedResponse {
+                    status,
+                    headers,
+                    body: Box::pin(tokio_stream::iter(
+                        prefix
+                            .into_iter()
+                            .map(Ok)
+                            .chain(std::iter::once(Err(error))),
+                    )),
+                    worker_pid: pid,
+                })
+            }
+            Drained::Pending { prefix } => {
+                // Bounded, so a slow client backpressures the send rather than
+                // hoarding a whole unstreamed response in memory.
+                let (body_tx, body_rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
 
-        let pool = Arc::clone(self);
-        tokio::spawn(async move {
-            pool.drive_stream_to_completion(worker, permit, body_tx, body_cleanup)
-                .await;
-        });
+                let pool = Arc::clone(self);
+                tokio::spawn(async move {
+                    pool.drive_stream_to_completion(worker, permit, body_tx, body_cleanup)
+                        .await;
+                });
 
-        Ok(StreamedResponse {
-            status,
-            headers,
-            body: ReceiverStream::new(body_rx),
-            worker_pid: pid,
-        })
+                let stream = tokio_stream::iter(prefix.into_iter().map(Ok))
+                    .chain(ReceiverStream::new(body_rx));
+                Ok(StreamedResponse {
+                    status,
+                    headers,
+                    body: Box::pin(stream),
+                    worker_pid: pid,
+                })
+            }
+        }
+    }
+
+    /// Takes whatever the worker has already written, without ever waiting:
+    /// a response that is not finished yet must not be delayed for one that
+    /// might be. Bounded because each read frees ring space the worker can
+    /// refill, so an unbounded loop would follow a fast producer instead of
+    /// returning.
+    fn drain_ready(channel: &mut crate::master::worker_channel::WorkerChannel) -> Drained {
+        let mut prefix: Vec<Bytes> = Vec::new();
+        let mut drained = 0;
+        loop {
+            if drained >= MAX_DRAINED_PREFIX_BYTES {
+                return Drained::Pending { prefix };
+            }
+            match channel.try_read_response_frame() {
+                Some(Ok(WorkerEvent::Body(chunk))) => {
+                    drained += chunk.len();
+                    prefix.push(chunk);
+                }
+                Some(Ok(WorkerEvent::End { retiring })) => {
+                    return Drained::Complete {
+                        body: join(prefix),
+                        retiring,
+                    };
+                }
+                Some(Ok(WorkerEvent::Headers { .. })) => {
+                    return Drained::Broken {
+                        prefix,
+                        error: std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "worker sent a second Headers frame, protocol violation",
+                        ),
+                    };
+                }
+                Some(Err(error)) => return Drained::Broken { prefix, error },
+                None => return Drained::Pending { prefix },
+            }
+        }
     }
 
     /// Owns the worker and permit for the rest of the response, returning it
@@ -267,12 +380,8 @@ impl PoolManager {
             match tokio::time::timeout(self.request_timeout, worker.channel.read_response_frame())
                 .await
             {
-                Ok(Ok(ResponseFrame::Body(chunk))) => {
-                    if body_tx
-                        .send(Ok(Bytes::from(chunk.into_owned())))
-                        .await
-                        .is_err()
-                    {
+                Ok(Ok(WorkerEvent::Body(chunk))) => {
+                    if body_tx.send(Ok(chunk)).await.is_err() {
                         // Client gone: the worker's state can no longer be
                         // trusted enough to pool it, but this is not its fault.
                         tracing::debug!(
@@ -284,8 +393,8 @@ impl PoolManager {
                         return;
                     }
                 }
-                Ok(Ok(ResponseFrame::End { retiring })) => break retiring,
-                Ok(Ok(ResponseFrame::Headers { .. })) => {
+                Ok(Ok(WorkerEvent::End { retiring })) => break retiring,
+                Ok(Ok(WorkerEvent::Headers { .. })) => {
                     let _ = body_tx
                         .send(Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -332,7 +441,20 @@ impl PoolManager {
             }
         };
         drop(body_tx); // ends the body stream cleanly (EOF) for the HTTP client
+        self.finish_after_end(worker, permit, retiring, None).await;
+    }
 
+    /// Everything after `End`: the worker may still be running past
+    /// `fastcgi_finish_request()`, so it is not poolable until its done
+    /// marker arrives.
+    async fn finish_after_end(
+        self: Arc<Self>,
+        mut worker: PooledWorker,
+        permit: OwnedSemaphorePermit,
+        retiring: bool,
+        _body_cleanup: Option<TempBodyFile>,
+    ) {
+        let pid = worker.pid;
         if retiring {
             // The worker exits right after this, so there is no done marker
             // coming and nothing to return to the pool.
@@ -395,3 +517,7 @@ impl PoolManager {
         drop(permit);
     }
 }
+
+#[cfg(test)]
+#[path = "pool_manager_dispatch_tests.rs"]
+mod tests;

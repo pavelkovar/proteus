@@ -641,7 +641,7 @@ async fn php_streams_a_single_huge_echo_call_correctly() {
 
 /// A header set too big for one ring frame must not fail the request.
 /// Covers both shapes the splitter handles - many entries, and one large
-/// one - end to end through the real worker and IO task.
+/// one - end to end through a real worker.
 ///
 /// Few, large cookies rather than many small ones: a real HTTP client caps
 /// how many distinct headers it will parse at all, so the total size has to
@@ -1136,6 +1136,45 @@ async fn no_new_privs_can_be_turned_off() {
         .find(|l| l.starts_with("NoNewPrivs:"))
         .unwrap();
     assert_eq!(line.split_whitespace().nth(1), Some("0"), "got: {line}");
+}
+
+/// A script that flushes early and then works on must not have its first
+/// chunk held back until it finishes - which is what collecting a whole
+/// response before answering would do.
+#[tokio::test]
+async fn an_early_flush_still_reaches_the_client_before_the_script_ends() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("early-flush", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    let started = std::time::Instant::now();
+    // A whole-response buffer would push the first chunk out only at the end.
+    let mut resp = reqwest::get(format!("http://127.0.0.1:{}/flush-stream", server.port))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let first = resp.chunk().await.unwrap().expect("no body chunk arrived");
+    let first_at = started.elapsed();
+
+    let mut body = String::from_utf8_lossy(&first).to_string();
+    while let Some(chunk) = resp.chunk().await.unwrap() {
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    let total = started.elapsed();
+
+    assert!(
+        body.contains("chunk-0") && body.contains("chunk-4"),
+        "the whole stream must still arrive: {body:?}"
+    );
+    assert!(
+        total >= Duration::from_millis(700),
+        "the script sleeps between chunks, so this should not have been instant: {total:?}"
+    );
+    assert!(
+        first_at < total / 2,
+        "the first chunk arrived at {first_at:?} of a {total:?} response - it was buffered, \
+         not streamed"
+    );
 }
 
 /// Hitting the pending-headers cap must not simply abandon the response ring
@@ -2368,6 +2407,137 @@ async fn fastcgi_finish_request_responds_early_and_keeps_worker_running() {
     }
 
     let _ = std::fs::remove_file(&marker);
+}
+
+/// After `End` the worker may still be running its script, so the worker and
+/// its permit stay claimed until the done marker arrives - and a client that
+/// hangs up in that window must not shorten it. Otherwise the next request
+/// is handed a worker still executing the previous one.
+#[tokio::test]
+async fn a_client_hanging_up_after_an_early_response_still_waits_out_the_worker() {
+    use std::io::Read;
+
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "fcgifinish-hangup",
+        www.to_str().unwrap(),
+        // One worker, so one permit: a second request can only be served
+        // once this one's whole lifecycle is finished with it.
+        serde_json::json!({ "php": { "processes": { "max": 1, "spare": 1 } } }),
+    )
+    .await;
+
+    let marker = format!("/tmp/fastcgi_finish_marker_{}.txt", server.port);
+    let _ = std::fs::remove_file(&marker);
+
+    let before: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    let worker_pid = before["php"]["workers"][0]["pid"].as_u64().unwrap();
+
+    let started = std::time::Instant::now();
+    let mut sock = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    write!(
+        sock,
+        "GET /fastcgi-finish?marker={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        server.port
+    )
+    .unwrap();
+
+    // Only the headers: hanging up without ever reading the body is the
+    // abort this is about.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 8192, "no end of headers in sight");
+        assert_eq!(sock.read(&mut byte).unwrap(), 1, "connection closed early");
+        head.push(byte[0]);
+    }
+    let answered = started.elapsed();
+    sock.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(sock);
+
+    let head = String::from_utf8_lossy(&head).to_string();
+    assert!(head.starts_with("HTTP/1.1 200"), "got: {head}");
+    assert!(
+        answered < Duration::from_millis(150),
+        "the response should arrive well before the script's 300ms post-response sleep, \
+         took {answered:?}"
+    );
+    assert!(
+        !std::path::Path::new(&marker).exists(),
+        "the script's background work was already over - this raced nothing"
+    );
+
+    let status: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        status["php"]["processes"]["busy"].as_u64(),
+        Some(1),
+        "the worker was pooled while its script was still running: {status}"
+    );
+
+    let marker_body = loop {
+        if let Ok(body) = std::fs::read_to_string(&marker) {
+            break body;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the abandoned script's background work never completed"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        marker_body.contains("background-work-done:true"),
+        "got: {marker_body}"
+    );
+    let _ = std::fs::remove_file(&marker);
+
+    // Same pid, so the hang-up recycled the worker through its lifecycle
+    // rather than killing it and hiding that behind a fresh spawn.
+    let status = loop {
+        let status: serde_json::Value =
+            reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        if status["php"]["processes"]["busy"].as_u64() == Some(0) {
+            break status;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the worker never came back to the pool: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status["php"]["processes"]["idle"].as_u64(), Some(1));
+    assert_eq!(
+        status["php"]["workers"][0]["pid"].as_u64(),
+        Some(worker_pid),
+        "the worker was replaced, not reused: {status}"
+    );
+    let counters = &status["php"]["counters"];
+    assert_eq!(counters["watchdog_kills"].as_u64(), Some(0), "{counters}");
+    assert_eq!(counters["requests_failed"].as_u64(), Some(0), "{counters}");
+
+    // And it still serves, on the very worker the vanished client left behind.
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/", server.port))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
 }
 
 /// Registering the function without an owning module crashes the Optimizer's
