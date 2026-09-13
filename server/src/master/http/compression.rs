@@ -33,7 +33,7 @@ impl Encoding {
     /// only lever left on a live encoder's memory.
     fn level(self, size_hint: Option<u64>) -> i32 {
         match self {
-            Encoding::Brotli => 4,
+            Encoding::Brotli => 2,
             Encoding::Zstd if size_hint.is_none() => 1,
             Encoding::Zstd => 3,
             Encoding::Gzip => 3,

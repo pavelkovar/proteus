@@ -70,7 +70,16 @@ async fn start_server(name: &str, php_root: &str, overrides: serde_json::Value) 
             "queue": { "timeout": 2 }
         }
     });
+    // A second listen address cannot come through `merge_json`: that would
+    // replace the array and lose the port the harness connects on.
+    if let Some(extra) = overrides.get("listen_extra").and_then(|v| v.as_u64()) {
+        config["listen"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(format!("127.0.0.1:{extra}")));
+    }
     merge_json(&mut config, overrides);
+    config.as_object_mut().unwrap().remove("listen_extra");
 
     let config_path = std::env::temp_dir().join(format!("test-config-{name}.json"));
     std::fs::File::create(&config_path)
@@ -1798,6 +1807,55 @@ async fn watchdog_kills_hung_worker_and_returns_504() {
 /// A failed read of an already-dead worker must count as a failure, not a
 /// watchdog kill, which would mean master decided to kill a worker it
 /// believed alive.
+/// A client that goes away mid-script must not cost the pool a worker: the
+/// checked-out worker is owned by the connection's own task, and losing its
+/// slot lowers `processes.max` for the rest of the process's life.
+#[tokio::test]
+async fn a_client_that_disconnects_mid_script_leaves_the_pool_at_full_strength() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "disconnect-mid-script",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "processes": { "max": 2, "spare": 2 } } }),
+    )
+    .await;
+
+    let before = status_json(&server).await;
+    assert_eq!(before["php"]["processes"]["idle"], 2);
+
+    // /slow sleeps well past this, so the connection dies while the script
+    // still holds the worker.
+    let client = reqwest::Client::new();
+    let cut_off = tokio::time::timeout(
+        Duration::from_millis(100),
+        client
+            .get(format!("http://127.0.0.1:{}/slow", server.port))
+            .send(),
+    )
+    .await;
+    assert!(cut_off.is_err(), "the request completed instead of being cut off");
+
+    let mut status = serde_json::Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        status = status_json(&server).await;
+        if status["php"]["processes"]["idle"] == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        status["php"]["processes"]["idle"], 2,
+        "pool never returned to spare after an abandoned request: {status}"
+    );
+    assert_eq!(
+        status["php"]["counters"]["workers_abandoned"], 1,
+        "the disconnect should be accounted for, not silently absorbed: {status}"
+    );
+    // The reaper is a backstop for deaths master cannot observe; reaching it
+    // here would mean the release path missed this one.
+    assert_eq!(status["php"]["counters"]["workers_reaped_dead"], 0);
+}
+
 #[tokio::test]
 async fn worker_killed_mid_stream_ends_the_response_and_pool_recovers() {
     let www = fixtures_dir().join("www");
@@ -3054,7 +3112,7 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
     );
     let resp_body = resp.text().await.unwrap();
     assert!(
-        resp_body.contains("failed to read request body"),
+        resp_body.contains("500 Internal Server Error"),
         "must be the server's own synthesized error, not anything PHP-generated: got {resp_body:?}"
     );
 
@@ -3109,7 +3167,7 @@ async fn a_request_body_that_disconnects_mid_transfer_fails_the_request() {
     let response = String::from_utf8_lossy(&response);
     assert!(response.starts_with("HTTP/1.1 500"), "got: {response}");
     assert!(
-        response.contains("failed to read request body"),
+        response.contains("500 Internal Server Error"),
         "must be the server's own synthesized error, not anything PHP-generated: got {response}"
     );
 }
@@ -3170,6 +3228,75 @@ async fn uncaught_error_forces_a_500() {
 /// SIGTERM must drain, not just die: an in-flight request has to get
 /// its real response, not a cut-off connection, and the process must then
 /// actually exit on its own within its configured grace period.
+/// Accepting is raced against shutdown, but so is the wait for a connection
+/// permit: with every permit held by a live keep-alive, that wait is unbounded,
+/// and an accept loop stuck in it never releases what shutdown is waiting on.
+#[tokio::test]
+async fn sigterm_exits_with_every_connection_permit_taken() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let www = fixtures_dir().join("www");
+    let mut server = start_server(
+        "sigterm-permits-taken",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            // One permit, and long enough that the holder cannot time out and
+            // hand it back on its own.
+            "connection": { "max": 1, "idle_timeout": 3600 },
+            "php": { "shutdown": { "grace_period_seconds": 3 } }
+        }),
+    )
+    .await;
+
+    // Holds the only permit: served to completion, then kept open and idle, so
+    // the drain has nothing of its own left to wait for.
+    let mut held = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .expect("connect");
+    held.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .expect("write");
+    let mut head = [0u8; 12];
+    tokio::time::timeout(Duration::from_secs(5), held.read_exact(&mut head))
+        .await
+        .expect("no response on the first connection")
+        .expect("read");
+
+    // Accepted, then parked waiting for the permit the first one holds.
+    let mut waiting = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
+        .await
+        .expect("connect");
+    waiting
+        .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .expect("write");
+    let mut byte = [0u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), waiting.read_exact(&mut byte))
+            .await
+            .is_err(),
+        "the second connection was served, so the permit was not held"
+    );
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(server.child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("failed to send SIGTERM");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(_)) = server.child.try_wait() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "master never exited: an accept loop is still waiting for a permit"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn sigterm_drains_in_flight_request_before_exiting() {
     let www = fixtures_dir().join("www");
@@ -4624,5 +4751,333 @@ async fn read_one_chunked_response(
         if acc.windows(7).any(|w| w == b"\r\n0\r\n\r\n") {
             return Some(String::from_utf8_lossy(&acc).into_owned());
         }
+    }
+}
+
+/// An unservable request is a property of the request, not of the worker that
+/// would have taken it. The head cap refuses it before any worker is involved,
+/// so the pool must be untouched and the counters quiet.
+#[tokio::test]
+async fn an_oversized_request_is_refused_without_costing_the_pool_a_worker() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("oversized-req", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    let pids_before = worker_pids(&server).await;
+    assert!(!pids_before.is_empty(), "expected pre-spawned spare workers");
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/echo-body", server.port))
+        .header("X-Big", "h".repeat(180 * 1024))
+        .body("b".repeat(31 * 1024))
+        .send()
+        .await
+        .expect("the connection must survive an unservable request");
+    assert_eq!(
+        response.status(),
+        431,
+        "an unservable request must be refused as a client error, not a 500"
+    );
+
+    let status: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        status["php"]["counters"]["prototype_respawns_total"], 0,
+        "refusing a request must not read as a sick prototype"
+    );
+    assert_eq!(
+        status["php"]["counters"]["requests_failed"], 0,
+        "a refused request is not a dispatch failure"
+    );
+
+    assert_eq!(
+        worker_pids(&server).await,
+        pids_before,
+        "the pool must be exactly as it was"
+    );
+
+    // And the pool still serves.
+    let ok = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/echo-body", server.port))
+        .body("b".repeat(1024))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.bytes().await.unwrap().len(), 1024);
+}
+
+/// Either side of the inline/spill boundary must reach PHP byte-exact: the
+/// ring carries small bodies in the request frame and large ones by filename.
+#[tokio::test]
+async fn bodies_on_both_sides_of_the_spill_threshold_reach_php_intact() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("spill-boundary", www.to_str().unwrap(), serde_json::json!({})).await;
+    let client = reqwest::Client::new();
+
+    // Straddling `BODY_MEMORY_THRESHOLD`, which this crate cannot see: keep
+    // these either side of it if it moves.
+    for size in [1024, 62 * 1024, 63 * 1024, 64 * 1024, 256 * 1024] {
+        let response = client
+            .post(format!("http://127.0.0.1:{}/echo-body", server.port))
+            .body("b".repeat(size))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{size} byte body failed: {e}"));
+        assert_eq!(response.status(), 200, "{size} byte body");
+        assert_eq!(
+            response.bytes().await.unwrap().len(),
+            size,
+            "{size} byte body did not reach PHP whole"
+        );
+    }
+}
+
+/// A worker's eventfds join the reactor of whichever runtime dispatches to it
+/// and leave when it is returned, so a worker moves between runtimes over its
+/// life. Fresh connections spread across cores, which is what moves it.
+#[tokio::test]
+async fn workers_survive_being_dispatched_from_one_runtime_after_another() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "runtime-hopping",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "processes": { "max": 4, "spare": 2 } } }),
+    )
+    .await;
+
+    for round in 0..8 {
+        let mut inflight = Vec::new();
+        for i in 0..16 {
+            // A client of its own each time, so every request opens a fresh
+            // connection rather than reusing one runtime's keep-alive.
+            let url = format!("http://127.0.0.1:{}/echo-body", server.port);
+            inflight.push(tokio::spawn(async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .body(format!("round{round}-req{i}"))
+                    .send()
+                    .await?
+                    .text()
+                    .await
+            }));
+        }
+        for (i, task) in inflight.into_iter().enumerate() {
+            let body = task
+                .await
+                .expect("request task panicked")
+                .unwrap_or_else(|e| panic!("round {round} request {i} failed: {e}"));
+            assert_eq!(
+                body,
+                format!("round{round}-req{i}"),
+                "round {round} request {i} came back wrong"
+            );
+        }
+    }
+
+    let status: serde_json::Value =
+        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(
+        status["php"]["counters"]["prototype_respawns_total"], 0,
+        "moving workers between runtimes must not look like a sick prototype"
+    );
+    assert_eq!(
+        status["php"]["counters"]["workers_reaped_dead"], 0,
+        "no worker should have died from being dispatched on a different runtime"
+    );
+    assert_eq!(
+        status["php"]["processes"]["max"], 4,
+        "the pool must still be at full strength"
+    );
+}
+
+/// Every core accepts on every configured address, so a second address is a
+/// second accept loop per core rather than a second set of threads. A core that
+/// only ever ran the first one would leave the second served by nobody.
+#[tokio::test]
+async fn every_configured_address_is_served() {
+    let www = fixtures_dir().join("www");
+    let second = next_port();
+    let server = start_server(
+        "multi-listen",
+        www.to_str().unwrap(),
+        serde_json::json!({ "listen_extra": second }),
+    )
+    .await;
+
+    // Enough requests that the kernel spreads them over more than one core's
+    // socket; a per-core mistake would show as a hang on some of them.
+    for _ in 0..20 {
+        for port in [server.port, second] {
+            let response = tokio::time::timeout(
+                Duration::from_secs(5),
+                reqwest::get(format!("http://127.0.0.1:{port}/app")),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("port {port} never answered"))
+            .unwrap_or_else(|e| panic!("port {port} failed: {e}"));
+            assert_eq!(response.status(), 200, "port {port}");
+        }
+    }
+}
+
+/// The body fd goes only after its request frame is on the ring, so a frame
+/// that failed to go leaves nothing queued - otherwise the next spilled body
+/// picks up the wrong fd and serves another client's bytes.
+#[tokio::test]
+async fn a_refused_request_leaves_no_body_fd_for_the_next_one_to_pick_up() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("body-fd-order", www.to_str().unwrap(), serde_json::json!({})).await;
+    let client = reqwest::Client::new();
+
+    // Spilled body plus headers too big for a ring frame: the frame is
+    // refused after the body file already exists.
+    let refused = client
+        .post(format!("http://127.0.0.1:{}/echo-body", server.port))
+        // One entry, so it cannot be split across frames and is genuinely
+        // unservable rather than merely large.
+        .header("X-Big", "h".repeat(180 * 1024))
+        .body("a".repeat(64 * 1024))
+        .send()
+        .await
+        .expect("the connection must survive a refused request");
+    assert_eq!(
+        refused.status(),
+        431,
+        "an unservable request must be refused as a client error"
+    );
+
+    // The next spilled body must be this request's own, byte for byte.
+    let mine = "b".repeat(64 * 1024);
+    let response = client
+        .post(format!("http://127.0.0.1:{}/echo-body", server.port))
+        .body(mine.clone())
+        .send()
+        .await
+        .expect("the pool must still serve");
+    assert_eq!(response.status(), 200);
+    let got = response.text().await.unwrap();
+    assert_eq!(
+        got.len(),
+        mine.len(),
+        "the body that came back is the wrong length"
+    );
+    assert_eq!(got, mine, "a stale body fd was picked up by the next request");
+}
+
+/// The head cap is what keeps a request inside one ring frame, so it has to
+/// hold: a header set past it is refused before any of this reaches a worker,
+/// and one just under it is served whole.
+#[tokio::test]
+async fn the_request_head_cap_holds_on_both_sides() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("head-cap", www.to_str().unwrap(), serde_json::json!({})).await;
+    let pids_before = worker_pids(&server).await;
+
+    // Comfortably inside the cap, and each value carries its own index so PHP
+    // catches a header lost or reordered on the way.
+    const PROBES: usize = 16;
+    let values: Vec<String> = (0..PROBES)
+        .map(|i| format!("{i}-{}", "v".repeat(4 * 1024)))
+        .collect();
+    let mut request =
+        reqwest::Client::new().get(format!("http://127.0.0.1:{}/probe-headers", server.port));
+    for (i, v) in values.iter().enumerate() {
+        request = request.header(format!("X-Probe-{i}"), v);
+    }
+    let response = request.send().await.expect("a head under the cap must serve");
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.text().await.unwrap(),
+        format!("ok:{PROBES}"),
+        "the header set did not reach PHP whole"
+    );
+
+    // Past the cap: refused before a worker is ever involved.
+    let mut oversized =
+        reqwest::Client::new().get(format!("http://127.0.0.1:{}/probe-headers", server.port));
+    for i in 0..40 {
+        oversized = oversized.header(format!("X-Big-{i}"), "v".repeat(4 * 1024));
+    }
+    let refused = oversized
+        .send()
+        .await
+        .expect("the connection must survive a refused head");
+    assert_eq!(refused.status(), 431);
+    assert_eq!(
+        worker_pids(&server).await,
+        pids_before,
+        "a head refused at the door must cost the pool nothing"
+    );
+}
+
+/// One header far past the cap: refused like any other oversized head, and
+/// still without costing the pool a worker.
+#[tokio::test]
+async fn one_indivisible_header_value_is_still_refused() {
+    let www = fixtures_dir().join("www");
+    let server =
+        start_server("header-indivisible", www.to_str().unwrap(), serde_json::json!({})).await;
+    let pids_before = worker_pids(&server).await;
+
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/app", server.port))
+        .header("X-Big", "h".repeat(200 * 1024))
+        .send()
+        .await
+        .expect("the connection must survive");
+    assert_eq!(response.status(), 431);
+    assert_eq!(
+        worker_pids(&server).await,
+        pids_before,
+        "refusing must still cost no worker"
+    );
+}
+
+/// `QUERY_STRING` is no longer carried on the wire: the worker takes it from
+/// `REQUEST_URI` past the first `?`. PHP must not be able to tell.
+#[tokio::test]
+async fn query_string_matches_the_request_uri_it_is_derived_from() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("cgi-vars", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    for (target, want_query, want_a) in [
+        ("/cgi-vars?a=1&b=two", "a=1&b=two", "1"),
+        ("/cgi-vars", "", "MISSING"),
+        // A bare `?` and an encoded one in a value: the split is on the first
+        // `?` only, and what follows is passed through untouched.
+        ("/cgi-vars?", "", "MISSING"),
+        ("/cgi-vars?a=x%3Fy&c=3", "a=x%3Fy&c=3", "x?y"),
+        // A second `?` is ordinary query data: the split is on the first one
+        // only, so everything after it goes through as-is.
+        ("/cgi-vars?a=1?b=2", "a=1?b=2", "1?b=2"),
+    ] {
+        let body = reqwest::get(format!("http://127.0.0.1:{}{target}", server.port))
+            .await
+            .unwrap_or_else(|e| panic!("{target}: {e}"))
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains(&format!("uri={target}\n")),
+            "{target}: REQUEST_URI wrong, got {body:?}"
+        );
+        assert!(
+            body.contains(&format!("query={want_query}\n")),
+            "{target}: QUERY_STRING wrong, got {body:?}"
+        );
+        assert!(
+            body.contains(&format!("get_a={want_a}\n")),
+            "{target}: $_GET did not parse, got {body:?}"
+        );
     }
 }

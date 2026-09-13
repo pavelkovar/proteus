@@ -7,6 +7,7 @@ fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
     let (control_sock, _unused_other_end) = UnixSeqpacket::pair().unwrap();
     PoolManager {
         control: Mutex::new(control_sock),
+        control_rt: tokio::runtime::Handle::current(),
         idle: IdleStack::new(4),
         semaphore: Arc::new(Semaphore::new(1)),
         max_workers: 1,
@@ -22,9 +23,12 @@ fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
         watchdog_kills: AtomicU64::new(0),
         queue_timeouts: AtomicU64::new(0),
         dispatch_failed: AtomicU64::new(0),
+        requests_too_large: AtomicU64::new(0),
         workers_spawned: AtomicU64::new(0),
         recycled_request_limit: AtomicU64::new(0),
         recycled_idle_timeout: AtomicU64::new(0),
+        workers_reaped_dead: AtomicU64::new(0),
+        workers_abandoned: AtomicU64::new(0),
         prototype_child: StdMutex::new(PrototypeHandle::new(prototype_child)),
         php_mod_path: String::new(),
         max_requests: 500,
@@ -322,5 +326,114 @@ async fn replacing_an_already_exited_prototype_just_reaps_it() {
         "an exited prototype must not linger"
     );
 
+    reap_tracked_prototype(&pool);
+}
+
+fn unused_body_socket() -> std::os::fd::OwnedFd {
+    let (a, _b) = nix::sys::socket::socketpair(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::SeqPacket,
+        None,
+        nix::sys::socket::SockFlag::empty(),
+    )
+    .expect("socketpair");
+    a
+}
+
+fn idle_worker(pool: &PoolManager, pid: u32, retired: bool) -> PooledWorker {
+    let (fd, _worker_side) = crate::ipc::shm::create_channel().unwrap();
+    let mapped = crate::ipc::shm::map_existing_channel(fd).unwrap();
+    let channel = crate::master::worker_channel::WorkerChannel::for_test(
+        pid,
+        Arc::new(mapped),
+        crate::ipc::shm::NotifyEfds {
+            req_space: crate::ipc::shm::create_notify_eventfd().unwrap(),
+            resp_data: crate::ipc::shm::create_notify_eventfd().unwrap(),
+        },
+        unused_body_socket(),
+    );
+    if retired {
+        channel.mark_worker_gone_for_test();
+    }
+    let slot = pool.idle.claim_slot().expect("a free slot");
+    PooledWorker {
+        channel,
+        pid,
+        meta: Arc::new(WorkerMeta::new(slot, pool.started_at, pool.started_at)),
+    }
+}
+
+/// The idle stack is LIFO, so a worker pushed straight back is the next one
+/// popped. A sweep that does that only ever sees the top of the stack, and a
+/// worker that retired underneath it is reported idle forever.
+#[tokio::test]
+async fn a_retired_worker_below_the_top_of_the_idle_stack_is_still_reaped() {
+    let child = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
+    let pool = make_test_pool_manager(child);
+
+    // Pushed first, so it ends up at the bottom; the two live ones cover it.
+    for (pid, retired) in [(101, true), (102, false), (103, false)] {
+        let worker = idle_worker(&pool, pid, retired);
+        pool.idle.push(worker.meta.slot, worker);
+    }
+    assert_eq!(pool.idle.len(), 3);
+
+    pool.sweep_idle_workers().await;
+
+    assert_eq!(
+        pool.idle.len(),
+        2,
+        "the retired worker under the live ones was never looked at"
+    );
+    assert_eq!(pool.recycled_idle_timeout.load(Relaxed), 1);
+    reap_tracked_prototype(&pool);
+}
+
+/// Workers are tracked by pid, and the OS reuses pids. An entry displaced by
+/// a new worker takes its slot with it unless the slot is handed back, and the
+/// pool's ceiling drops by one for good every time that happens.
+#[tokio::test]
+async fn reusing_a_pid_that_was_never_reaped_gives_its_slot_back() {
+    let child = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .unwrap();
+    let pool = make_test_pool_manager(child);
+    let free_at_rest = pool.idle.claim_slot().map(|s| {
+        pool.idle.release_slot(s);
+        s
+    });
+    assert!(free_at_rest.is_some(), "the fixture must start with a free slot");
+
+    // A worker that died without anyone noticing: its entry is still tracked
+    // and its slot is out of circulation.
+    const PID: u32 = 4242;
+    let stale_slot = pool.idle.claim_slot().expect("a free slot");
+    pool.track_worker(
+        PID,
+        Arc::new(WorkerMeta::new(stale_slot, pool.started_at, pool.started_at)),
+    );
+
+    // The same pid comes back on a fresh worker, through the path a real
+    // spawn takes.
+    let new_slot = pool.idle.claim_slot().expect("a second free slot");
+    pool.track_worker(
+        PID,
+        Arc::new(WorkerMeta::new(new_slot, pool.started_at, pool.started_at)),
+    );
+
+    // Both slots must be reachable again once the new worker gives its own up.
+    pool.idle.release_slot(new_slot);
+    let mut reclaimed = Vec::new();
+    while let Some(s) = pool.idle.claim_slot() {
+        reclaimed.push(s);
+    }
+    assert!(
+        reclaimed.contains(&stale_slot),
+        "the displaced entry's slot never came back: {reclaimed:?}"
+    );
     reap_tracked_prototype(&pool);
 }

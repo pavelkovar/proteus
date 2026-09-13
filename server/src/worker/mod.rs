@@ -45,6 +45,7 @@ fn die_with_parent(_expected_parent: nix::unistd::Pid) {}
 /// `fork()` - see `die_with_parent`.
 pub(crate) fn run(
     _liveness: OwnedFd,
+    body_socket: OwnedFd,
     channel: shm::MappedChannel,
     phpconn: &PhpConn,
     max_requests: u32,
@@ -66,6 +67,11 @@ pub(crate) fn run(
     let mut scratch = data::RingScratch::default();
 
     loop {
+        // At the top, not the tail: `req` borrows `scratch.read` for the rest
+        // of the iteration, and a worker parked below should hold the shrunk
+        // capacity rather than its last peak.
+        scratch.shrink();
+
         let deadline = idle_timeout.map(|timeout| std::time::Instant::now() + timeout);
         let req = match data::read_command_from_ring(
             &channel.request,
@@ -86,6 +92,18 @@ pub(crate) fn run(
                 tracing::warn!(r#type = "worker", pid, error = %e, "read_command_from_ring failed");
                 break;
             }
+        };
+        // Master sends the fd only after the frame it belongs to is on the
+        // ring, so by the time this runs it is either here or on its way.
+        let body_fd = match req.body {
+            data::RequestBody::File { .. } => match recv_body_fd(&body_socket) {
+                Ok(fd) => Some(fd),
+                Err(e) => {
+                    tracing::warn!(r#type = "worker", pid, error = %e, "no fd arrived for a spilled request body");
+                    break;
+                }
+            },
+            data::RequestBody::Inline(_) => None,
         };
         served += 1;
         // Computed before execute_file, because `End` can fire well ahead of
@@ -132,7 +150,12 @@ pub(crate) fn run(
                 write_failed = true;
             }
         };
-        let result = phpconn.execute_file(&req.script_path, &req, &mut on_chunk);
+        let result = phpconn.execute_file(
+            &req.script_path,
+            &req,
+            body_fd.as_ref().map(std::os::fd::AsFd::as_fd),
+            &mut on_chunk,
+        );
 
         // Unconditional, right after execute_file truly returns: this marker
         // is the only thing that tells master the worker is free again.
@@ -162,4 +185,35 @@ pub(crate) fn run(
             break;
         }
     }
+}
+
+/// The body fd master sent for this request. Blocking: master has already
+/// written the frame, so it is sending or has sent.
+fn recv_body_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
+    use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    let mut buf = [0u8; 8];
+    let mut iov = [std::io::IoSliceMut::new(&mut buf)];
+    let mut cmsg = nix::cmsg_space!([std::os::fd::RawFd; 1]);
+    let msg = recvmsg::<()>(
+        socket.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg),
+        MsgFlags::empty(),
+    )
+    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    for c in msg
+        .cmsgs()
+        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?
+    {
+        if let ControlMessageOwned::ScmRights(fds) = c
+            && let Some(&fd) = fds.first()
+        {
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "body message carried no fd",
+    ))
 }

@@ -44,7 +44,11 @@ fn version_str(version: Version) -> &'static str {
 
 /// Bodies above this spill to a temp file. Distinct from `max_body_size`,
 /// which is the hard cap.
-const BODY_MEMORY_THRESHOLD: usize = 256 * 1024; // 256 KiB
+///
+/// Bounded by `connection.max` times this, which is the heap a flood of
+/// concurrent uploads can pin, not by the ring - spilling costs a file, an fd
+/// handover and a read back, so the only reason not to go higher is that heap.
+pub(crate) const BODY_MEMORY_THRESHOLD: usize = 63 * 1024; // 63 KiB
 
 /// How much a spilled body gathers before reaching the file. Every write to
 /// a `tokio::fs::File` is its own trip through the blocking pool, so writing
@@ -68,7 +72,7 @@ enum CollectedBody {
     /// Counted as bytes arrive rather than stat()ed later, CONTENT_LENGTH
     /// being needed before the file is ever opened.
     Spilled {
-        path: PathBuf,
+        file: std::fs::File,
         len: u64,
     },
 }
@@ -97,25 +101,16 @@ async fn collect_body_streaming(
 ) -> Result<CollectedBody, BodyCollectError> {
     let mut limited = Limited::new(body, max_body_size);
     let mut inline: Vec<u8> = Vec::new();
-    let mut spilled: Option<(tokio::fs::File, PathBuf)> = None;
+    let mut spilled: Option<tokio::fs::File> = None;
     let mut pending: Vec<u8> = Vec::new();
     let mut total_len: u64 = 0;
 
-    let cleanup_on_error = |spilled: &Option<(tokio::fs::File, PathBuf)>| {
-        if let Some((_, path)) = spilled {
-            let path = path.clone();
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(&path).await;
-            });
-        }
-    };
 
     loop {
         let next = match read_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, limited.frame()).await {
                 Ok(next) => next,
                 Err(_) => {
-                    cleanup_on_error(&spilled);
                     return Err(BodyCollectError::Stalled);
                 }
             },
@@ -125,11 +120,9 @@ async fn collect_body_streaming(
             None => break,
             Some(Ok(frame)) => frame,
             Some(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
-                cleanup_on_error(&spilled);
                 return Err(BodyCollectError::TooLarge);
             }
             Some(Err(_)) => {
-                cleanup_on_error(&spilled);
                 return Err(BodyCollectError::Io);
             }
         };
@@ -138,12 +131,11 @@ async fn collect_body_streaming(
         };
         total_len += data.len() as u64;
 
-        if let Some((file, _)) = spilled.as_mut() {
+        if let Some(file) = spilled.as_mut() {
             pending.extend_from_slice(&data);
             if pending.len() >= SPILL_WRITE_THRESHOLD {
                 if let Err(e) = file.write_all(&pending).await {
                     tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-                    cleanup_on_error(&spilled);
                     return Err(BodyCollectError::Io);
                 }
                 pending.clear();
@@ -154,11 +146,15 @@ async fn collect_body_streaming(
         inline.extend_from_slice(&data);
         if inline.len() > BODY_MEMORY_THRESHOLD {
             let path = temp_body_path();
-            // The name is predictable, so O_EXCL is what refuses a planted
-            // symlink; the mode keeps it from being briefly world-readable
-            // mid-upload.
+            // `create_new` is O_EXCL, which is what refuses a symlink planted
+            // at this predictable name. Readable because the worker reads
+            // through this same open file description.
             let mut open_options = tokio::fs::OpenOptions::new();
-            open_options.write(true).create_new(true).mode(0o600);
+            open_options
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600);
             let mut file = match open_options.open(&path).await {
                 Ok(f) => f,
                 Err(e) => {
@@ -166,34 +162,55 @@ async fn collect_body_streaming(
                     return Err(BodyCollectError::Io);
                 }
             };
+            // Immediately: from here the body has no name, so nothing can open
+            // it, replace it, or need cleaning up - closing the fd is the
+            // whole of it.
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                // Someone else got there first, which is the state wanted.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // The name outlives this request: nothing later knows it, and
+                // retrying the call that just failed would not help.
+                Err(e) => {
+                    tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "could not unlink the spilled request body, it will be left behind");
+                    return Err(BodyCollectError::Io);
+                }
+            }
             if let Err(e) = file.write_all(&inline).await {
                 tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-                let _ = tokio::fs::remove_file(&path).await;
                 return Err(BodyCollectError::Io);
             }
             inline.clear();
             inline.shrink_to_fit(); // don't hoard BODY_MEMORY_THRESHOLD bytes for nothing
-            spilled = Some((file, path));
+            spilled = Some(file);
         }
     }
 
     // The tail is under the threshold by definition, so without this the file
     // would be short of the length already counted into `total_len`.
     let tail = match spilled.as_mut() {
-        Some((file, _)) => file.write_all(&pending).await,
+        Some(file) => file.write_all(&pending).await,
         None => Ok(()),
     };
     if let Err(e) = tail {
         tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-        cleanup_on_error(&spilled);
         return Err(BodyCollectError::Io);
     }
 
     Ok(match spilled {
-        Some((_, path)) => CollectedBody::Spilled {
-            path,
-            len: total_len,
-        },
+        Some(mut file) => {
+            // The worker inherits this open file description, offset included,
+            // so it has to start at the beginning.
+            use tokio::io::AsyncSeekExt as _;
+            if let Err(e) = file.rewind().await {
+                tracing::warn!(r#type = "controller", error = %e, "failed rewinding spilled request body");
+                return Err(BodyCollectError::Io);
+            }
+            CollectedBody::Spilled {
+                file: file.into_std().await,
+                len: total_len,
+            }
+        }
         None => CollectedBody::Inline(inline),
     })
 }
@@ -220,13 +237,6 @@ pub(crate) async fn build_php_request(
         .path_and_query()
         .map(|pq| pq.to_string())
         .unwrap_or_else(|| path.to_string());
-    let query_string = req.uri().query().unwrap_or("").to_string();
-    let content_type = req
-        .headers()
-        .get(hyper::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     // One sized allocation for the whole set; the per-entry term covers the
     // two NUL terminators.
     let header_bytes: usize = req
@@ -258,41 +268,12 @@ pub(crate) async fn build_php_request(
     .await
     {
         Ok(CollectedBody::Inline(bytes)) => (RequestBody::Inline(Cow::Owned(bytes)), None),
-        Ok(CollectedBody::Spilled { path, len }) => {
-            // Master created the file as itself, so it must be handed over.
-            // Skipped when the worker shares master's identity.
-            let (uid, gid) = state.pool.worker_uid_gid();
-            if (uid, gid)
-                != (
-                    nix::unistd::getuid().as_raw(),
-                    nix::unistd::getgid().as_raw(),
-                )
-                && let Err(e) = nix::unistd::chown(
-                    &path,
-                    Some(nix::unistd::Uid::from_raw(uid)),
-                    Some(nix::unistd::Gid::from_raw(gid)),
-                )
-            {
-                tracing::warn!(r#type = "controller", path = %path.display(), uid, gid, error = %e, "failed to chown spilled body file, failing the request");
-                let _cleanup = TempBodyFile::new(path);
-                return Err(Box::new(DispatchResult::new(
-                    ActionBody::Buffered {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        body: b"500 failed to prepare request body\n".to_vec(),
-                        headers: HeaderBlob::default(),
-                    },
-                    "php",
-                    0,
-                )));
-            }
-            (
-                RequestBody::File {
-                    path: Cow::Owned(path.to_string_lossy().into_owned()),
-                    len,
-                },
-                Some(TempBodyFile::new(path)),
-            )
-        }
+        Ok(CollectedBody::Spilled { file, len }) => (
+            RequestBody::File { len },
+            // Already unlinked: the worker gets this fd, nobody can reach the
+            // file by name, and there is no ownership to hand over.
+            Some(TempBodyFile::new(file)),
+        ),
         Err(BodyCollectError::TooLarge) => {
             return Err(Box::new(DispatchResult::new(
                 ActionBody::Buffered {
@@ -319,7 +300,7 @@ pub(crate) async fn build_php_request(
             return Err(Box::new(DispatchResult::new(
                 ActionBody::Buffered {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    body: b"500 failed to read request body\n".to_vec(),
+                    body: b"500 Internal Server Error\n".to_vec(),
                     headers: HeaderBlob::default(),
                 },
                 "php",
@@ -336,8 +317,6 @@ pub(crate) async fn build_php_request(
             path_info: Cow::Owned(resolved.path_info),
             method,
             uri: Cow::Owned(uri),
-            query_string: Cow::Owned(query_string),
-            content_type: Cow::Owned(content_type),
             headers,
             client_ip: client_ip.ip(),
             body,
@@ -374,15 +353,21 @@ pub(crate) async fn dispatch_php(
         }
         DispatchOutcome::Timeout => php_error_response(
             StatusCode::GATEWAY_TIMEOUT,
-            b"504 worker did not respond in time\n",
+            b"504 Gateway Timeout\n",
         ),
         DispatchOutcome::QueueTimeout => php_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            b"503 no worker capacity available\n",
+            b"503 Service Unavailable\n",
+        ),
+        // The head cap bounds everything a client controls, so a frame that
+        // still overflows is this deployment's paths, not the request.
+        DispatchOutcome::RequestTooLarge => php_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            b"500 Internal Server Error\n",
         ),
         DispatchOutcome::Failed => php_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            b"500 worker dispatch failed\n",
+            b"500 Internal Server Error\n",
         ),
     }
 }

@@ -1,4 +1,16 @@
 use super::*;
+
+/// These tests never spill a body, so the far end can go straight away.
+fn unused_body_socket() -> std::os::fd::OwnedFd {
+    let (a, _b) = nix::sys::socket::socketpair(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::SeqPacket,
+        None,
+        nix::sys::socket::SockFlag::empty(),
+    )
+    .expect("socketpair");
+    a
+}
 use crate::ipc::data;
 use bytes::Bytes;
 use std::os::fd::AsRawFd;
@@ -33,8 +45,11 @@ fn spawn_harness(pid: u32) -> Harness {
         channel: WorkerChannel::for_test(
             pid,
             Arc::new(master_side),
-            AsyncFd::new(req_space_efd_owned).unwrap(),
-            AsyncFd::new(resp_data_efd_owned).unwrap(),
+            shm::NotifyEfds {
+                req_space: req_space_efd_owned,
+                resp_data: resp_data_efd_owned,
+            },
+            unused_body_socket(),
         ),
     }
 }
@@ -52,8 +67,6 @@ fn dummy_request() -> PhpRequest<'static> {
         path_info: Cow::Borrowed(""),
         method: Cow::Borrowed("GET"),
         uri: Cow::Borrowed("/"),
-        query_string: Cow::Borrowed(""),
-        content_type: Cow::Borrowed(""),
         headers: data::HeaderBlob::default(),
         client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         body: data::RequestBody::Inline(Cow::Borrowed(&[])),
@@ -434,6 +447,7 @@ async fn a_stray_byte_on_the_liveness_socket_is_treated_as_fatal_same_as_eof() {
         channel: channel_fd,
         liveness: worker_liveness_side,
         notify,
+        body: unused_body_socket(),
     };
     let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
 
@@ -596,6 +610,7 @@ fn channel_with_live_worker_side() -> (WorkerChannel, shm::MappedChannel, shm::N
         channel: channel_fd,
         liveness: liveness_master_side,
         notify,
+        body: unused_body_socket(),
     };
     let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
     (channel, worker_side, worker_notify, liveness_worker_side)
@@ -719,4 +734,50 @@ async fn a_worker_blocked_writing_a_response_is_released_when_master_drops_the_c
         std::io::ErrorKind::BrokenPipe,
         "a released writer should report the peer as gone"
     );
+}
+
+/// Registration is all or nothing: a regular file cannot join an epoll set, so
+/// the second half fails where the first succeeded - and the eventfds are the
+/// only way this channel can ever notify its peer.
+#[tokio::test]
+async fn a_failed_registration_leaves_the_channel_parked_with_both_fds() {
+    use std::os::fd::OwnedFd;
+    let req_space = shm::create_notify_eventfd().unwrap();
+    let resp_data: OwnedFd = std::fs::File::open(std::env::current_exe().unwrap())
+        .unwrap()
+        .into();
+    let mut notify = Notify::Parked(shm::NotifyEfds {
+        req_space,
+        resp_data,
+    });
+
+    assert!(
+        notify.register().is_err(),
+        "a regular file was accepted into the epoll set"
+    );
+    assert!(
+        matches!(notify, Notify::Parked(_)),
+        "left mid-transition instead of rolled back"
+    );
+    assert!(notify.registered().is_none());
+
+    // Both fds survived, so this fails the same way rather than on a closed fd.
+    assert!(notify.register().is_err());
+    assert!(matches!(notify, Notify::Parked(_)));
+}
+
+/// Parking is called on the way back to the idle pool, and a channel that was
+/// never registered is already parked. Doing it anyway must leave the channel
+/// usable rather than consuming the eventfds it was meant to keep.
+#[tokio::test]
+async fn parking_a_channel_that_was_never_registered_keeps_it_usable() {
+    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+
+    // Nothing has been dispatched to it, so this is the already-parked case.
+    h.channel.park_notify();
+
+    h.channel
+        .write_request(&dummy_request())
+        .await
+        .expect("a parked channel must still be able to register and write");
 }

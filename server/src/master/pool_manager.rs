@@ -22,51 +22,27 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_seqpacket::UnixSeqpacket;
 
-/// RAII cleanup for a spilled request body. Must outlive the response:
-/// dropping it before the worker's done marker races the worker's `fopen()`.
-pub struct TempBodyFile(std::path::PathBuf);
+/// A spilled request body, held open after being unlinked: the worker gets
+/// this fd, and closing it is what frees the space. Must outlive the response,
+/// since the worker reads through it for the whole of the request.
+pub struct TempBodyFile(std::fs::File);
 
 impl TempBodyFile {
-    pub fn new(path: std::path::PathBuf) -> Self {
-        TempBodyFile(path)
+    pub fn new(file: std::fs::File) -> Self {
+        TempBodyFile(file)
     }
-}
 
-fn remove_temp_body(path: &std::path::Path) {
-    if let Err(e) = std::fs::remove_file(path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "failed to remove temp body file");
-    }
-}
-
-/// The `unlink` is a filesystem round trip on whatever `TMPDIR` points at,
-/// which need not be a tmpfs, so it goes to a background task rather than a
-/// runtime thread.
-///
-/// `Handle::spawn`, not `spawn_blocking`: the latter panics once the runtime
-/// is shutting down, and a panic in a `Drop` during unwind aborts the
-/// process. Leaking a temp file for the OS to reap is the better failure.
-impl Drop for TempBodyFile {
-    fn drop(&mut self) {
-        let path = std::mem::take(&mut self.0);
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move { tokio::fs::remove_file(&path).await.or_else(|e| {
-                    if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
-                }).unwrap_or_else(|e| {
-                    tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "failed to remove temp body file");
-                }) });
-            }
-            // No runtime at all: inline is both safe and the only option.
-            Err(_) => remove_temp_body(&path),
-        }
+    pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
     }
 }
 
 pub struct PoolManager {
     /// tokio mutex: `spawn_worker_once` holds this guard across an `.await`.
     control: Mutex<UnixSeqpacket>,
+    /// Where the control socket is registered. Everything that polls it has
+    /// to run here, whatever runtime a request happens to arrive on.
+    control_rt: tokio::runtime::Handle,
     /// Lock-free, being taken and returned on every request. Workable only
     /// because retirement is the worker's own decision, so nothing needs to
     /// inspect this from the far end.
@@ -93,10 +69,18 @@ pub struct PoolManager {
     watchdog_kills: AtomicU64,
     queue_timeouts: AtomicU64,
     dispatch_failed: AtomicU64,
+    /// Refused for not fitting a request-ring frame. The head cap is meant to
+    /// make that unreachable, so anything but zero says a configured path is
+    /// longer than the ring was sized for.
+    pub(crate) requests_too_large: AtomicU64,
     workers_spawned: AtomicU64,
     /// Clean retirement, as distinct from `dispatch_failed`.
     recycled_request_limit: AtomicU64,
     recycled_idle_timeout: AtomicU64,
+    /// Non-zero means something else failed to release a worker.
+    workers_reaped_dead: AtomicU64,
+    /// Clients that went away while a worker was checked out.
+    workers_abandoned: AtomicU64,
     prototype_child: StdMutex<PrototypeHandle>,
     /// Retained so a respawn can reproduce the original launch exactly.
     php_mod_path: String,
@@ -211,6 +195,11 @@ impl WorkerMeta {
             .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
     }
 
+    /// Checked out to a request, so not sitting in the idle stack.
+    fn is_busy(&self) -> bool {
+        self.state.load(Relaxed) == STATE_BUSY
+    }
+
     fn state_str(&self) -> &'static str {
         match self.state.load(Relaxed) {
             STATE_BUSY => "busy",
@@ -279,6 +268,61 @@ fn resolve_php_mod_path() -> String {
     std::env::var("PROTEUS_PHP_MOD_PATH").unwrap_or_else(|_| "libproteus-php-mod.so".to_string())
 }
 
+/// Whether `pid` still names a live process. `EPERM` counts as alive: a
+/// worker running as `php.user` is not master's to signal. Racy against pid
+/// reuse, at the cost of dropping one worker's metadata early.
+fn process_is_alive(pid: u32) -> bool {
+    !matches!(kill(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
+}
+
+/// The pool is at `processes.max`. `WouldBlock` so callers can tell it from
+/// the failures that say something about the prototype's health.
+fn pool_full_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "worker pool is at processes.max",
+    )
+}
+
+fn is_pool_full(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// Holds a claimed slot until its worker reaches `workers`. Any failure in
+/// between would otherwise retire the slot for good, lowering the pool's
+/// ceiling by one each time.
+struct SlotGuard<'a> {
+    idle: &'a IdleStack<PooledWorker>,
+    slot: Option<u32>,
+}
+
+impl<'a> SlotGuard<'a> {
+    fn new(idle: &'a IdleStack<PooledWorker>, slot: u32) -> Self {
+        SlotGuard {
+            idle,
+            slot: Some(slot),
+        }
+    }
+
+    /// Gives up ownership; the caller is now responsible for the slot.
+    fn keep(mut self) -> u32 {
+        self.slot.take().expect("a guard is kept at most once")
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            self.idle.release_slot(slot);
+        }
+    }
+}
+
+/// How long one sweep may spend returning ring pages. A swept worker is
+/// unavailable for the length of a `spawn_blocking` hop, and nothing here is
+/// urgent: whatever is still due is due again a tick later.
+const RECLAIM_BUDGET: Duration = Duration::from_millis(2);
+
 impl PoolManager {
     pub fn spawn_prototype(cfg: &Config) -> Self {
         // config::validate guarantees these are set together or not at all.
@@ -327,6 +371,7 @@ impl PoolManager {
 
         PoolManager {
             control: Mutex::new(control),
+            control_rt: tokio::runtime::Handle::current(),
             idle: IdleStack::new(cfg.php.processes.max),
             semaphore: Arc::new(Semaphore::new(cfg.php.processes.max)),
             max_workers: cfg.php.processes.max,
@@ -345,9 +390,12 @@ impl PoolManager {
             watchdog_kills: AtomicU64::new(0),
             queue_timeouts: AtomicU64::new(0),
             dispatch_failed: AtomicU64::new(0),
+            requests_too_large: AtomicU64::new(0),
             workers_spawned: AtomicU64::new(0),
             recycled_request_limit: AtomicU64::new(0),
             recycled_idle_timeout: AtomicU64::new(0),
+            workers_reaped_dead: AtomicU64::new(0),
+            workers_abandoned: AtomicU64::new(0),
             prototype_child: StdMutex::new(PrototypeHandle::new(child)),
             php_mod_path,
             max_requests: cfg.php.limits.requests,
@@ -451,21 +499,52 @@ impl PoolManager {
         }
     }
 
-    /// Drops workers that retired themselves while parked here, releasing
-    /// the memfd mappings their entries pin. `get_worker` skips such entries,
-    /// but on a quiet pool nothing pops, so without this they would be
-    /// reported idle forever and never released.
-    ///
-    /// Survivors are pushed back in reverse so the warmest stays on top. A
-    /// concurrent pop or push just means this pass sees a slightly different
-    /// set; nothing is lost either way.
-    fn reap_retired_idle_workers(&self) {
-        let to_check = self.idle.len();
-        let mut keep = Vec::new();
-        for _ in 0..to_check {
-            let Some((_slot, worker)) = self.idle.pop() else {
+    /// Drops metadata for workers whose process is gone - the OOM killer, a
+    /// segfault in an extension, an operator's `kill`. Each such death would
+    /// otherwise hold a slot for good and lower the pool's real ceiling.
+    fn reap_dead_worker_metas(&self) {
+        // Checked-out workers only, to satisfy `remove_worker_meta`: freeing
+        // the slot of one still linked in the idle stack hands that slot out
+        // twice. Idle deaths are `sweep_idle_workers`'s to find.
+        let dead: Vec<u32> = {
+            let workers = self.workers.lock().unwrap();
+            workers
+                .iter()
+                .filter(|(_, meta)| meta.is_busy())
+                .map(|(pid, _)| *pid)
+                .filter(|&pid| !process_is_alive(pid))
+                .collect()
+        };
+        for pid in dead {
+            tracing::warn!(
+                r#type = "controller",
+                pid,
+                "reaping a worker that died without master noticing"
+            );
+            self.remove_worker_meta(pid);
+            self.workers_reaped_dead.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Checked workers are held aside, not pushed straight back: the LIFO
+    /// stack would hand the same one out again. Popping is also the exclusion
+    /// `Ring::reclaim_if_due` needs - nothing dispatches to a worker off it.
+    async fn sweep_idle_workers(&self) {
+        // Draining does not await, so the pool is short only for as long as
+        // the pops take; each worker goes back as soon as it is handled.
+        let ceiling = self.idle.len();
+        let mut held = Vec::with_capacity(ceiling);
+        for _ in 0..ceiling {
+            let Some(entry) = self.idle.pop() else {
                 break;
             };
+            held.push(entry);
+        }
+
+        let deadline = Instant::now() + RECLAIM_BUDGET;
+        let mut reclaimed = 0usize;
+        // Reversed, so the warmest ends up back on top.
+        for (slot, worker) in held.into_iter().rev() {
             if worker.channel.worker_has_exited() {
                 tracing::debug!(
                     r#type = "controller",
@@ -475,12 +554,23 @@ impl PoolManager {
                 self.recycled_idle_timeout.fetch_add(1, Relaxed);
                 self.remove_worker_meta(worker.pid);
                 // Dropping releases the channel and its mapping.
-            } else {
-                keep.push(worker);
+                continue;
             }
+            if Instant::now() < deadline && worker.channel.reclaim_is_due() {
+                let mapped = worker.channel.mapping();
+                // fallocate is not guaranteed cheap and cannot safely overlap
+                // itself, so this is awaited rather than left detached.
+                let _ = tokio::task::spawn_blocking(move || mapped.reclaim_if_due()).await;
+                reclaimed += 1;
+            }
+            self.idle.push(slot, worker);
         }
-        for worker in keep.into_iter().rev() {
-            self.return_worker(worker);
+        if reclaimed > 0 {
+            tracing::debug!(
+                r#type = "controller",
+                workers = reclaimed,
+                "reclaimed ring pages from idle workers"
+            );
         }
     }
 
@@ -494,7 +584,8 @@ impl PoolManager {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            self.reap_retired_idle_workers();
+            self.reap_dead_worker_metas();
+            self.sweep_idle_workers().await;
             // Bounded by the total worker count, not the idle count: this
             // spawns without a semaphore permit, so topping up while others
             // are busy would push the pool past `processes.max` and past the
@@ -550,7 +641,7 @@ impl PoolManager {
     }
 
     /// Best-effort: fewer spares than asked for beats failing to start.
-    pub async fn prespawn_spare(&self, spare: usize) {
+    pub async fn prespawn_spare(self: &Arc<Self>, spare: usize) {
         tracing::info!(r#type = "controller", spare, "pre-spawning spare workers");
         for _ in 0..spare {
             match self.spawn_worker().await {
@@ -562,10 +653,26 @@ impl PoolManager {
         }
     }
 
-    /// A dead prototype fails individual dispatches, never the whole master.
-    async fn spawn_worker(&self) -> std::io::Result<PooledWorker> {
+    /// Spawns on the control runtime, where the control socket and the
+    /// prototype respawn already have their fds registered. Spawns are rare
+    /// enough that the hop costs nothing that shows.
+    async fn spawn_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
+        let pool = Arc::clone(self);
+        match self.control_rt.spawn(async move { pool.spawn_worker_here().await }).await {
+            Ok(result) => result,
+            Err(e) => Err(std::io::Error::other(format!(
+                "worker spawn task on the control runtime failed: {e}"
+            ))),
+        }
+    }
+
+    /// A dead prototype fails individual dispatches, never the whole master -
+    /// but a full pool must not escalate to a respawn, which would kill the
+    /// prototype and fail every worker in flight to lose the same race again.
+    async fn spawn_worker_here(self: Arc<Self>) -> std::io::Result<PooledWorker> {
         match self.spawn_worker_once().await {
             Ok(w) => Ok(w),
+            Err(e) if is_pool_full(&e) => Err(e),
             Err(e) => {
                 tracing::warn!(r#type = "controller", error = %e, "spawn_worker failed, trying to respawn the prototype");
                 if self.try_respawn_prototype().await {
@@ -578,6 +685,14 @@ impl PoolManager {
     }
 
     async fn spawn_worker_once(&self) -> std::io::Result<PooledWorker> {
+        // Claimed before the fork: this is the only atomic admission gate.
+        // `workers.len() < max_workers` is a check-then-act that two spawn
+        // paths can pass at once, leaving the loser a process to kill.
+        let Some(slot) = self.idle.claim_slot() else {
+            return Err(pool_full_error());
+        };
+        let slot = SlotGuard::new(&self.idle, slot);
+
         let control = self.control.lock().await;
         let request =
             tokio::time::timeout(self.spawn_timeout, control::request_worker(&control)).await;
@@ -610,20 +725,41 @@ impl PoolManager {
         })?;
 
         self.workers_spawned.fetch_add(1, Relaxed);
-        let Some(slot) = self.idle.claim_slot() else {
-            // Unreachable while the semaphore caps live workers at the slot
-            // count; killing still beats leaking an untracked process.
-            sigkill(pid, "no idle slot available for a freshly spawned worker");
-            return Err(std::io::Error::other("idle pool has no free slot"));
-        };
-        let meta = Arc::new(WorkerMeta::new(slot, Instant::now(), self.started_at));
-        self.workers.lock().unwrap().insert(pid, Arc::clone(&meta));
+        // Past every fallible step, so the slot now belongs to a worker that
+        // `workers` will account for.
+        let meta = Arc::new(WorkerMeta::new(slot.keep(), Instant::now(), self.started_at));
+        self.track_worker(pid, Arc::clone(&meta));
         tracing::debug!(r#type = "controller", pid, "spawned worker");
         Ok(PooledWorker { channel, pid, meta })
     }
 
+    pub(crate) fn note_worker_abandoned(&self) {
+        self.workers_abandoned.fetch_add(1, Relaxed);
+    }
+
+    /// A checked-out worker is out of the idle stack, which is
+    /// `remove_worker_meta`'s precondition.
+    pub(crate) fn release_abandoned_worker(&self, pid: u32) {
+        self.remove_worker_meta(pid);
+    }
+
     /// Forgets a worker and returns its slot. The worker must already be out
     /// of the idle stack.
+    /// Takes the slot back from any entry this displaces: the OS reuses pids,
+    /// and a worker whose pid came round again before it was reaped would
+    /// otherwise take its slot out of circulation for good.
+    fn track_worker(&self, pid: u32, meta: Arc<WorkerMeta>) {
+        // Bound first: as the scrutinee of an `if let`, the guard would live
+        // for the whole arm and put the log call under the map lock.
+        let displaced = self.workers.lock().unwrap().insert(pid, meta);
+        if let Some(stale) = displaced {
+            // Gone for certain: the kernel does not hand out a live pid.
+            tracing::warn!(r#type = "controller", pid, "reusing the pid of a worker that was never reaped");
+            self.idle.release_slot(stale.slot);
+            self.workers_reaped_dead.fetch_add(1, Relaxed);
+        }
+    }
+
     fn remove_worker_meta(&self, pid: u32) {
         if let Some(meta) = self.workers.lock().unwrap().remove(&pid) {
             self.idle.release_slot(meta.slot);
@@ -633,31 +769,39 @@ impl PoolManager {
     /// LIFO, and load-bearing: FIFO would cycle evenly through every idle
     /// worker, so under steady traffic none would reach its own
     /// `idle_timeout` and the pool would never scale back down.
-    async fn get_worker(&self) -> std::io::Result<PooledWorker> {
-        // A worker can retire itself while still parked here.
-        while let Some((_slot, worker)) = self.idle.pop() {
-            if !worker.channel.worker_has_exited() {
-                return Ok(worker);
+    async fn get_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
+        // The caller holds one of `processes.max` permits with the pool at
+        // `processes.max`, so a worker is owed to it and merely busy or
+        // mid-return - a wait that is usually sub-millisecond.
+        const POOL_FULL_ATTEMPTS: u32 = 1000;
+        const POOL_FULL_BACKOFF: Duration = Duration::from_millis(1);
+
+        for _ in 0..POOL_FULL_ATTEMPTS {
+            // A worker can retire itself while still parked here.
+            while let Some((_slot, worker)) = self.idle.pop() {
+                if !worker.channel.worker_has_exited() {
+                    return Ok(worker);
+                }
+                tracing::debug!(
+                    r#type = "controller",
+                    pid = worker.pid,
+                    "discarding a worker that retired on idle timeout"
+                );
+                self.recycled_idle_timeout.fetch_add(1, Relaxed);
+                self.remove_worker_meta(worker.pid);
             }
-            tracing::debug!(
-                r#type = "controller",
-                pid = worker.pid,
-                "discarding a worker that retired on idle timeout"
-            );
-            self.recycled_idle_timeout.fetch_add(1, Relaxed);
-            self.remove_worker_meta(worker.pid);
+            match self.spawn_worker().await {
+                Err(e) if is_pool_full(&e) => {
+                    tokio::time::sleep(POOL_FULL_BACKOFF).await;
+                }
+                other => return other,
+            }
         }
-        self.spawn_worker().await
+        Err(pool_full_error())
     }
 
     fn return_worker(&self, worker: PooledWorker) {
         self.idle.push(worker.meta.slot, worker);
-    }
-
-    /// A spilled body file must be chown()ed to the worker's identity, or it
-    /// defaults to master's own.
-    pub fn worker_uid_gid(&self) -> (u32, u32) {
-        (self.uid, self.gid)
     }
 
     pub fn status_json(&self) -> serde_json::Value {
@@ -697,11 +841,14 @@ impl PoolManager {
                 "counters": {
                     "requests_total": self.requests_total.load(Relaxed),
                     "requests_failed": self.dispatch_failed.load(Relaxed),
+                    "requests_too_large": self.requests_too_large.load(Relaxed),
                     "watchdog_kills": self.watchdog_kills.load(Relaxed),
                     "queue_timeouts": self.queue_timeouts.load(Relaxed),
                     "workers_spawned_total": self.workers_spawned.load(Relaxed),
                     "recycled_request_limit": self.recycled_request_limit.load(Relaxed),
                     "recycled_idle_timeout": self.recycled_idle_timeout.load(Relaxed),
+                    "workers_reaped_dead": self.workers_reaped_dead.load(Relaxed),
+                    "workers_abandoned": self.workers_abandoned.load(Relaxed),
                     "prototype_respawns_total": self.prototype_respawns.load(Relaxed),
                     "crash_loop_backoffs": self.crash_loop_backoffs.load(Relaxed),
                 },

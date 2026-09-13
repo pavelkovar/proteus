@@ -579,6 +579,7 @@ async fn serve_status(listen: String, state: Arc<AppState>) {
                 }
             });
             let _ = hyper::server::conn::http1::Builder::new()
+                .max_buf_size(MAX_REQUEST_HEAD)
                 .timer(hyper_util::rt::TokioTimer::new())
                 .header_read_timeout(header_read_timeout)
                 .serve_connection(io, service)
@@ -599,106 +600,250 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-pub async fn serve(state: Arc<AppState>) {
+/// A latched signal: `notify_waiters` would wake only whoever is already
+/// waiting, and an accept loop that missed it would never return - which master
+/// joins on before it exits.
+#[derive(Clone)]
+pub struct Shutdown(tokio::sync::watch::Receiver<bool>);
+
+impl Shutdown {
+    pub fn channel() -> (tokio::sync::watch::Sender<bool>, Shutdown) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (tx, Shutdown(rx))
+    }
+
+    /// Returns at once if it has already fired.
+    pub async fn wait(&mut self) {
+        while !*self.0.borrow_and_update() {
+            if self.0.changed().await.is_err() {
+                return; // sender gone: nothing left to serve either
+            }
+        }
+    }
+}
+
+/// The CPUs this process may actually run on - identities, not the count
+/// `available_parallelism` gives: under a cpuset of `{4,5,6,7}` pinning to
+/// `0..4` would miss all four. Empty means the mask could not be read.
+pub fn allowed_cpus() -> Vec<usize> {
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
+            .collect()
+    }
+}
+
+/// Pins the calling thread to one CPU, keeping its connections' state on one
+/// core instead of following the thread around. Best-effort: a cpuset that
+/// refuses is a reason to serve unpinned, not to refuse to serve.
+pub fn pin_to_cpu(cpu: usize) {
+    if cpu >= libc::CPU_SETSIZE as usize {
+        return; // CPU_SET would index past the mask
+    }
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) != 0 {
+            tracing::debug!(
+                r#type = "controller",
+                cpu,
+                error = %std::io::Error::last_os_error(),
+                "could not pin a serving thread to its CPU"
+            );
+        }
+    }
+}
+
+/// One more listening socket for `listen`, sharing the port with whatever is
+/// already bound to it. The kernel hands each connection to exactly one of
+/// them, so accepting stops being one thread's work.
+pub fn reuseport_listener(listen: &str) -> std::io::Result<std::net::TcpListener> {
+    let addr: std::net::SocketAddr = listen.parse().map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{listen}: {e}"))
+    })?;
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    sock.set_reuse_address(true)?;
+    sock.set_reuse_port(true)?;
+    sock.bind(&addr.into())?;
+    sock.listen(1024)?;
+    Ok(sock.into())
+}
+
+/// Accepts on this core's own share of every listening address and serves what
+/// it accepts, all on one thread. Distributing connections in user space
+/// instead measured no better and cost a cross-thread handoff.
+pub async fn serve_core(
+    listeners: Vec<(std::net::TcpListener, Arc<str>)>,
+    state: Arc<AppState>,
+    shutdown: Shutdown,
+    exit: Shutdown,
+    connection_slots: Arc<tokio::sync::Semaphore>,
+) {
+    let mut accepting = Vec::with_capacity(listeners.len());
+    for (listener, listen_addr) in listeners {
+        accepting.push(tokio::spawn(accept_loop(
+            listener,
+            listen_addr,
+            Arc::clone(&state),
+            shutdown.clone(),
+            Arc::clone(&connection_slots),
+        )));
+    }
+    for task in accepting {
+        let _ = task.await;
+    }
+    // Connections outlive the accept loops: dropping this runtime drops their
+    // tasks, so it has to stay until master says the drain is over.
+    let mut exit = exit;
+    exit.wait().await;
+}
+
+async fn accept_loop(
+    listener: std::net::TcpListener,
+    listen_addr: Arc<str>,
+    state: Arc<AppState>,
+    mut shutdown: Shutdown,
+    connection_slots: Arc<tokio::sync::Semaphore>,
+) {
+    listener
+        .set_nonblocking(true)
+        .expect("a listening socket must go non-blocking");
+    let listener = match TcpListener::from_std(listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(r#type = "controller", %listen_addr, error = %e, "registering a listening socket failed");
+            return;
+        }
+    };
+    set_defer_accept_or_log(&listener, &listen_addr);
+    let timeouts = ConnTimeouts::from(&state);
+    loop {
+        let (stream, peer) = tokio::select! {
+            result = listener.accept() => match result {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(r#type = "controller", error = %e, "accept failed");
+                    continue;
+                }
+            },
+            _ = shutdown.wait() => break,
+        };
+        // Before spawning, so a flood waits in the kernel's bounded accept
+        // backlog rather than piling up as tasks holding sockets. Raced against
+        // shutdown like every wait here: live keep-alives make it unbounded.
+        let slot = tokio::select! {
+            result = Arc::clone(&connection_slots).acquire_owned() => match result {
+                Ok(slot) => slot,
+                Err(_) => break, // semaphore closed: only on shutdown
+            },
+            _ = shutdown.wait() => break,
+        };
+        let state = Arc::clone(&state);
+        let listen_addr = Arc::clone(&listen_addr);
+        tokio::spawn(async move {
+            let _slot = slot;
+            serve_one_connection(stream, peer, listen_addr, state, timeouts).await;
+        });
+    }
+    tracing::info!(r#type = "controller", %listen_addr, "no longer accepting new connections");
+}
+
+/// What one request's head may total, on every listener. The frame carrying it
+/// repeats the URI and Host, so the ring bounds this at roughly half its own
+/// size once an inline body and the resolved paths are allowed for.
+const MAX_REQUEST_HEAD: usize = 80 * 1024;
+
+// The head twice over - the URI and Host each get a field of their own beside
+// the blob - plus an inline body and the resolved paths. Checked, so tuning
+// any of them alone breaks the build rather than production.
+const _: () = assert!(
+    2 * MAX_REQUEST_HEAD + php_dispatch::BODY_MEMORY_THRESHOLD + 16 * 1024
+        <= crate::ipc::shm::REQUEST_RING_CAPACITY - 4,
+    "a request at the head cap must fit one ring frame, paths and body included"
+);
+
+/// Read once per accept rather than per request.
+#[derive(Clone, Copy)]
+struct ConnTimeouts {
+    header_read: std::time::Duration,
+    idle: std::time::Duration,
+}
+
+impl ConnTimeouts {
+    fn from(state: &AppState) -> Self {
+        ConnTimeouts {
+            header_read: std::time::Duration::from_secs(state.config.connection.header_read_timeout),
+            idle: std::time::Duration::from_secs(state.config.connection.idle_timeout),
+        }
+    }
+}
+
+async fn serve_one_connection(
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    listen_addr: Arc<str>,
+    state: Arc<AppState>,
+    timeouts: ConnTimeouts,
+) {
+    set_nodelay_or_log(&stream);
+    let io = TokioIo::new(stream);
+    let peer_identity = Peer::resolve(peer.ip(), &state.config.trusted_proxies);
+    let conn = Arc::new(ConnState::new());
+    let service = {
+        let conn = Arc::clone(&conn);
+        hyper::service::service_fn(move |req| {
+            let state = state.clone();
+            let listen_addr = listen_addr.clone();
+            let conn = Arc::clone(&conn);
+            async move { handle(req, state, peer_identity, &listen_addr, conn).await }
+        })
+    };
+    let mut connection = std::pin::pin!(
+        hyper::server::conn::http1::Builder::new()
+            // The ring is what bounds it: it holds the head twice.
+            .max_buf_size(MAX_REQUEST_HEAD)
+            // hyper is runtime-agnostic: without a timer installed, any timeout
+            // it is asked to honour panics the connection task rather than
+            // being ignored.
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(timeouts.header_read)
+            .serve_connection(io, service)
+    );
+    let result = if timeouts.idle.is_zero() {
+        connection.as_mut().await
+    } else {
+        tokio::select! {
+            result = connection.as_mut() => result,
+            _ = wait_until_idle(&conn, timeouts.idle) => {
+                // Shutting down rather than dropping lets hyper finish a
+                // response still on the wire.
+                connection.as_mut().graceful_shutdown();
+                connection.as_mut().await
+            }
+        }
+    };
+    if let Err(err) = result {
+        tracing::debug!(r#type = "controller", %peer, error = %err, "connection error");
+    }
+}
+
+/// Returns once in-flight requests have finished or the grace period runs out.
+pub async fn serve_control(state: Arc<AppState>, shutdown: tokio::sync::watch::Sender<bool>) {
     let status_listen = state.config.status.listen.clone();
     tokio::spawn(serve_status(status_listen, state.clone()));
 
-    // Raced against accept() so shutdown stops new connections; in-flight
-    // requests and existing keep-alives finish on their own.
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-
-    // Zero means no cap, expressed as a huge permit count so the acquire
-    // path stays branchless.
-    let conn_cap = state.config.connection.max;
-    let connection_slots = Arc::new(tokio::sync::Semaphore::new(if conn_cap == 0 {
-        tokio::sync::Semaphore::MAX_PERMITS
-    } else {
-        conn_cap
-    }));
-    let header_read_timeout =
-        std::time::Duration::from_secs(state.config.connection.header_read_timeout);
-    let idle_timeout = std::time::Duration::from_secs(state.config.connection.idle_timeout);
-
-    for listen in &state.config.listen {
-        let listener = TcpListener::bind(listen).await.expect("bind failed");
-        set_defer_accept_or_log(&listener, listen);
-        tracing::info!(r#type = "controller", %listen, "listening");
-        let state = state.clone();
-        // The closure needs an owned copy per call, and a refcount bump
-        // beats a heap allocation per request on a keep-alive connection.
-        let listen_addr: Arc<str> = Arc::from(listen.as_str());
-        let shutdown = shutdown.clone();
-        let connection_slots = Arc::clone(&connection_slots);
-        tokio::spawn(async move {
-            loop {
-                let (stream, peer) = tokio::select! {
-                    result = listener.accept() => match result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            tracing::warn!(r#type = "controller", error = %e, "accept failed");
-                            continue;
-                        }
-                    },
-                    _ = shutdown.notified() => {
-                        tracing::info!(r#type = "controller", %listen_addr, "no longer accepting new connections");
-                        break;
-                    }
-                };
-                // Before spawning, so a flood waits in the kernel's bounded
-                // accept backlog rather than becoming an unbounded pile of
-                // tasks each holding a socket and its buffers.
-                let Ok(slot) = Arc::clone(&connection_slots).acquire_owned().await else {
-                    break; // semaphore closed: only on shutdown
-                };
-                let state = state.clone();
-                let listen_addr = listen_addr.clone();
-                tokio::spawn(async move {
-                    let _slot = slot;
-                    set_nodelay_or_log(&stream);
-                    let io = TokioIo::new(stream);
-                    let peer_identity = Peer::resolve(peer.ip(), &state.config.trusted_proxies);
-                    let conn = Arc::new(ConnState::new());
-                    let service = {
-                        let conn = Arc::clone(&conn);
-                        hyper::service::service_fn(move |req| {
-                            let state = state.clone();
-                            let listen_addr = listen_addr.clone();
-                            let conn = Arc::clone(&conn);
-                            async move { handle(req, state, peer_identity, &listen_addr, conn).await }
-                        })
-                    };
-                    let mut connection = std::pin::pin!(
-                        hyper::server::conn::http1::Builder::new()
-                            // hyper is runtime-agnostic: without a timer
-                            // installed, any timeout it is asked to honour panics
-                            // the connection task rather than being ignored.
-                            .timer(hyper_util::rt::TokioTimer::new())
-                            .header_read_timeout(header_read_timeout)
-                            .serve_connection(io, service)
-                    );
-                    let result = if idle_timeout.is_zero() {
-                        connection.as_mut().await
-                    } else {
-                        tokio::select! {
-                            result = connection.as_mut() => result,
-                            _ = wait_until_idle(&conn, idle_timeout) => {
-                                // Shutting down rather than dropping lets
-                                // hyper finish a response still on the wire.
-                                connection.as_mut().graceful_shutdown();
-                                connection.as_mut().await
-                            }
-                        }
-                    };
-                    if let Err(err) = result {
-                        tracing::debug!(r#type = "controller", %peer, error = %err, "connection error");
-                    }
-                });
-            }
-        });
-    }
-
     wait_for_shutdown_signal().await;
-    shutdown.notify_waiters();
+    // Latched, so an accept loop blocked elsewhere still sees it when it
+    // next looks.
+    let _ = shutdown.send(true);
 
     // 0 exits immediately.
     let grace_period =
@@ -721,8 +866,6 @@ pub async fn serve(state: Arc<AppState>) {
             "all in-flight requests finished, exiting cleanly"
         );
     }
-    // Exiting closes our end of their sockets, which they already treat as
-    // the signal to exit.
 }
 
 #[cfg(test)]

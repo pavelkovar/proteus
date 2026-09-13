@@ -71,9 +71,9 @@ struct CPhpRequest {
     content_type: *const c_char, // may be null
     extra_vars: *const *const c_char,
     extra_var_count: c_ulong,
-    body: *const c_char, // null if body_file_path is set instead
+    body: *const c_char, // null if body_fd is set instead
     body_len: c_ulong,
-    body_file_path: *const c_char, // null if body/body_len are used instead
+    body_fd: c_int, // -1 if body/body_len are used instead
     cookie_header: *const c_char,  // may be null
     authorization: *const c_char,  // may be null
 }
@@ -131,7 +131,6 @@ struct PhpRequestFfi {
     _content_type: Option<CString>,
     _cookie: Option<CString>,
     _authorization: Option<CString>,
-    _body_path: Option<CString>,
     _vars: CgiVarBuf,
     /// `c_req.extra_vars` points into this array, not directly into `_vars` -
     /// both must outlive `c_req`.
@@ -141,14 +140,30 @@ struct PhpRequestFfi {
 impl PhpRequestFfi {
     /// `script_path` is passed separately to `execute_file`, not part of
     /// `CPhpRequest`.
-    fn build(script_path: &str, req: &PhpRequest<'_>) -> Self {
+    fn build(
+        script_path: &str,
+        req: &PhpRequest<'_>,
+        body_fd: Option<std::os::fd::BorrowedFd<'_>>,
+    ) -> Self {
         // `hyper::Method`/`Uri` both reject raw control bytes, NUL included.
         let c_method = CString::new(req.method.as_ref()).unwrap_or_default();
         let c_uri = CString::new(req.uri.as_ref()).unwrap_or_default();
-        let c_query = CString::new(req.query_string.as_ref()).unwrap_or_default();
+        // CGI's QUERY_STRING is REQUEST_URI past the first `?`, so master
+        // sends the one and this derives the other. `PATH_INFO` cannot come
+        // out of it the same way: it is percent-decoded and this is not.
+        let query = req.uri.split_once('?').map_or("", |(_, q)| q);
+        let c_query = CString::new(query).unwrap_or_default();
         // PHP wants a NULL here, not an empty string.
-        let c_content_type = (!req.content_type.is_empty())
-            .then(|| CString::new(req.content_type.as_ref()).unwrap_or_default());
+        // Master sends the header set and nothing extracted from it, so
+        // CONTENT_TYPE comes out of the blob rather than off the wire twice.
+        let content_type = req
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value)
+            .unwrap_or("");
+        let c_content_type =
+            (!content_type.is_empty()).then(|| CString::new(content_type).unwrap_or_default());
 
         // Not `req.uri`, which is path plus query; PHP_SELF must never carry
         // the query string.
@@ -196,21 +211,18 @@ impl PhpRequestFfi {
         let c_cookie = cookie_value.map(|v| CString::new(v).unwrap_or_default());
         let c_authorization = authorization_value.map(|v| CString::new(v).unwrap_or_default());
 
-        // Exactly one of the inline body and the body path is set. The path
-        // is a server-generated temp filename (php_dispatch.rs), never NUL.
-        let mut c_body_path = None;
-        let (body_ptr, body_len, body_file_path_ptr) = match &req.body {
+        // Exactly one of the inline body and the body fd is set.
+        let (body_ptr, body_len, body_fd) = match &req.body {
             RequestBody::Inline(bytes) => (
                 bytes.as_ptr() as *const c_char,
                 bytes.len() as c_ulong,
-                std::ptr::null(),
+                -1,
             ),
-            RequestBody::File { path, len } => {
-                let p = CString::new(path.as_ref()).unwrap_or_default();
-                let ptr = p.as_ptr();
-                c_body_path = Some(p);
-                (std::ptr::null(), *len as c_ulong, ptr)
-            }
+            RequestBody::File { len } => (
+                std::ptr::null(),
+                *len as c_ulong,
+                body_fd.map_or(-1, |fd| std::os::fd::AsRawFd::as_raw_fd(&fd)),
+            ),
         };
 
         let c_req = CPhpRequest {
@@ -224,7 +236,7 @@ impl PhpRequestFfi {
             extra_var_count: extra_var_ptrs.len() as c_ulong,
             body: body_ptr,
             body_len,
-            body_file_path: body_file_path_ptr,
+            body_fd,
             cookie_header: c_cookie.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
             authorization: c_authorization
                 .as_ref()
@@ -239,7 +251,6 @@ impl PhpRequestFfi {
             _content_type: c_content_type,
             _cookie: c_cookie,
             _authorization: c_authorization,
-            _body_path: c_body_path,
             _vars: vars,
             _extra_var_ptrs: extra_var_ptrs,
         }
@@ -309,6 +320,7 @@ impl PhpConn {
         &self,
         script_path: &str,
         req: &PhpRequest<'_>,
+        body_fd: Option<std::os::fd::BorrowedFd<'_>>,
         on_chunk: &mut dyn FnMut(PhpChunk),
     ) -> ExecuteResult {
         // Unreachable through hyper, but a panic on request-derived data
@@ -323,7 +335,7 @@ impl PhpConn {
         };
 
         // Must outlive the FFI call below - see `PhpRequestFfi`.
-        let ffi = PhpRequestFfi::build(script_path, req);
+        let ffi = PhpRequestFfi::build(script_path, req, body_fd);
 
         // C sees only the trampoline and an opaque pointer to a local
         // holding the real closure.

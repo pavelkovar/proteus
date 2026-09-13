@@ -17,9 +17,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
-/// One request, inline body included - a worker handles one at a time, so
-/// this need only fit the largest inline body plus its headers.
-pub const REQUEST_RING_CAPACITY: usize = 512 * 1024;
+/// Sized so that every request hyper is configured to accept fits one frame:
+/// the head twice over - the URI and Host are each copied into a field of
+/// their own - plus an inline body and the resolved paths.
+pub const REQUEST_RING_CAPACITY: usize = 256 * 1024;
 
 /// Enough for a streamed response to pipeline several frames ahead instead
 /// of stalling the worker on master. Costs one mapping per pooled worker.
@@ -795,14 +796,14 @@ impl MappedChannel {
     /// No-op on a worker's mapping. One moment serves both rings, but not for
     /// one reason: master is the response ring's reader and the request ring's
     /// writer, and at the done marker it is neither reading nor about to write.
-    pub(in crate::ipc) fn reclaim_if_due(&self) {
+    pub(crate) fn reclaim_if_due(&self) {
         if let Some(fd) = &self.fd {
             self.channel().reclaim_response(fd);
             self.channel().reclaim_request(fd);
         }
     }
 
-    pub(in crate::ipc) fn reclaim_is_due(&self) -> bool {
+    pub(crate) fn reclaim_is_due(&self) -> bool {
         self.fd.is_some()
             && (self.channel().response.is_reclaim_due() || self.channel().request.is_reclaim_due())
     }

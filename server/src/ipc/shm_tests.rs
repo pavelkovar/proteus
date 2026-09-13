@@ -1296,3 +1296,19 @@ async fn tight_park_wake_handoff_never_loses_a_wakeup() {
             .unwrap();
     }
 }
+
+/// This mapping is resident in master and the worker alike, times
+/// `php.processes.max`, so growing it is a capacity decision rather than an
+/// implementation detail. A budget, not an exact size.
+#[test]
+fn channel_mapping_stays_within_its_per_worker_budget() {
+    // Tracks the request ring, sized so any request hyper accepts fits one
+    // frame. Pages are resident only once touched, so the cost at rest is well
+    // under this.
+    const BUDGET: usize = 544 * 1024;
+    let actual = size_of::<Channel>();
+    assert!(
+        actual <= BUDGET,
+        "per-worker channel mapping grew to {actual} bytes, over the {BUDGET} byte budget"
+    );
+}

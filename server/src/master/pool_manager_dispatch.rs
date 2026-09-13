@@ -15,6 +15,49 @@ use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Owns a worker between check-out and the hand-off to its completion task,
+/// so cancellation in between releases it instead of losing its `workers`
+/// entry and pool slot for good.
+struct CheckedOutWorker {
+    pool: Arc<PoolManager>,
+    worker: Option<PooledWorker>,
+}
+
+impl CheckedOutWorker {
+    fn new(pool: Arc<PoolManager>, worker: PooledWorker) -> Self {
+        CheckedOutWorker {
+            pool,
+            worker: Some(worker),
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut PooledWorker {
+        self.worker.as_mut().expect("held until taken")
+    }
+
+    fn take(&mut self) -> PooledWorker {
+        self.worker.take().expect("taken at most once")
+    }
+}
+
+impl Drop for CheckedOutWorker {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return; // handed off, nothing to clean up
+        };
+        let pid = worker.pid;
+        tracing::debug!(
+            r#type = "controller",
+            pid,
+            "request abandoned while a worker was checked out, releasing it"
+        );
+        self.pool.note_worker_abandoned();
+        // Before the drop, whose channel close is what retires the worker.
+        self.pool.release_abandoned_worker(pid);
+        drop(worker);
+    }
+}
+
 /// Headers known; the body may still be arriving.
 pub type BodyStream =
     std::pin::Pin<Box<dyn tokio_stream::Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
@@ -62,6 +105,9 @@ pub struct StreamedResponse {
 enum StartAttempt {
     /// Never reached a Headers frame, so a fresh retry is safe.
     WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
+    /// The request will not fit a ring frame. No worker can take it, so
+    /// retrying only burns another one.
+    RequestTooLarge(OwnedSemaphorePermit, Option<TempBodyFile>),
     /// Timed out before Headers, so retrying would only hang again.
     TimedOut(OwnedSemaphorePermit, Option<TempBodyFile>),
 }
@@ -69,6 +115,7 @@ enum StartAttempt {
 /// Worker metadata is already cleaned up by the time this is returned.
 enum DispatchAttemptError {
     WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
+    RequestTooLarge(OwnedSemaphorePermit),
     TimedOut(OwnedSemaphorePermit),
 }
 
@@ -78,6 +125,9 @@ pub enum DispatchOutcome {
     Timeout,
     /// Never reached a worker at all.
     QueueTimeout,
+    /// Too big for a request-ring frame, whichever worker took it. The head
+    /// cap makes this a configuration fault rather than a client's doing.
+    RequestTooLarge,
     Failed,
 }
 
@@ -100,6 +150,9 @@ impl PoolManager {
             Ok(started) => Ok(started),
             Err(StartAttempt::TimedOut(permit, _body_cleanup)) => {
                 Err(DispatchAttemptError::TimedOut(permit))
+            }
+            Err(StartAttempt::RequestTooLarge(permit, _body_cleanup)) => {
+                Err(DispatchAttemptError::RequestTooLarge(permit))
             }
             Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)) => {
                 self.remove_worker_meta(pid);
@@ -158,6 +211,11 @@ impl PoolManager {
             .await
         {
             Ok(started) => return DispatchOutcome::Ok(started),
+            Err(DispatchAttemptError::RequestTooLarge(permit)) => {
+                self.requests_too_large.fetch_add(1, Relaxed);
+                drop(permit);
+                return DispatchOutcome::RequestTooLarge;
+            }
             Err(DispatchAttemptError::TimedOut(permit)) => return self.timed_out(pid, permit),
             Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
                 tracing::warn!(
@@ -192,6 +250,11 @@ impl PoolManager {
             .await
         {
             Ok(started) => DispatchOutcome::Ok(started),
+            Err(DispatchAttemptError::RequestTooLarge(permit)) => {
+                self.requests_too_large.fetch_add(1, Relaxed);
+                drop(permit);
+                DispatchOutcome::RequestTooLarge
+            }
             Err(DispatchAttemptError::TimedOut(permit)) => self.timed_out(pid, permit),
             Err(DispatchAttemptError::WorkerUnavailable(e, permit, _body_cleanup)) => {
                 sigkill(pid, "freshly spawned worker failed its dispatch too");
@@ -224,24 +287,35 @@ impl PoolManager {
     /// carried by a spawned task. Error paths hand `permit` back for a retry.
     async fn start_streaming(
         self: &Arc<Self>,
-        mut worker: PooledWorker,
+        worker: PooledWorker,
         req: &Arc<PhpRequest<'static>>,
         permit: OwnedSemaphorePermit,
         body_cleanup: Option<TempBodyFile>,
     ) -> Result<StreamedResponse, StartAttempt> {
         let pid = worker.pid;
-        let channel = &mut worker.channel;
+        // This runs on the connection's own task and the wait below spans the
+        // whole of PHP's execution, so a client disconnect drops the future
+        // mid-flight. The guard makes that window cancellation-safe.
+        let mut worker = CheckedOutWorker::new(Arc::clone(self), worker);
+        let channel = &mut worker.get_mut().channel;
         // One window covers publishing the request and waiting for the first
         // response frame: a worker that never drains the request ring is as
         // stuck as one that never answers.
         let first = tokio::time::timeout(self.request_timeout, async {
             channel.write_request(req).await?;
+            // After the frame, never before: a frame that failed to go would
+            // otherwise leave this fd queued for the next request to take.
+            if let Some(body) = body_cleanup.as_ref() {
+                channel.send_body_fd(body.as_fd())?;
+            }
             channel.read_response_frame().await
         })
         .await;
         let (status, headers) = match first {
             Ok(Ok(WorkerEvent::Headers { status, headers })) => (status, headers),
             Ok(Ok(_unexpected)) => {
+                // Not cancellation: the caller accounts for this one.
+                drop(worker.take());
                 return Err(StartAttempt::WorkerUnavailable(
                     std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -251,7 +325,19 @@ impl PoolManager {
                     body_cleanup,
                 ));
             }
-            Ok(Err(e)) => return Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)),
+            Ok(Err(e)) => {
+                if e.kind() == std::io::ErrorKind::InvalidInput {
+                    // Nothing was written, so this worker is still good.
+                    let mut w = worker.take();
+                    w.channel.shrink_scratch();
+                    w.channel.park_notify();
+                    w.meta.mark_idle(Instant::now(), self.started_at);
+                    self.return_worker(w);
+                    return Err(StartAttempt::RequestTooLarge(permit, body_cleanup));
+                }
+                drop(worker.take());
+                return Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup));
+            }
             // Even a worker that hung before reading the request must be
             // killed, or it runs on invisible to every later watchdog pass.
             Err(_elapsed) => {
@@ -262,9 +348,14 @@ impl PoolManager {
                     "worker exceeded request_timeout writing the request or waiting for headers"
                 );
                 sigkill(pid, "write_request/headers wait timed out");
+                drop(worker.take());
                 return Err(StartAttempt::TimedOut(permit, body_cleanup));
             }
         };
+
+        // Past every cancellable await; a spawned task owns it from here.
+        let mut worker = worker.take();
+        let channel = &mut worker.channel;
 
         // A short response is usually already queued behind the headers, so
         // taking what is there without ever waiting lets the whole reply go
@@ -304,7 +395,9 @@ impl PoolManager {
             }
             Drained::Pending { prefix } => {
                 // Bounded, so a slow client backpressures the send rather than
-                // hoarding a whole unstreamed response in memory.
+                // hoarding a whole unstreamed response in memory. Do not
+                // shorten it to save the buffer: the depth is what keeps the
+                // worker writing while master hands an earlier frame to hyper.
                 let (body_tx, body_rx) = mpsc::channel::<std::io::Result<Bytes>>(8);
 
                 let pool = Arc::clone(self);
@@ -472,6 +565,10 @@ impl PoolManager {
         match tokio::time::timeout(self.request_timeout, worker.channel.read_worker_done()).await {
             Ok(Ok(())) => {
                 let now = Instant::now();
+                // Past the done marker nothing borrows the scratch, and the
+                // eventfds can leave this runtime's reactor.
+                worker.channel.shrink_scratch();
+                worker.channel.park_notify();
                 worker.meta.mark_idle(now, self.started_at);
                 self.return_worker(worker);
                 drop(permit);

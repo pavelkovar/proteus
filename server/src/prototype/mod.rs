@@ -161,12 +161,23 @@ pub fn run() -> ! {
                 .expect("failed to create response-data eventfd"),
         };
 
+        // A spilled request body reaches the worker as an fd over this, since
+        // the ring cannot carry one. Seqpacket so one send is one receive.
+        let (body_prototype_side, body_worker_side) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::empty(),
+        )
+        .expect("failed to create body socketpair");
+
         // Before the fork, where this is still the value `die_with_parent`
         // needs to compare `getppid()` against.
         let prototype_pid = nix::unistd::getpid();
         match unsafe { fork() }.expect("fork failed") {
             ForkResult::Child => {
                 drop(liveness_prototype_side);
+                drop(body_prototype_side);
                 // A worker has no use for the prototype's control channel,
                 // and std::process::exit below skips Drop, so nothing else
                 // would ever close it.
@@ -174,6 +185,7 @@ pub fn run() -> ! {
                 proctitle::set_title(&format!("{}: php worker", crate::APP_NAME));
                 worker::run(
                     liveness_worker_side,
+                    body_worker_side,
                     mapped_channel,
                     &phpconn,
                     max_requests,
@@ -185,12 +197,14 @@ pub fn run() -> ! {
             }
             ForkResult::Parent { child } => {
                 drop(liveness_worker_side);
+                drop(body_worker_side);
                 // Unmaps only this view; the worker keeps its own.
                 drop(mapped_channel);
                 let fds = control::WorkerReadyFds {
                     channel: channel_fd,
                     liveness: liveness_prototype_side,
                     notify: notify_efds,
+                    body: body_prototype_side,
                 };
                 if let Err(e) = control::send_worker_ready(&mut control_stream, child.as_raw(), fds)
                 {

@@ -1,8 +1,19 @@
 use super::*;
+
+/// These tests never spill a body, so the far end can go straight away.
+fn unused_body_socket() -> std::os::fd::OwnedFd {
+    let (a, _b) = nix::sys::socket::socketpair(
+        nix::sys::socket::AddressFamily::Unix,
+        nix::sys::socket::SockType::SeqPacket,
+        None,
+        nix::sys::socket::SockFlag::empty(),
+    )
+    .expect("socketpair");
+    a
+}
 use crate::ipc::{data, shm};
 use crate::master::worker_channel::WorkerChannel;
 use std::os::fd::AsRawFd;
-use tokio::io::unix::AsyncFd;
 
 /// Out of range, so the kill a failed drain may attempt finds nothing.
 const NO_REAL_WORKER_PID: u32 = 999_999_999;
@@ -17,8 +28,11 @@ fn channel_pair() -> (WorkerChannel, shm::MappedChannel, std::os::fd::RawFd) {
     let channel = WorkerChannel::for_test(
         NO_REAL_WORKER_PID,
         Arc::new(master_side),
-        AsyncFd::new(shm::create_notify_eventfd().unwrap()).unwrap(),
-        AsyncFd::new(resp_data_efd_owned).unwrap(),
+        shm::NotifyEfds {
+            req_space: shm::create_notify_eventfd().unwrap(),
+            resp_data: resp_data_efd_owned,
+        },
+        unused_body_socket(),
     );
     (channel, worker_side, resp_data_efd_raw)
 }

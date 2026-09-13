@@ -71,7 +71,11 @@ fn main() {
     logging::init(true);
     enable_child_subreaper();
 
+    // Two is enough: this runtime owns the prototype control socket, the pool's
+    // background loops and the status endpoint, none of which are per-request.
+    // Connections are accepted and served by the per-core runtimes.
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
@@ -98,5 +102,89 @@ async fn run_master(config: Config) {
         std::time::Duration::from_millis(config.fs_cache.ttl_ms),
     );
     let state = Arc::new(AppState::new(pool, config, fs_cache));
-    master::http::serve(state).await;
+
+    // `None` where the mask could not be read: the count is still worth having,
+    // but pinning to invented ids would land threads on CPUs this process may
+    // not run on.
+    let cpus: Vec<Option<usize>> = {
+        let allowed = master::http::allowed_cpus();
+        if allowed.is_empty() {
+            let n = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            tracing::warn!(
+                r#type = "controller",
+                cores = n,
+                "could not read this process's CPU affinity, serving unpinned"
+            );
+            vec![None; n]
+        } else {
+            allowed.into_iter().map(Some).collect()
+        }
+    };
+
+    // Raced against accept(), so it bounds how long the accept loops run
+    // rather than guaranteeing nothing more is taken. The drain that follows
+    // waits on requests in flight, not connections.
+    let (shutdown_tx, shutdown) = master::http::Shutdown::channel();
+    // Shared, so `connection.max` stays a whole-process cap. Zero means no
+    // cap, expressed as a huge permit count so the acquire path stays
+    // branchless.
+    let conn_cap = state.config.connection.max;
+    let connection_slots = Arc::new(tokio::sync::Semaphore::new(if conn_cap == 0 {
+        tokio::sync::Semaphore::MAX_PERMITS
+    } else {
+        tokio::sync::Semaphore::MAX_PERMITS.min(conn_cap)
+    }));
+
+    // One runtime per core, each accepting on its own share of every address.
+    let (exit_tx, exit) = master::http::Shutdown::channel();
+    // All of them before any thread starts: one failing half way through would
+    // otherwise leave a process serving on some cores and not others.
+    let mut per_core: Vec<Vec<(std::net::TcpListener, Arc<str>)>> = Vec::with_capacity(cpus.len());
+    for _ in &cpus {
+        let mut listeners = Vec::with_capacity(state.config.listen.len());
+        for listen in &state.config.listen {
+            let socket = master::http::reuseport_listener(listen)
+                .unwrap_or_else(|e| panic!("cannot listen on {listen}: {e}"));
+            listeners.push((socket, Arc::from(listen.as_str())));
+        }
+        per_core.push(listeners);
+    }
+
+    let mut threads = Vec::with_capacity(cpus.len());
+    for (cpu, listeners) in cpus.iter().copied().zip(per_core) {
+        let state = Arc::clone(&state);
+        let shutdown = shutdown.clone();
+        let exit = exit.clone();
+        let connection_slots = Arc::clone(&connection_slots);
+        threads.push(std::thread::spawn(move || {
+            if let Some(cpu) = cpu {
+                master::http::pin_to_cpu(cpu);
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build a serving runtime");
+            rt.block_on(master::http::serve_core(
+                listeners,
+                state,
+                shutdown,
+                exit,
+                connection_slots,
+            ));
+        }));
+    }
+    for listen in &state.config.listen {
+        tracing::info!(r#type = "controller", %listen, cores = cpus.len(), "listening");
+    }
+
+    master::http::serve_control(state, shutdown_tx).await;
+
+    // Only now: until the drain is over, the serving runtimes still own live
+    // connections.
+    let _ = exit_tx.send(true);
+    for t in threads {
+        let _ = t.join();
+    }
 }

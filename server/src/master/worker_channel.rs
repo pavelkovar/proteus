@@ -27,8 +27,9 @@ const MAX_PENDING_HEADERS_BYTES: usize = 16 * 1024 * 1024;
 pub struct WorkerChannel {
     pid: u32,
     mapped: Arc<shm::MappedChannel>,
-    req_space_efd: AsyncFd<OwnedFd>,
-    resp_data_efd: AsyncFd<OwnedFd>,
+    notify: Notify,
+    /// Master's end of the socket a spilled body's fd goes over.
+    body: OwnedFd,
     /// Reused for the worker's whole life, so a steady-state request neither
     /// encodes nor decodes with an allocation.
     read_scratch: Vec<u8>,
@@ -45,6 +46,97 @@ pub struct WorkerChannel {
     /// on every pop from the idle pool, where an atomic load beats
     /// `watch::Receiver::borrow` taking an internal read lock.
     worker_gone: Arc<AtomicBool>,
+}
+
+/// The notify eventfds, wrapped in `AsyncFd` only while the worker is checked
+/// out. An `AsyncFd` belongs to the reactor that created it, so registering for
+/// the worker's whole life would pin it to one runtime.
+enum Notify {
+    Parked(shm::NotifyEfds),
+    /// Held by the task driving one response.
+    Registered {
+        req_space: AsyncFd<OwnedFd>,
+        resp_data: AsyncFd<OwnedFd>,
+    },
+    /// Only while a transition is in progress; never observed outside one.
+    Moving,
+}
+
+impl Notify {
+    fn register(&mut self) -> std::io::Result<()> {
+        let shm::NotifyEfds {
+            req_space,
+            resp_data,
+        } = match std::mem::replace(self, Notify::Moving) {
+            Notify::Parked(fds) => fds,
+            // Already registered: a retry reuses the same dispatch.
+            other => {
+                *self = other;
+                return Ok(());
+            }
+        };
+        // All or nothing: `try_new` hands the fd back, so a half-registered
+        // channel goes back to `Parked` intact rather than being left dead
+        // with one eventfd already closed.
+        let req_space = match AsyncFd::try_new(req_space) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let (fd, cause) = e.into_parts();
+                *self = Notify::Parked(shm::NotifyEfds {
+                    req_space: fd,
+                    resp_data,
+                });
+                return Err(cause);
+            }
+        };
+        let resp_data = match AsyncFd::try_new(resp_data) {
+            Ok(fd) => fd,
+            Err(e) => {
+                let (fd, cause) = e.into_parts();
+                *self = Notify::Parked(shm::NotifyEfds {
+                    req_space: req_space.into_inner(),
+                    resp_data: fd,
+                });
+                return Err(cause);
+            }
+        };
+        *self = Notify::Registered {
+            req_space,
+            resp_data,
+        };
+        Ok(())
+    }
+
+    /// Must run on the runtime that registered, which is where a response is
+    /// always finished.
+    fn park(&mut self) {
+        // Total, not an `if let`: anything left unmatched would be dropped
+        // here, taking the eventfds with it.
+        *self = match std::mem::replace(self, Notify::Moving) {
+            Notify::Registered {
+                req_space,
+                resp_data,
+            } => Notify::Parked(shm::NotifyEfds {
+                req_space: req_space.into_inner(),
+                resp_data: resp_data.into_inner(),
+            }),
+            already_parked => already_parked,
+        };
+    }
+
+    fn registered(&self) -> Option<(&AsyncFd<OwnedFd>, &AsyncFd<OwnedFd>)> {
+        match self {
+            Notify::Registered {
+                req_space,
+                resp_data,
+            } => Some((req_space, resp_data)),
+            _ => None,
+        }
+    }
+}
+
+fn not_registered() -> std::io::Error {
+    std::io::Error::other("worker channel used outside a dispatch")
 }
 
 /// One response event, as the rest of master sees it. Distinct from the wire
@@ -91,14 +183,13 @@ impl WorkerChannel {
             channel: channel_fd,
             liveness: liveness_fd,
             notify,
+            body,
         } = fds;
         let mapped = Arc::new(shm::map_existing_channel(channel_fd)?);
 
         // Its own dup'd fds, so it can never notify through a number this
         // channel has closed and the OS has reused.
         let watcher_notify = notify.try_clone()?;
-        let req_space_efd = AsyncFd::new(notify.req_space)?;
-        let resp_data_efd = AsyncFd::new(notify.resp_data)?;
 
         let worker_gone = Arc::new(AtomicBool::new(false));
         spawn_liveness_watcher(
@@ -111,8 +202,8 @@ impl WorkerChannel {
         Ok(WorkerChannel {
             pid,
             mapped,
-            req_space_efd,
-            resp_data_efd,
+            body,
+            notify: Notify::Parked(notify),
             read_scratch: Vec::new(),
             encode_scratch: Vec::new(),
             pending_headers: None,
@@ -128,14 +219,14 @@ impl WorkerChannel {
     pub(crate) fn for_test(
         pid: u32,
         mapped: Arc<shm::MappedChannel>,
-        req_space_efd: AsyncFd<OwnedFd>,
-        resp_data_efd: AsyncFd<OwnedFd>,
+        notify: shm::NotifyEfds,
+        body: OwnedFd,
     ) -> Self {
         WorkerChannel {
             pid,
             mapped,
-            req_space_efd,
-            resp_data_efd,
+            body,
+            notify: Notify::Parked(notify),
             read_scratch: Vec::new(),
             encode_scratch: Vec::new(),
             pending_headers: None,
@@ -152,22 +243,21 @@ impl WorkerChannel {
         self.pending_headers = None;
         self.pending_headers_bytes = 0;
         self.deferred = None;
+        // Joins this runtime's reactor for the dispatch; left in
+        // `park_notify`.
+        self.notify.register()?;
 
         let Self {
             mapped,
             encode_scratch,
-            req_space_efd,
+            notify,
             ..
         } = self;
+        let (req_space_efd, _) = notify.registered().ok_or_else(not_registered)?;
         let channel = mapped.channel();
         let encoded = data::encode_request(encode_scratch, req)?;
-        data::write_request_to_ring(
-            &channel.request,
-            &channel.peer_death,
-            encoded,
-            req_space_efd,
-        )
-        .await
+        data::write_request_to_ring(&channel.request, &channel.peer_death, encoded, req_space_efd)
+            .await
     }
 
     /// The next frame if the worker has already published one. `None` means
@@ -221,13 +311,17 @@ impl WorkerChannel {
         if let Some(ready) = self.deferred.take() {
             return Ok(ready);
         }
+        // Lazy rather than only in `write_request`, so reading is not ordered
+        // after writing to be legal. Idempotent once registered.
+        self.notify.register()?;
         loop {
             let Self {
                 mapped,
                 read_scratch,
-                resp_data_efd,
+                notify,
                 ..
             } = self;
+            let (_, resp_data_efd) = notify.registered().ok_or_else(not_registered)?;
             let raw =
                 data::read_response_frame_from_ring(mapped, read_scratch, resp_data_efd).await?;
             if let Absorbed::Ready(frame) = self.absorb(raw)? {
@@ -288,6 +382,50 @@ impl WorkerChannel {
             status,
             headers,
         })))
+    }
+
+    /// Hands a spilled body to the worker. Only ever called after the request
+    /// frame is on the ring, so a frame that failed to go leaves nothing
+    /// queued here for the next request to pick up by mistake.
+    pub fn send_body_fd(&self, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+        use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
+        let raw = [fd.as_raw_fd()];
+        let cmsg = [ControlMessage::ScmRights(&raw)];
+        let iov = [std::io::IoSlice::new(b"B")];
+        sendmsg::<()>(self.body.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+            .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+        Ok(())
+    }
+
+    /// Between responses only: a decoded frame borrows `read_scratch`, and a
+    /// headers run must already be flushed.
+    pub fn shrink_scratch(&mut self) {
+        data::shrink_scratch(&mut self.read_scratch);
+        data::shrink_scratch(&mut self.encode_scratch);
+    }
+
+    /// Releases the eventfds from this runtime's reactor so the next dispatch
+    /// can register them elsewhere. Belongs where the worker returns to idle;
+    /// the kill paths drop the channel, which deregisters with it.
+    pub fn park_notify(&mut self) {
+        self.notify.park();
+    }
+
+    /// Whether either ring has consumed enough to be worth a `fallocate`.
+    pub fn reclaim_is_due(&self) -> bool {
+        self.mapped.reclaim_is_due()
+    }
+
+    /// Reclaiming through this is safe only while the worker is out of the
+    /// idle stack - see `Ring::reclaim_if_due`.
+    pub fn mapping(&self) -> Arc<shm::MappedChannel> {
+        Arc::clone(&self.mapped)
+    }
+
+    /// Stands in for the liveness watcher, which needs a real process.
+    #[cfg(test)]
+    pub(crate) fn mark_worker_gone_for_test(&self) {
+        self.worker_gone.store(true, Ordering::Relaxed);
     }
 
     /// A worker can retire on its own idle timeout while still parked in the

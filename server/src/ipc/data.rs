@@ -11,17 +11,14 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 
-/// A large body streams to a temp file and only its path crosses the ring.
+/// A large body streams to an unlinked temp file whose fd is passed over the
+/// worker's body socket; only its length crosses the ring.
 /// `len` travels with it because PHP needs CONTENT_LENGTH before
 /// `read_post()`, and stat()ing the file would leave a TOCTOU gap.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RequestBody<'a> {
     Inline(#[serde(borrow, with = "serde_bytes")] Cow<'a, [u8]>),
-    File {
-        #[serde(borrow)]
-        path: Cow<'a, str>,
-        len: u64,
-    },
+    File { len: u64 },
 }
 
 /// Every string field is a `Cow` so one type serves both directions: master
@@ -40,20 +37,17 @@ pub struct PhpRequest<'a> {
     pub document_root: Cow<'a, str>,
     #[serde(borrow)]
     pub script_name: Cow<'a, str>,
+    /// Percent-decoded, unlike `uri`, so it cannot be a slice of it however
+    /// much the two overlap.
     #[serde(borrow)]
     pub path_info: Cow<'a, str>,
     #[serde(borrow)]
     pub method: Cow<'a, str>,
-    /// Path and query together, as PHP's REQUEST_URI.
+    /// Path and query together, as PHP's REQUEST_URI. `QUERY_STRING` is not
+    /// sent beside it: it is this same string past the first `?`, and hyper
+    /// admits a URI large enough that carrying it twice matters.
     #[serde(borrow)]
     pub uri: Cow<'a, str>,
-    #[serde(borrow)]
-    pub query_string: Cow<'a, str>,
-    /// Empty means the client sent none. Not `Option<Cow>`, which cannot
-    /// borrow: serde's `borrow` reaches only a `Cow` sitting directly in a
-    /// field and otherwise falls back to an allocating impl.
-    #[serde(borrow)]
-    pub content_type: Cow<'a, str>,
     /// Raw pairs as received; $_SERVER's HTTP_ mangling happens worker-side.
     #[serde(borrow)]
     pub headers: HeaderBlob<'a>,
@@ -173,6 +167,14 @@ impl<'a> HeaderBlob<'a> {
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct HeaderBlobRef<'a>(#[serde(with = "serde_bytes")] pub &'a [u8]);
 
+impl Copy for HeaderBlobRef<'_> {}
+
+impl Clone for HeaderBlobRef<'_> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 impl<'a> From<&'a HeaderBlob<'_>> for HeaderBlobRef<'a> {
     fn from(blob: &'a HeaderBlob<'_>) -> Self {
         HeaderBlobRef(&blob.0)
@@ -264,6 +266,20 @@ fn encode_into<'a, T: serde::Serialize + ?Sized>(
 pub enum WorkerCommand<'a> {
     Request(PhpRequest<'a>),
     Retire,
+}
+
+/// One frame, always: the head cap master sets on hyper and this ring are
+/// sized against each other, so no request hyper accepts can need two. One
+/// that still does not fit is refused rather than split.
+pub async fn write_request_to_ring(
+    ring: &shm::RequestRing,
+    peer: &shm::PeerDeath,
+    encoded: &[u8],
+    space_efd: &AsyncFd<OwnedFd>,
+) -> std::io::Result<()> {
+    ring.write_frame_async(encoded, peer, space_efd)
+        .await
+        .map_err(ring_err_to_io)
 }
 
 /// Worker side, blocking. `Ok(None)` means the peer is gone.
@@ -389,6 +405,23 @@ pub fn write_worker_done_to_ring(
         .map_err(ring_err_to_io)
 }
 
+/// Fixed bounds rather than a decaying high-water mark: a buffer that grew
+/// this far served an outlier, and optimising for its recurrence is the wrong
+/// bet.
+const SCRATCH_SHRINK_ABOVE: usize = 64 * 1024;
+const SCRATCH_KEEP_CAPACITY: usize = 4 * 1024;
+
+/// Hands back capacity a single large request left behind; these buffers are
+/// otherwise only ever cleared, so the peak is pinned for the worker's life.
+///
+/// Only where nothing borrows `buf`: a decoded frame borrows its scratch.
+pub fn shrink_scratch(buf: &mut Vec<u8>) {
+    if buf.capacity() > SCRATCH_SHRINK_ABOVE {
+        buf.clear();
+        buf.shrink_to(SCRATCH_KEEP_CAPACITY);
+    }
+}
+
 /// Reused for a worker's whole life, so a steady-state request allocates in
 /// neither direction. Grouped rather than passed as two loose buffers, which
 /// would be easy to transpose at a call site.
@@ -398,23 +431,19 @@ pub struct RingScratch {
     pub write: Vec<u8>,
 }
 
+impl RingScratch {
+    /// Between requests only, never while a decoded command borrows `read`.
+    pub fn shrink(&mut self) {
+        shrink_scratch(&mut self.read);
+        shrink_scratch(&mut self.write);
+    }
+}
+
 pub fn encode_request<'a>(
     scratch: &'a mut Vec<u8>,
     req: &PhpRequest<'_>,
 ) -> std::io::Result<&'a [u8]> {
     encode_into(scratch, req)
-}
-
-/// Master side, async.
-pub async fn write_request_to_ring(
-    ring: &shm::RequestRing,
-    peer: &shm::PeerDeath,
-    bytes: &[u8],
-    space_efd: &AsyncFd<OwnedFd>,
-) -> std::io::Result<()> {
-    ring.write_frame_async(bytes, peer, space_efd)
-        .await
-        .map_err(ring_err_to_io)
 }
 
 /// What a non-blocking read of the response ring found. `Empty` is only ever
@@ -449,11 +478,8 @@ pub fn try_read_response_frame_from_ring(
 
 /// Master side, async. `Ok(None)` is the trailing worker-done marker.
 ///
-/// Reclaims the rings on its way out of that marker, which is the one moment
-/// the peer is provably not writing. Doing it here rather than exposing a
-/// reclaim of its own is what stops a caller from having to get that timing
-/// right - see `Ring::reclaim_if_due`'s safety note for what getting it wrong
-/// costs.
+/// Reclaiming the rings here was tried and abandoned: the punched pages fault
+/// straight back in on the worker about to reuse them.
 pub async fn read_response_frame_from_ring(
     mapped: &Arc<shm::MappedChannel>,
     scratch: &mut Vec<u8>,
@@ -466,12 +492,6 @@ pub async fn read_response_frame_from_ring(
         .await
         .map_err(ring_err_to_io)?;
     if scratch.is_empty() {
-        if mapped.reclaim_is_due() {
-            // fallocate is not guaranteed cheap, and it cannot safely overlap
-            // itself, so this is awaited rather than left to run detached.
-            let mapped = Arc::clone(mapped);
-            let _ = tokio::task::spawn_blocking(move || mapped.reclaim_if_due()).await;
-        }
         return Ok(None);
     }
     let frame: ResponseFrame<'_> = postcard::from_bytes(scratch).map_err(to_io_err)?;
@@ -480,8 +500,11 @@ pub async fn read_response_frame_from_ring(
 
 pub(crate) fn ring_err_to_io(e: shm::RingError) -> std::io::Error {
     match e {
+        // `InvalidInput`, not `InvalidData`: what is wrong is the frame we
+        // were asked to send, not anything the peer produced. Callers tell a
+        // request they must refuse from a worker they must replace by this.
         shm::RingError::FrameTooLarge => std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
             "frame exceeds ring capacity",
         ),
         shm::RingError::PeerGone => {

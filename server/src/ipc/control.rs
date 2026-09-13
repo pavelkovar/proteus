@@ -22,6 +22,9 @@ pub struct WorkerReadyFds {
     pub channel: OwnedFd,
     pub liveness: OwnedFd,
     pub notify: shm::NotifyEfds,
+    /// Carries the fd of a spilled request body, which needs a socket rather
+    /// than the ring: `SCM_RIGHTS` is the only way to hand one over.
+    pub body: OwnedFd,
 }
 
 /// Unpacks the reply's fds in the same fixed order `send_worker_ready` packs
@@ -50,12 +53,12 @@ pub async fn request_worker(control: &UnixSeqpacket) -> std::io::Result<(WorkerR
             fds.extend(received);
         }
     }
-    let [channel_fd, liveness_fd, req_space_efd, resp_data_efd] = <[OwnedFd; 4]>::try_from(fds)
-        .map_err(|fds| {
+    let [channel_fd, liveness_fd, req_space_efd, resp_data_efd, body_fd] =
+        <[OwnedFd; 5]>::try_from(fds).map_err(|fds| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "expected exactly 4 fds in WORKER_READY reply, got {}",
+                    "expected exactly 5 fds in WORKER_READY reply, got {}",
                     fds.len()
                 ),
             )
@@ -69,6 +72,7 @@ pub async fn request_worker(control: &UnixSeqpacket) -> std::io::Result<(WorkerR
                 req_space: req_space_efd,
                 resp_data: resp_data_efd,
             },
+            body: body_fd,
         },
         pid,
     ))
@@ -84,7 +88,7 @@ pub fn recv_command(control: &mut StdUnixStream) -> std::io::Result<Option<Vec<u
     }
 }
 
-/// All four fds go in one `SCM_RIGHTS` message, in the fixed order
+/// One `SCM_RIGHTS` message for all of them, in the fixed order
 /// `request_worker` unpacks them.
 pub fn send_worker_ready(
     control: &mut StdUnixStream,
@@ -99,6 +103,7 @@ pub fn send_worker_ready(
         fds.liveness.as_raw_fd(),
         fds.notify.req_space.as_raw_fd(),
         fds.notify.resp_data.as_raw_fd(),
+        fds.body.as_raw_fd(),
     ];
     let cmsg = [ControlMessage::ScmRights(&raw_fds)];
     let iov = [IoSlice::new(&payload)];

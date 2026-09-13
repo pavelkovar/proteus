@@ -550,30 +550,19 @@ int proteus_php_mod_execute_file(
     g_ctx.extra_var_count = req->extra_var_count;
     g_ctx.body = req->body;
     g_ctx.body_len = req->body_len;
-    /* Exactly one of the inline body and the spill path is set. A broken
-     * contract here (open or ownership/type check fails) now fails the
-     * whole request rather than degrading to a merely-empty-looking one. */
-    if (req->body_file_path) {
-        g_ctx.body_file = fopen(req->body_file_path, "rb");
-        if (!g_ctx.body_file) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "fopen(%s) failed for spilled request body, failing the request", req->body_file_path);
-            proteus_php_mod_log_json("worker", "ERROR", msg);
-            proteus_php_mod_capture_shrink(&g_headers);
-            *out_early_sent = 0;
-            return -1;
-        }
-        /* The spill path is predictable and the directory shared, so a
-         * sibling worker of the same uid could race a symlink in ahead of
-         * this open. fstat() on the fd actually obtained is bound to the
-         * resolved inode and cannot be swapped afterwards. */
-        struct stat st;
-        if (fstat(fileno(g_ctx.body_file), &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
-            char msg[512];
-            snprintf(msg, sizeof(msg), "spilled request body file %s failed ownership/type check, failing the request", req->body_file_path);
-            proteus_php_mod_log_json("worker", "ERROR", msg);
-            fclose(g_ctx.body_file);
-            g_ctx.body_file = NULL;
+    /* Exactly one of the inline body and the body fd is set. The fd came
+     * from master over SCM_RIGHTS and names an unlinked file, so there is no
+     * path to race and nothing to check about ownership. */
+    if (req->body_fd >= 0) {
+        /* dup, because fclose() below closes whatever fdopen took, and the
+         * fd itself belongs to the caller. */
+        int fd = dup(req->body_fd);
+        if (fd < 0 || !(g_ctx.body_file = fdopen(fd, "rb"))) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            proteus_php_mod_log_json("worker", "ERROR",
+                "could not open the request body fd, failing the request");
             proteus_php_mod_capture_shrink(&g_headers);
             *out_early_sent = 0;
             return -1;

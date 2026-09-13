@@ -11,10 +11,11 @@ typedef struct {
     const char *content_type;  /* may be NULL */
     const char *const *extra_vars; /* "KEY=VALUE" strings for $_SERVER */
     size_t extra_var_count;
-    const char *body;           /* inline body bytes - NULL if body_file_path is set instead */
+    const char *body;           /* inline body bytes - NULL if body_fd is set instead */
     size_t body_len;
-    const char *body_file_path; /* body spilled to disk instead of body/body_len - opened
-                                  * read-only, read incrementally like the inline case */
+    int body_fd;                /* spilled body, an fd master passed over SCM_RIGHTS;
+                                  * -1 when the body is inline. Read incrementally,
+                                  * like the inline case. */
     const char *cookie_header;  /* raw Cookie header value, may be NULL - populates $_COOKIE */
     const char *authorization;  /* raw Authorization header value, may be NULL - populates PHP_AUTH_* */
 } proteus_php_mod_request_t;

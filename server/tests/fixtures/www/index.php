@@ -138,6 +138,35 @@ if (strpos($_SERVER['REQUEST_URI'], '/reflect-header') !== false) {
     exit;
 }
 
+// Echoes the CGI variables derived from the request target, so a test can
+// prove QUERY_STRING still matches REQUEST_URI after the wire stopped
+// carrying it separately.
+if (strpos($_SERVER['REQUEST_URI'], '/cgi-vars') !== false) {
+    header('Content-Type: text/plain');
+    echo 'uri=', $_SERVER['REQUEST_URI'], "\n";
+    echo 'query=', $_SERVER['QUERY_STRING'] ?? '', "\n";
+    echo 'get_a=', $_GET['a'] ?? 'MISSING', "\n";
+    exit;
+}
+
+// Checks the X-Probe-N headers against the index each one carries, so a lost,
+// duplicated or reordered piece of a fragmented header run is caught here
+// rather than by a test that only looks at one header.
+if (strpos($_SERVER['REQUEST_URI'], '/probe-headers') !== false) {
+    header('Content-Type: text/plain');
+    $n = 0;
+    while (isset($_SERVER['HTTP_X_PROBE_' . $n])) {
+        $want = $n . '-';
+        if (substr($_SERVER['HTTP_X_PROBE_' . $n], 0, strlen($want)) !== $want) {
+            echo 'mismatch@', $n;
+            exit;
+        }
+        $n++;
+    }
+    echo 'ok:', $n;
+    exit;
+}
+
 // Echoes the body back verbatim, so a large one can be checked byte-exact
 // across the disk-spillover path rather than only by length.
 if (strpos($_SERVER['REQUEST_URI'], '/echo-body') !== false) {
