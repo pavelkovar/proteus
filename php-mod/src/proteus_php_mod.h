@@ -52,6 +52,5 @@ int proteus_php_mod_execute_file(
     proteus_php_mod_chunk_fn chunk_cb, void *chunk_cb_user_data,
     int *out_early_sent
 );
-void proteus_php_mod_shutdown(void);
 
 #endif

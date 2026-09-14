@@ -256,8 +256,13 @@ impl WorkerChannel {
         let (req_space_efd, _) = notify.registered().ok_or_else(not_registered)?;
         let channel = mapped.channel();
         let encoded = data::encode_request(encode_scratch, req)?;
-        data::write_request_to_ring(&channel.request, &channel.peer_death, encoded, req_space_efd)
-            .await
+        data::write_request_to_ring(
+            &channel.request,
+            &channel.peer_death,
+            encoded,
+            req_space_efd,
+        )
+        .await
     }
 
     /// The next frame if the worker has already published one. `None` means

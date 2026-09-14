@@ -83,10 +83,13 @@ enum BodyCollectError {
     /// The body stopped arriving. Must fail the request rather than degrade
     /// to an empty one, which would hand the script a silently truncated body.
     Stalled,
-    /// A body-stream read or spill-file write failed. Must fail the request
-    /// rather than degrade to an empty body: PHP must never see a request
-    /// that looks complete but isn't.
+    /// A body-stream read failed. Must fail the request rather than degrade
+    /// to an empty body: PHP must never see a request that looks complete but
+    /// isn't.
     Io,
+    /// The spill file failed - this server's doing, not the client's, so the
+    /// rest of the upload is drained before answering.
+    Spill,
 }
 
 /// Buffers in memory only up to the spill threshold, never the whole body
@@ -101,6 +104,35 @@ async fn collect_body_streaming(
     read_timeout: Option<std::time::Duration>,
 ) -> Result<CollectedBody, BodyCollectError> {
     let mut limited = Limited::new(body, max_body_size);
+    let collected = collect_frames(&mut limited, read_timeout).await;
+    if matches!(collected, Err(BodyCollectError::Spill)) {
+        drain_body(&mut limited, read_timeout).await;
+    }
+    collected
+}
+
+/// Reads off what is left of a body whose request has already failed, so the
+/// error response reaches a client still uploading rather than the connection
+/// closing under it. The same `Limited` still caps how much that can be.
+async fn drain_body(limited: &mut Limited<Incoming>, read_timeout: Option<std::time::Duration>) {
+    loop {
+        let next = match read_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, limited.frame()).await {
+                Ok(next) => next,
+                Err(_) => return,
+            },
+            None => limited.frame().await,
+        };
+        if !matches!(next, Some(Ok(_))) {
+            return;
+        }
+    }
+}
+
+async fn collect_frames(
+    limited: &mut Limited<Incoming>,
+    read_timeout: Option<std::time::Duration>,
+) -> Result<CollectedBody, BodyCollectError> {
     let mut inline: Vec<u8> = Vec::new();
     let mut spilled: Option<tokio::fs::File> = None;
     let mut pending: Vec<u8> = Vec::new();
@@ -136,7 +168,7 @@ async fn collect_body_streaming(
             if pending.len() >= SPILL_WRITE_THRESHOLD {
                 if let Err(e) = file.write_all(&pending).await {
                     logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-                    return Err(BodyCollectError::Io);
+                    return Err(BodyCollectError::Spill);
                 }
                 pending.clear();
             }
@@ -159,7 +191,7 @@ async fn collect_body_streaming(
                 Ok(f) => f,
                 Err(e) => {
                     logging::warn!(r#type = "controller", path = %path.display(), error = %e, "failed creating spilled request body file");
-                    return Err(BodyCollectError::Io);
+                    return Err(BodyCollectError::Spill);
                 }
             };
             // Immediately: from here the body has no name, so nothing can open
@@ -173,12 +205,12 @@ async fn collect_body_streaming(
                 // retrying the call that just failed would not help.
                 Err(e) => {
                     logging::warn!(r#type = "controller", path = %path.display(), error = %e, "could not unlink the spilled request body, it will be left behind");
-                    return Err(BodyCollectError::Io);
+                    return Err(BodyCollectError::Spill);
                 }
             }
             if let Err(e) = file.write_all(&inline).await {
                 logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-                return Err(BodyCollectError::Io);
+                return Err(BodyCollectError::Spill);
             }
             inline.clear();
             inline.shrink_to_fit(); // don't hoard BODY_MEMORY_THRESHOLD bytes for nothing
@@ -194,7 +226,7 @@ async fn collect_body_streaming(
     };
     if let Err(e) = tail {
         logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
-        return Err(BodyCollectError::Io);
+        return Err(BodyCollectError::Spill);
     }
 
     Ok(match spilled {
@@ -204,7 +236,7 @@ async fn collect_body_streaming(
             use tokio::io::AsyncSeekExt as _;
             if let Err(e) = file.rewind().await {
                 logging::warn!(r#type = "controller", error = %e, "failed rewinding spilled request body");
-                return Err(BodyCollectError::Io);
+                return Err(BodyCollectError::Spill);
             }
             CollectedBody::Spilled {
                 file: file.into_std().await,
@@ -291,7 +323,7 @@ pub(crate) async fn build_php_request(
                     0,
                 )));
             }
-            Err(BodyCollectError::Io) => {
+            Err(BodyCollectError::Io | BodyCollectError::Spill) => {
                 return Err(Box::new(DispatchResult::new(
                     ActionBody::Buffered {
                         status: StatusCode::INTERNAL_SERVER_ERROR,

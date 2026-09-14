@@ -1,0 +1,122 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  code-format:
+    name: Check code formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt
+
+      - name: Rustfmt Check
+        uses: actions-rust-lang/rustfmt@v1
+        with:
+          manifest-path: 'server/Cargo.toml'
+
+  server:
+    name: Test server (${{ matrix.arch }})
+    runs-on: ${{ startsWith(matrix.arch, 'arm64') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container:
+      image: almalinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ "x86_64", "arm64" ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install packages
+        run: |
+          dnf -y install gcc-toolset-11 jq
+          echo "/opt/rh/gcc-toolset-11/root/usr/bin" >> $GITHUB_PATH
+          echo "CC=/opt/rh/gcc-toolset-11/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-11/root/usr/bin/g++" >> $GITHUB_ENV
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
+      - name: Run unit tests
+        working-directory: server
+        run: cargo test --bin proteus
+
+      - name: Build integration tests
+        working-directory: server
+        run: |
+          NAME=$(cargo test --test integration --no-run --message-format=json | jq -r 'select(.profile.test == true and .executable != null) | .executable' | head -n 1)
+          cp "$NAME" integration-tests
+
+      - name: Upload integration tests binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: tests-${{ matrix.arch }}
+          path: |
+            **/server/target/debug/proteus
+            **/server/integration-tests
+
+  php-mod:
+    name: Test php-mod (${{ matrix.arch }} / PHP ${{ matrix.php }})
+    runs-on: ${{ startsWith(matrix.arch, 'arm64') && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    needs: server
+    container:
+      image:  almalinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ "x86_64", "arm64" ]
+        php: [ "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5" ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install PHP
+        run: |
+          dnf -y install https://rpms.remirepo.net/enterprise/remi-release-8.rpm epel-release
+          dnf -y module enable php:remi-${{ matrix.php }}
+          dnf -y install php-cli php-devel php-embedded gcc-toolset-11
+          
+          echo "/opt/rh/gcc-toolset-11/root/usr/bin" >> $GITHUB_PATH
+          echo "CC=/opt/rh/gcc-toolset-11/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-11/root/usr/bin/g++" >> $GITHUB_ENV
+
+      - name: Build PHP module
+        working-directory: php-mod
+        run: make
+
+      - name: Create php user
+        run: |
+          groupadd -r -g 1500 phpapp
+          useradd -r -u 1500 -g phpapp -d /var/lib/proteus -s /sbin/nologin -c "Proteus PHP worker user" phpapp
+          mkdir -p /var/lib/proteus && chown phpapp:phpapp /var/lib/proteus
+
+      - name: Download integration tests binary
+        uses: actions/download-artifact@v8
+        with:
+          name: tests-${{ matrix.arch }}
+
+      - name: Build integration tests
+        run: |
+          export PROTEUS_PHP_MOD_PATH=$(pwd)/php-mod/libproteus-php-mod.so
+          
+          chmod +x server/target/debug/proteus
+          chmod +x server/integration-tests
+          
+          ./server/integration-tests

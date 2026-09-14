@@ -3,7 +3,10 @@ use super::*;
 #[test]
 fn a_batch_writes_whole_lines_and_counts_only_what_the_sink_took() {
     let line = vec![b'x'; 1000];
-    let mut batch = Batch { bytes: Vec::new(), lines: 0 };
+    let mut batch = Batch {
+        bytes: Vec::new(),
+        lines: 0,
+    };
 
     let mut sink: Vec<Vec<u8>> = Vec::new();
     let before = WRITTEN.load(Ordering::Acquire);
@@ -16,13 +19,21 @@ fn a_batch_writes_whole_lines_and_counts_only_what_the_sink_took() {
     assert_eq!(sink.iter().map(Vec::len).sum::<usize>(), 9000);
     for write in &sink {
         assert!(write.len() <= MAX_BATCH, "a write may not exceed PIPE_BUF");
-        assert_eq!(write.len() % line.len(), 0, "a line may not be split across writes");
+        assert_eq!(
+            write.len() % line.len(),
+            0,
+            "a line may not be split across writes"
+        );
     }
 
     let before = WRITTEN.load(Ordering::Acquire);
     batch.push(&line, &mut FailingWriter);
     batch.write(&mut FailingWriter);
-    assert_eq!(WRITTEN.load(Ordering::Acquire), before, "a refused write is not a write");
+    assert_eq!(
+        WRITTEN.load(Ordering::Acquire),
+        before,
+        "a refused write is not a write"
+    );
 }
 
 struct CapturingWriter<'a>(&'a mut Vec<Vec<u8>>);
@@ -59,8 +70,13 @@ fn record_is_flat_json_with_the_fields_in_call_order() {
     line.extend_from_slice(b"}\n");
 
     let text = String::from_utf8(line).expect("a log line is always UTF-8");
-    let (timestamp, rest) = text.split_once("\",\"level\"").expect("timestamp comes first");
-    assert_eq!(timestamp.len(), "{\"timestamp\":\"1970-01-01T00:00:00.000000Z".len());
+    let (timestamp, rest) = text
+        .split_once("\",\"level\"")
+        .expect("timestamp comes first");
+    assert_eq!(
+        timestamp.len(),
+        "{\"timestamp\":\"1970-01-01T00:00:00.000000Z".len()
+    );
     assert_eq!(
         rest,
         ":\"INFO\",\"type\":\"controller\",\"pid\":42,\"dropped\":true,\
@@ -68,5 +84,8 @@ fn record_is_flat_json_with_the_fields_in_call_order() {
     );
 
     let parsed: serde_json::Value = serde_json::from_str(&text).expect("a record parses back");
-    assert!(parsed.get("message").is_none(), "a fields-only record carries no message");
+    assert!(
+        parsed.get("message").is_none(),
+        "a fields-only record carries no message"
+    );
 }

@@ -263,6 +263,29 @@ pub(crate) fn sigkill(pid: u32, context: &str) {
     }
 }
 
+fn log_prototype_death(pid: u32, status: WaitStatus) {
+    match status {
+        WaitStatus::Exited(_, code) => {
+            logging::error!(
+                r#type = "controller",
+                pid,
+                exit_code = code,
+                "prototype exited"
+            )
+        }
+        WaitStatus::Signaled(_, signal, core_dumped) => logging::error!(
+            r#type = "controller",
+            pid,
+            signal = signal.as_str(),
+            core_dumped,
+            "prototype was killed by a signal"
+        ),
+        other => {
+            logging::error!(r#type = "controller", pid, status = ?other, "prototype stopped")
+        }
+    }
+}
+
 /// Installed where the dynamic linker already looks, so a bare `dlopen()`
 /// finds it; `PROTEUS_PHP_MOD_PATH` overrides with an absolute path.
 fn resolve_php_mod_path() -> String {
@@ -483,10 +506,24 @@ impl PoolManager {
     fn replace_prototype_child(&self, new_child: std::process::Child) {
         let mut child_guard = self.prototype_child.lock().unwrap();
         if let Some(pid) = child_guard.live_pid() {
-            sigkill(pid, "replacing a prototype that is still running");
             // The lock serialises this against the sweep, so exactly one of
             // the two reaps this pid.
-            let _ = waitpid(Pid::from_raw(pid as i32), None);
+            match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
+                // Reaped ahead of any kill, or the SIGKILL below becomes the
+                // status and buries whatever actually killed it.
+                Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                    log_prototype_death(pid, status);
+                }
+                // Reaped by something else, so the pid may name an unrelated
+                // process by now.
+                Err(Errno::ECHILD) => {}
+                // Including a failed wait: leaving a live prototype unkilled
+                // orphans a whole PHP heap that nothing else tracks.
+                _ => {
+                    sigkill(pid, "replacing a prototype that is still running");
+                    let _ = waitpid(Pid::from_raw(pid as i32), None);
+                }
+            }
         }
         *child_guard = PrototypeHandle::new(new_child);
     }
@@ -611,7 +648,7 @@ impl PoolManager {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            let mut prototype_exited = false;
+            let mut prototype_death = None;
             {
                 // Held for the whole sweep so the pid compared against cannot
                 // be replaced halfway through it.
@@ -620,10 +657,12 @@ impl PoolManager {
                 loop {
                     match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
                         Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
-                        Ok(WaitStatus::Exited(pid, _)) | Ok(WaitStatus::Signaled(pid, _, _)) => {
+                        Ok(
+                            status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)),
+                        ) => {
                             if pid.as_raw() as u32 == prototype_pid {
                                 child_guard.mark_reaped();
-                                prototype_exited = true;
+                                prototype_death = Some((prototype_pid, status));
                             }
                         }
                         Err(Errno::EINTR) => continue,
@@ -631,7 +670,8 @@ impl PoolManager {
                     }
                 }
             }
-            if prototype_exited {
+            if let Some((pid, status)) = prototype_death {
+                log_prototype_death(pid, status);
                 logging::warn!(
                     r#type = "controller",
                     "prototype exited with no pending worker-spawn attempt to notice it - respawning proactively"

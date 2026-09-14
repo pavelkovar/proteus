@@ -251,12 +251,17 @@ if (strpos($_SERVER['REQUEST_URI'], '/cookie-and-auth') !== false) {
 // right string with the function still present.
 if (strpos($_SERVER['REQUEST_URI'], '/disabled-function-check') !== false) {
     echo "EXEC_EXISTS=" . var_export(function_exists('exec'), true) . "\n";
+    echo "PHP_VERSION_ID=" . PHP_VERSION_ID . "\n";
     exit;
 }
 
-// A disabled function raises an uncaught Error like any undefined one.
+// 8.0 drops a disabled function from the table, so calling it is an uncaught
+// Error. 7.4 leaves a stub that warns and returns false, so the script goes on
+// - either way the command itself must not run.
 if (strpos($_SERVER['REQUEST_URI'], '/call-disabled-function') !== false) {
-    exec('echo hi');
+    $output = [];
+    exec('echo hi', $output);
+    echo "EXEC_OUTPUT_LINES=" . count($output) . "\n";
     exit;
 }
 

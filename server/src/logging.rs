@@ -2,9 +2,9 @@ use serde::{Serialize, Serializer as _};
 use std::cell::RefCell;
 use std::fmt;
 use std::io::Write as _;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 const QUEUE_CAPACITY: usize = 8192;
@@ -52,7 +52,9 @@ fn install_panic_hook() {
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("panicked");
-        let location = info.location().map_or_else(String::new, ToString::to_string);
+        let location = info
+            .location()
+            .map_or_else(String::new, ToString::to_string);
         crate::logging::error!(r#type = "panic", pid = std::process::id(), location = %location, "{message}");
         flush();
         previous(info);
@@ -61,7 +63,10 @@ fn install_panic_hook() {
 
 fn drain_loop(receiver: Receiver<Vec<u8>>) {
     let mut out = std::io::stdout().lock();
-    let mut batch = Batch { bytes: Vec::with_capacity(MAX_BATCH), lines: 0 };
+    let mut batch = Batch {
+        bytes: Vec::with_capacity(MAX_BATCH),
+        lines: 0,
+    };
     while let Ok(line) = receiver.recv() {
         batch.push(&line, &mut out);
         while let Ok(line) = receiver.try_recv() {
@@ -102,7 +107,8 @@ impl Batch {
 
 fn report_sink_failure(error: &std::io::Error) {
     if !SINK_FAILED.swap(true, Ordering::Relaxed) {
-        let report = format!("[logger] writing to stdout failed, lines are being dropped: {error}\n");
+        let report =
+            format!("[logger] writing to stdout failed, lines are being dropped: {error}\n");
         let _ = std::io::stderr().write_all(report.as_bytes());
     }
 }

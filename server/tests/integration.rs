@@ -90,8 +90,8 @@ async fn start_server(name: &str, php_root: &str, overrides: serde_json::Value) 
     let child = Command::new(env!("CARGO_BIN_EXE_proteus"))
         .arg(&config_path)
         .env("PROTEUS_PHP_MOD_PATH", php_mod_path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("failed to spawn server binary");
 
@@ -1833,7 +1833,10 @@ async fn a_client_that_disconnects_mid_script_leaves_the_pool_at_full_strength()
             .send(),
     )
     .await;
-    assert!(cut_off.is_err(), "the request completed instead of being cut off");
+    assert!(
+        cut_off.is_err(),
+        "the request completed instead of being cut off"
+    );
 
     let mut status = serde_json::Value::Null;
     for _ in 0..40 {
@@ -2297,8 +2300,9 @@ async fn php_receives_cookies_and_basic_auth() {
 }
 
 /// The directive must reach the engine, not merely make `ini_get` report the
-/// right string: `function_exists()` is the real signal, and calling it
-/// anyway must still fail loudly.
+/// right string: `function_exists()` is the real signal, and calling it anyway
+/// must not run the command. How that refusal surfaces is PHP's own call - a
+/// fatal from 8.0, a warning on 7.4 - so the fixture reports its version.
 #[tokio::test]
 async fn disable_functions_actually_disables_the_function() {
     let www = fixtures_dir().join("www");
@@ -2317,6 +2321,11 @@ async fn disable_functions_actually_disables_the_function() {
     .unwrap();
     let body = resp.text().await.unwrap();
     assert!(body.contains("EXEC_EXISTS=false"), "got: {body}");
+    let php_version_id: u32 = body
+        .lines()
+        .find_map(|line| line.strip_prefix("PHP_VERSION_ID="))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or_else(|| panic!("fixture must report PHP_VERSION_ID: {body}"));
 
     let resp = reqwest::get(format!(
         "http://127.0.0.1:{}/call-disabled-function",
@@ -2324,11 +2333,23 @@ async fn disable_functions_actually_disables_the_function() {
     ))
     .await
     .unwrap();
-    assert_eq!(
-        resp.status(),
-        500,
-        "calling a disabled function must still surface as a real error, not silently no-op"
-    );
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    if php_version_id >= 80000 {
+        assert_eq!(
+            status, 500,
+            "an uncaught Error from a removed function must surface as a real error, not silently no-op: {body}"
+        );
+    } else {
+        assert_eq!(
+            status, 200,
+            "7.4 only warns and returns false, so the script must finish: {body}"
+        );
+        assert!(
+            body.contains("EXEC_OUTPUT_LINES=0"),
+            "the command must not have run: {body}"
+        );
+    }
 }
 
 /// Admin wins on a key collision, and an `ini_set()` against it from inside
@@ -2854,7 +2875,7 @@ async fn access_log_includes_worker_pid_and_php_target() {
         .arg(&config_path)
         .env("PROTEUS_PHP_MOD_PATH", php_mod_path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("failed to spawn server binary");
     let stdout = child.stdout.take().unwrap();
@@ -4209,7 +4230,7 @@ async fn start_server_capturing_stdout(
         .arg(&config_path)
         .env("PROTEUS_PHP_MOD_PATH", php_mod_path())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("failed to spawn server binary");
     let stdout = child.stdout.take().unwrap();
@@ -4760,10 +4781,18 @@ async fn read_one_chunked_response(
 #[tokio::test]
 async fn an_oversized_request_is_refused_without_costing_the_pool_a_worker() {
     let www = fixtures_dir().join("www");
-    let server = start_server("oversized-req", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "oversized-req",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
 
     let pids_before = worker_pids(&server).await;
-    assert!(!pids_before.is_empty(), "expected pre-spawned spare workers");
+    assert!(
+        !pids_before.is_empty(),
+        "expected pre-spawned spare workers"
+    );
 
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{}/echo-body", server.port))
@@ -4816,7 +4845,12 @@ async fn an_oversized_request_is_refused_without_costing_the_pool_a_worker() {
 #[tokio::test]
 async fn bodies_on_both_sides_of_the_spill_threshold_reach_php_intact() {
     let www = fixtures_dir().join("www");
-    let server = start_server("spill-boundary", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "spill-boundary",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::new();
 
     // Straddling `BODY_MEMORY_THRESHOLD`, which this crate cannot see: keep
@@ -4936,7 +4970,12 @@ async fn every_configured_address_is_served() {
 #[tokio::test]
 async fn a_refused_request_leaves_no_body_fd_for_the_next_one_to_pick_up() {
     let www = fixtures_dir().join("www");
-    let server = start_server("body-fd-order", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "body-fd-order",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let client = reqwest::Client::new();
 
     // Spilled body plus headers too big for a ring frame: the frame is
@@ -4971,7 +5010,10 @@ async fn a_refused_request_leaves_no_body_fd_for_the_next_one_to_pick_up() {
         mine.len(),
         "the body that came back is the wrong length"
     );
-    assert_eq!(got, mine, "a stale body fd was picked up by the next request");
+    assert_eq!(
+        got, mine,
+        "a stale body fd was picked up by the next request"
+    );
 }
 
 /// The head cap is what keeps a request inside one ring frame, so it has to
@@ -4994,7 +5036,10 @@ async fn the_request_head_cap_holds_on_both_sides() {
     for (i, v) in values.iter().enumerate() {
         request = request.header(format!("X-Probe-{i}"), v);
     }
-    let response = request.send().await.expect("a head under the cap must serve");
+    let response = request
+        .send()
+        .await
+        .expect("a head under the cap must serve");
     assert_eq!(response.status(), 200);
     assert_eq!(
         response.text().await.unwrap(),
@@ -5025,8 +5070,12 @@ async fn the_request_head_cap_holds_on_both_sides() {
 #[tokio::test]
 async fn one_indivisible_header_value_is_still_refused() {
     let www = fixtures_dir().join("www");
-    let server =
-        start_server("header-indivisible", www.to_str().unwrap(), serde_json::json!({})).await;
+    let server = start_server(
+        "header-indivisible",
+        www.to_str().unwrap(),
+        serde_json::json!({}),
+    )
+    .await;
     let pids_before = worker_pids(&server).await;
 
     let response = reqwest::Client::new()

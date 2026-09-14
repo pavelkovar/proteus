@@ -406,7 +406,10 @@ async fn reusing_a_pid_that_was_never_reaped_gives_its_slot_back() {
         pool.idle.release_slot(s);
         s
     });
-    assert!(free_at_rest.is_some(), "the fixture must start with a free slot");
+    assert!(
+        free_at_rest.is_some(),
+        "the fixture must start with a free slot"
+    );
 
     // A worker that died without anyone noticing: its entry is still tracked
     // and its slot is out of circulation.
@@ -414,7 +417,11 @@ async fn reusing_a_pid_that_was_never_reaped_gives_its_slot_back() {
     let stale_slot = pool.idle.claim_slot().expect("a free slot");
     pool.track_worker(
         PID,
-        Arc::new(WorkerMeta::new(stale_slot, pool.started_at, pool.started_at)),
+        Arc::new(WorkerMeta::new(
+            stale_slot,
+            pool.started_at,
+            pool.started_at,
+        )),
     );
 
     // The same pid comes back on a fresh worker, through the path a real

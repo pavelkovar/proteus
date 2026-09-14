@@ -437,12 +437,31 @@ static int proteus_php_mod_disable_functions(const char *list) {
 }
 #endif
 
-/* ZEND_INI_SYSTEM mutates the directive's own `modifiable` flag as a side
- * effect, so a later ini_set() is rejected regardless of its original
- * modifiability. force_change because this is SAPI setup, not an ini_set()
- * emulation.
- *
- * Returns 0 if every entry applied cleanly, -1 if anything failed - a
+/* Writes the directive in place: zend_alter_ini_entry_ex() would register it in
+ * EG(modified_ini_directives), which zend_ini_deactivate() restores at the end
+ * of the first request. Setting `modifiable` is what locks out ini_set(). */
+static int proteus_php_mod_set_ini(
+    const char *name, size_t name_len, const char *value, int modify_type
+) {
+    zend_ini_entry *ini_entry = zend_hash_str_find_ptr(EG(ini_directives), name, name_len);
+    if (ini_entry == NULL) {
+        return -1;
+    }
+
+    zend_string *new_value = zend_string_init(value, strlen(value), 1);
+    if (ini_entry->on_modify != NULL
+        && ini_entry->on_modify(ini_entry, new_value, ini_entry->mh_arg1, ini_entry->mh_arg2,
+                                ini_entry->mh_arg3, ZEND_INI_STAGE_ACTIVATE) != SUCCESS) {
+        zend_string_release(new_value);
+        return -1;
+    }
+
+    ini_entry->value = new_value;
+    ini_entry->modifiable = (uint8_t) modify_type;
+    return 0;
+}
+
+/* Returns 0 if every entry applied cleanly, -1 if anything failed - a
  * partially-applied, possibly security-relevant configuration must not look
  * like success to the caller. */
 static int proteus_php_mod_apply_ini(const char *const *entries, size_t count, int modify_type) {
@@ -456,10 +475,7 @@ static int proteus_php_mod_apply_ini(const char *const *entries, size_t count, i
         size_t klen = (size_t) (eq - entry);
         const char *val = eq + 1;
 
-        zend_string *name = zend_string_init(entry, klen, 0);
-        zend_string *value = zend_string_init(val, strlen(val), 0);
-        /* Copied internally, so these stay ours to free. */
-        if (zend_alter_ini_entry_ex(name, value, modify_type, PHP_INI_STAGE_ACTIVATE, 1) != SUCCESS) {
+        if (proteus_php_mod_set_ini(entry, klen, val, modify_type) != 0) {
             char msg[320];
             snprintf(msg, sizeof(msg), "failed to set php option '%.*s'", (int) klen, entry);
             proteus_php_mod_log_json("prototype", "ERROR", msg);
@@ -475,9 +491,6 @@ static int proteus_php_mod_apply_ini(const char *const *entries, size_t count, i
                 failed = -1;
             }
         }
-
-        zend_string_release(name);
-        zend_string_release(value);
     }
     return failed;
 }
@@ -497,6 +510,8 @@ int proteus_php_mod_init(
     php_embed_module.read_post = proteus_php_mod_read_post;
     php_embed_module.read_cookies = proteus_php_mod_read_cookies;
     php_embed_module.send_headers = proteus_php_mod_send_headers;
+    php_embed_module.flush = NULL;
+    php_embed_module.php_ini_ignore_cwd = 1;
 
     /* OPcache's accel_find_sapi() hardcodes an allowlist that "embed" is not
      * on, so masquerade as one that is. */
@@ -504,13 +519,11 @@ int proteus_php_mod_init(
 
     sapi_startup(&php_embed_module);
 
-    /* MINIT only; request startup is per-call. */
-    if (php_embed_module.startup(&php_embed_module) == FAILURE) {
-        return -1;
-    }
-
-    /* The supported way to add a module after php_module_startup(). */
-    if (zend_startup_module(&proteus_php_mod_module_entry) == FAILURE) {
+#if PHP_VERSION_ID < 80200
+    if (php_module_startup(&php_embed_module, &proteus_php_mod_module_entry, 1) == FAILURE) {
+#else
+    if (php_module_startup(&php_embed_module, &proteus_php_mod_module_entry) == FAILURE) {
+#endif
         return -1;
     }
 
@@ -648,12 +661,4 @@ int proteus_php_mod_execute_file(
 
     *out_early_sent = g_ctx.early_sent;
     return 0;
-}
-
-void proteus_php_mod_shutdown(void) {
-    php_module_shutdown();
-    sapi_shutdown();
-    free(g_headers.buf);
-    g_headers.buf = NULL;
-    g_headers.cap = g_headers.len = 0;
 }
