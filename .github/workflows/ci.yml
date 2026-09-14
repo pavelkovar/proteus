@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: PHP ${{ matrix.php }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: almalinux:8
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { php: '7.4', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '7.4', arch: arm64, runner: ubuntu-24.04-arm }
+          - { php: '8.0', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '8.0', arch: arm64, runner: ubuntu-24.04-arm }
+          - { php: '8.1', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '8.1', arch: arm64, runner: ubuntu-24.04-arm }
+          - { php: '8.2', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '8.2', arch: arm64, runner: ubuntu-24.04-arm }
+          - { php: '8.3', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '8.3', arch: arm64, runner: ubuntu-24.04-arm }
+          - { php: '8.4', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '8.4', arch: arm64, runner: ubuntu-24.04-arm }
+          - { php: '8.5', arch: x86_64, runner: ubuntu-24.04 }
+          - { php: '8.5', arch: arm64, runner: ubuntu-24.04-arm }
+
+    steps:
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          set -euxo pipefail
+          dnf -y update
+          dnf -y install \
+            ca-certificates \
+            curl \
+            gcc \
+            gcc-c++ \
+            git \
+            make \
+            openssl-devel \
+            pkgconfig \
+            tar \
+            gzip
+          update-ca-trust
+
+      - name: Install PHP ${{ matrix.php }} from Remi
+        shell: bash
+        run: |
+          set -euxo pipefail
+          dnf -y install https://rpms.remirepo.net/enterprise/remi-release-8.rpm
+          dnf -y module reset php
+          dnf -y module enable php:remi-${{ matrix.php }}
+          dnf -y install php php-cli php-devel
+          php -v
+          php-config --version
+          test "$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')" = "${{ matrix.php }}"
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Build and test Rust server
+        shell: bash
+        working-directory: server
+        run: |
+          set -euxo pipefail
+          source "$HOME/.cargo/env"
+          cargo fmt --check
+          cargo test --locked
+          cargo build --release --locked
+
+      - name: Build PHP module
+        shell: bash
+        working-directory: php-mod
+        run: |
+          set -euxo pipefail
+          make clean
+          make
+          php -n -d extension="$PWD/libproteus-php-mod.so" -m >/dev/null
+
+      - name: Assemble output
+        shell: bash
+        run: |
+          set -euxo pipefail
+          out="proteus-php${{ matrix.php }}-${{ matrix.arch }}"
+          mkdir -p "$out"
+          install -m 0755 server/target/release/proteus "$out/proteus"
+          install -m 0755 php-mod/libproteus-php-mod.so "$out/libproteus-php-mod.so"
+          php -v > "$out/php-version.txt"
+          rustc --version > "$out/rust-version.txt"
+          tar -C "$out" -czf "${out}.tar.gz" .
+          sha256sum "${out}.tar.gz" > "${out}.tar.gz.sha256"
+
+      - name: Upload output
+        uses: actions/upload-artifact@v5
+        with:
+          name: proteus-php${{ matrix.php }}-${{ matrix.arch }}
+          path: |
+            proteus-php${{ matrix.php }}-${{ matrix.arch }}.tar.gz
+            proteus-php${{ matrix.php }}-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 14
