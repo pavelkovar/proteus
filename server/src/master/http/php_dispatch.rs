@@ -5,6 +5,7 @@ use super::AppState;
 use super::proxy::{resolve_https, resolve_server_name_port};
 use super::routing::{ActionBody, DispatchResult, RequestContext, ResolvedScript};
 use crate::ipc::data::{HeaderBlob, PhpRequest, RequestBody};
+use crate::logging;
 use crate::master::pool_manager::{DispatchOutcome, TempBodyFile};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
@@ -105,7 +106,6 @@ async fn collect_body_streaming(
     let mut pending: Vec<u8> = Vec::new();
     let mut total_len: u64 = 0;
 
-
     loop {
         let next = match read_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, limited.frame()).await {
@@ -135,7 +135,7 @@ async fn collect_body_streaming(
             pending.extend_from_slice(&data);
             if pending.len() >= SPILL_WRITE_THRESHOLD {
                 if let Err(e) = file.write_all(&pending).await {
-                    tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
+                    logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
                     return Err(BodyCollectError::Io);
                 }
                 pending.clear();
@@ -158,7 +158,7 @@ async fn collect_body_streaming(
             let mut file = match open_options.open(&path).await {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "failed creating spilled request body file");
+                    logging::warn!(r#type = "controller", path = %path.display(), error = %e, "failed creating spilled request body file");
                     return Err(BodyCollectError::Io);
                 }
             };
@@ -172,12 +172,12 @@ async fn collect_body_streaming(
                 // The name outlives this request: nothing later knows it, and
                 // retrying the call that just failed would not help.
                 Err(e) => {
-                    tracing::warn!(r#type = "controller", path = %path.display(), error = %e, "could not unlink the spilled request body, it will be left behind");
+                    logging::warn!(r#type = "controller", path = %path.display(), error = %e, "could not unlink the spilled request body, it will be left behind");
                     return Err(BodyCollectError::Io);
                 }
             }
             if let Err(e) = file.write_all(&inline).await {
-                tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
+                logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
                 return Err(BodyCollectError::Io);
             }
             inline.clear();
@@ -193,7 +193,7 @@ async fn collect_body_streaming(
         None => Ok(()),
     };
     if let Err(e) = tail {
-        tracing::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
+        logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
         return Err(BodyCollectError::Io);
     }
 
@@ -203,7 +203,7 @@ async fn collect_body_streaming(
             // so it has to start at the beginning.
             use tokio::io::AsyncSeekExt as _;
             if let Err(e) = file.rewind().await {
-                tracing::warn!(r#type = "controller", error = %e, "failed rewinding spilled request body");
+                logging::warn!(r#type = "controller", error = %e, "failed rewinding spilled request body");
                 return Err(BodyCollectError::Io);
             }
             CollectedBody::Spilled {
@@ -260,54 +260,49 @@ pub(crate) async fn build_php_request(
 
     let body_read_timeout = (state.config.connection.body_read_timeout > 0)
         .then(|| std::time::Duration::from_secs(state.config.connection.body_read_timeout));
-    let (body, body_cleanup) = match collect_body_streaming(
-        req.into_body(),
-        max_body_size,
-        body_read_timeout,
-    )
-    .await
-    {
-        Ok(CollectedBody::Inline(bytes)) => (RequestBody::Inline(Cow::Owned(bytes)), None),
-        Ok(CollectedBody::Spilled { file, len }) => (
-            RequestBody::File { len },
-            // Already unlinked: the worker gets this fd, nobody can reach the
-            // file by name, and there is no ownership to hand over.
-            Some(TempBodyFile::new(file)),
-        ),
-        Err(BodyCollectError::TooLarge) => {
-            return Err(Box::new(DispatchResult::new(
-                ActionBody::Buffered {
-                    status: StatusCode::PAYLOAD_TOO_LARGE,
-                    body: b"413 request body exceeds the configured limit\n".to_vec(),
-                    headers: HeaderBlob::default(),
-                },
-                "php",
-                0,
-            )));
-        }
-        Err(BodyCollectError::Stalled) => {
-            return Err(Box::new(DispatchResult::new(
-                ActionBody::Buffered {
-                    status: StatusCode::REQUEST_TIMEOUT,
-                    body: b"408 request body stopped arriving\n".to_vec(),
-                    headers: HeaderBlob::default(),
-                },
-                "php",
-                0,
-            )));
-        }
-        Err(BodyCollectError::Io) => {
-            return Err(Box::new(DispatchResult::new(
-                ActionBody::Buffered {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    body: b"500 Internal Server Error\n".to_vec(),
-                    headers: HeaderBlob::default(),
-                },
-                "php",
-                0,
-            )));
-        }
-    };
+    let (body, body_cleanup) =
+        match collect_body_streaming(req.into_body(), max_body_size, body_read_timeout).await {
+            Ok(CollectedBody::Inline(bytes)) => (RequestBody::Inline(Cow::Owned(bytes)), None),
+            Ok(CollectedBody::Spilled { file, len }) => (
+                RequestBody::File { len },
+                // Already unlinked: the worker gets this fd, nobody can reach the
+                // file by name, and there is no ownership to hand over.
+                Some(TempBodyFile::new(file)),
+            ),
+            Err(BodyCollectError::TooLarge) => {
+                return Err(Box::new(DispatchResult::new(
+                    ActionBody::Buffered {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        body: b"413 request body exceeds the configured limit\n".to_vec(),
+                        headers: HeaderBlob::default(),
+                    },
+                    "php",
+                    0,
+                )));
+            }
+            Err(BodyCollectError::Stalled) => {
+                return Err(Box::new(DispatchResult::new(
+                    ActionBody::Buffered {
+                        status: StatusCode::REQUEST_TIMEOUT,
+                        body: b"408 request body stopped arriving\n".to_vec(),
+                        headers: HeaderBlob::default(),
+                    },
+                    "php",
+                    0,
+                )));
+            }
+            Err(BodyCollectError::Io) => {
+                return Err(Box::new(DispatchResult::new(
+                    ActionBody::Buffered {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        body: b"500 Internal Server Error\n".to_vec(),
+                        headers: HeaderBlob::default(),
+                    },
+                    "php",
+                    0,
+                )));
+            }
+        };
 
     Ok((
         PhpRequest {
@@ -351,10 +346,9 @@ pub(crate) async fn dispatch_php(
                 resp.worker_pid,
             )
         }
-        DispatchOutcome::Timeout => php_error_response(
-            StatusCode::GATEWAY_TIMEOUT,
-            b"504 Gateway Timeout\n",
-        ),
+        DispatchOutcome::Timeout => {
+            php_error_response(StatusCode::GATEWAY_TIMEOUT, b"504 Gateway Timeout\n")
+        }
         DispatchOutcome::QueueTimeout => php_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             b"503 Service Unavailable\n",

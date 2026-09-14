@@ -29,7 +29,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[cfg(target_os = "linux")]
 fn enable_child_subreaper() {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
-        tracing::warn!(
+        logging::warn!(
             r#type = "controller",
             error = %std::io::Error::last_os_error(),
             "prctl(PR_SET_CHILD_SUBREAPER) failed - orphaned workers may outlive a killed prototype"
@@ -80,6 +80,8 @@ fn main() {
         .build()
         .expect("failed to build tokio runtime");
     rt.block_on(run_master(config));
+
+    logging::flush();
 }
 
 async fn run_master(config: Config) {
@@ -112,7 +114,7 @@ async fn run_master(config: Config) {
             let n = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1);
-            tracing::warn!(
+            logging::warn!(
                 r#type = "controller",
                 cores = n,
                 "could not read this process's CPU affinity, serving unpinned"
@@ -176,7 +178,7 @@ async fn run_master(config: Config) {
         }));
     }
     for listen in &state.config.listen {
-        tracing::info!(r#type = "controller", %listen, cores = cpus.len(), "listening");
+        logging::info!(r#type = "controller", %listen, cores = cpus.len(), "listening");
     }
 
     master::http::serve_control(state, shutdown_tx).await;

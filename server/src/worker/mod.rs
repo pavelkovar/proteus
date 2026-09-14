@@ -4,6 +4,7 @@
 
 use crate::ipc::data;
 use crate::ipc::shm;
+use crate::logging;
 use crate::prototype::php_ffi::{PhpChunk, PhpConn};
 use std::os::fd::OwnedFd;
 
@@ -23,7 +24,7 @@ pub(crate) const COALESCE_FLUSH_THRESHOLD: usize = 64 * 1024;
 #[cfg(target_os = "linux")]
 fn die_with_parent(expected_parent: nix::unistd::Pid) {
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        tracing::warn!(
+        logging::warn!(
             r#type = "worker",
             error = %std::io::Error::last_os_error(),
             "prctl(PR_SET_PDEATHSIG) failed - this worker will not die with its prototype"
@@ -84,12 +85,12 @@ pub(crate) fn run(
             Ok(Some(data::WorkerCommand::Retire)) => {
                 // Only reachable while genuinely idle, so there is nothing
                 // to finish first.
-                tracing::debug!(r#type = "worker", pid, "idle timeout reached, retiring");
+                logging::debug!(r#type = "worker", pid, "idle timeout reached, retiring");
                 break;
             }
             Ok(None) => break,
             Err(e) => {
-                tracing::warn!(r#type = "worker", pid, error = %e, "read_command_from_ring failed");
+                logging::warn!(r#type = "worker", pid, error = %e, "read_command_from_ring failed");
                 break;
             }
         };
@@ -99,7 +100,7 @@ pub(crate) fn run(
             data::RequestBody::File { .. } => match recv_body_fd(&body_socket) {
                 Ok(fd) => Some(fd),
                 Err(e) => {
-                    tracing::warn!(r#type = "worker", pid, error = %e, "no fd arrived for a spilled request body");
+                    logging::warn!(r#type = "worker", pid, error = %e, "no fd arrived for a spilled request body");
                     break;
                 }
             },
@@ -146,7 +147,7 @@ pub(crate) fn run(
                 ),
             };
             if let Err(e) = result {
-                tracing::warn!(r#type = "worker", pid, error = %e, "write_response_frame_to_ring failed");
+                logging::warn!(r#type = "worker", pid, error = %e, "write_response_frame_to_ring failed");
                 write_failed = true;
             }
         };
@@ -160,7 +161,7 @@ pub(crate) fn run(
         // Unconditional, right after execute_file truly returns: this marker
         // is the only thing that tells master the worker is free again.
         if result.early_sent {
-            tracing::debug!(
+            logging::debug!(
                 r#type = "worker",
                 pid,
                 "fastcgi_finish_request() fired, response already streamed early"
@@ -171,12 +172,12 @@ pub(crate) fn run(
             &channel.peer_death,
             resp_data_efd_raw,
         ) {
-            tracing::warn!(r#type = "worker", pid, error = %e, "write_worker_done_to_ring failed");
+            logging::warn!(r#type = "worker", pid, error = %e, "write_worker_done_to_ring failed");
             break;
         }
 
         if retiring {
-            tracing::debug!(
+            logging::debug!(
                 r#type = "worker",
                 pid,
                 max_requests,

@@ -2,6 +2,7 @@
 //! cross this boundary.
 
 use crate::ipc::data::{HeaderBlob, PhpRequest, RequestBody};
+use crate::logging;
 use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW, Symbol};
 use std::ffi::CString;
 use std::io::Write;
@@ -73,9 +74,9 @@ struct CPhpRequest {
     extra_var_count: c_ulong,
     body: *const c_char, // null if body_fd is set instead
     body_len: c_ulong,
-    body_fd: c_int, // -1 if body/body_len are used instead
-    cookie_header: *const c_char,  // may be null
-    authorization: *const c_char,  // may be null
+    body_fd: c_int,               // -1 if body/body_len are used instead
+    cookie_header: *const c_char, // may be null
+    authorization: *const c_char, // may be null
 }
 
 /// Matches `proteus_php_mod_chunk_kind` in the C header.
@@ -213,11 +214,9 @@ impl PhpRequestFfi {
 
         // Exactly one of the inline body and the body fd is set.
         let (body_ptr, body_len, body_fd) = match &req.body {
-            RequestBody::Inline(bytes) => (
-                bytes.as_ptr() as *const c_char,
-                bytes.len() as c_ulong,
-                -1,
-            ),
+            RequestBody::Inline(bytes) => {
+                (bytes.as_ptr() as *const c_char, bytes.len() as c_ulong, -1)
+            }
             RequestBody::File { len } => (
                 std::ptr::null(),
                 *len as c_ulong,
@@ -404,7 +403,7 @@ unsafe extern "C" fn chunk_trampoline(
         // means an ABI mismatch, not a normal event. Dropped rather than
         // guessed as `End`; the request_timeout watchdog kills the worker
         // once the sequence never completes.
-        tracing::error!(
+        logging::error!(
             r#type = "prototype",
             kind,
             "php-mod sent an unrecognized chunk kind, dropping it"

@@ -20,6 +20,7 @@ use response::*;
 use routing::*;
 
 use crate::config::{Config, RouteActionConfig};
+use crate::logging;
 use crate::master::pool_manager::PoolManager;
 use bytes::Bytes;
 use http_body::Frame;
@@ -147,7 +148,7 @@ struct PendingAccessLog {
 impl PendingAccessLog {
     /// 0 for anything that never reached a PHP worker; a real pid is never 0.
     fn emit(&self, body: BodyOutcome) {
-        tracing::info!(
+        logging::info!(
             r#type = "access_log",
             client_ip = %self.client_ip,
             method = %self.method,
@@ -298,7 +299,7 @@ async fn handle(
                 b"400 invalid path\n".to_vec(),
                 &crate::ipc::data::HeaderBlob::default(),
             );
-            tracing::debug!(
+            logging::debug!(
                 r#type = "controller",
                 ?reason,
                 raw_path = uri.path(),
@@ -528,7 +529,7 @@ fn set_defer_accept_or_log(listener: &TcpListener, listen: &str) {
         )
     };
     if rc != 0 {
-        tracing::warn!(
+        logging::warn!(
             r#type = "controller",
             %listen,
             error = %std::io::Error::last_os_error(),
@@ -542,7 +543,7 @@ fn set_defer_accept_or_log(listener: &TcpListener, listen: &str) {
 /// fixed-40ms-per-request bug.
 fn set_nodelay_or_log(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
-        tracing::warn!(r#type = "controller", error = %e, "set_nodelay failed");
+        logging::warn!(r#type = "controller", error = %e, "set_nodelay failed");
     }
 }
 
@@ -553,12 +554,12 @@ async fn serve_status(listen: String, state: Arc<AppState>) {
     let listener = TcpListener::bind(&listen)
         .await
         .expect("status bind failed");
-    tracing::info!(r#type = "controller", %listen, "status endpoint listening");
+    logging::info!(r#type = "controller", %listen, "status endpoint listening");
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(r#type = "controller", error = %e, "status accept failed");
+                logging::warn!(r#type = "controller", error = %e, "status accept failed");
                 continue;
             }
         };
@@ -595,8 +596,8 @@ async fn wait_for_shutdown_signal() {
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     tokio::select! {
-        _ = sigterm.recv() => tracing::info!(r#type = "controller", "received SIGTERM"),
-        _ = sigint.recv() => tracing::info!(r#type = "controller", "received SIGINT"),
+        _ = sigterm.recv() => logging::info!(r#type = "controller", "received SIGTERM"),
+        _ = sigint.recv() => logging::info!(r#type = "controller", "received SIGINT"),
     }
 }
 
@@ -648,7 +649,7 @@ pub fn pin_to_cpu(cpu: usize) {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_SET(cpu, &mut set);
         if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) != 0 {
-            tracing::debug!(
+            logging::debug!(
                 r#type = "controller",
                 cpu,
                 error = %std::io::Error::last_os_error(),
@@ -719,7 +720,7 @@ async fn accept_loop(
     let listener = match TcpListener::from_std(listener) {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(r#type = "controller", %listen_addr, error = %e, "registering a listening socket failed");
+            logging::error!(r#type = "controller", %listen_addr, error = %e, "registering a listening socket failed");
             return;
         }
     };
@@ -730,7 +731,7 @@ async fn accept_loop(
             result = listener.accept() => match result {
                 Ok(v) => v,
                 Err(e) => {
-                    tracing::warn!(r#type = "controller", error = %e, "accept failed");
+                    logging::warn!(r#type = "controller", error = %e, "accept failed");
                     continue;
                 }
             },
@@ -753,7 +754,7 @@ async fn accept_loop(
             serve_one_connection(stream, peer, listen_addr, state, timeouts).await;
         });
     }
-    tracing::info!(r#type = "controller", %listen_addr, "no longer accepting new connections");
+    logging::info!(r#type = "controller", %listen_addr, "no longer accepting new connections");
 }
 
 /// What one request's head may total, on every listener. The frame carrying it
@@ -780,7 +781,9 @@ struct ConnTimeouts {
 impl ConnTimeouts {
     fn from(state: &AppState) -> Self {
         ConnTimeouts {
-            header_read: std::time::Duration::from_secs(state.config.connection.header_read_timeout),
+            header_read: std::time::Duration::from_secs(
+                state.config.connection.header_read_timeout,
+            ),
             idle: std::time::Duration::from_secs(state.config.connection.idle_timeout),
         }
     }
@@ -831,7 +834,7 @@ async fn serve_one_connection(
         }
     };
     if let Err(err) = result {
-        tracing::debug!(r#type = "controller", %peer, error = %err, "connection error");
+        logging::debug!(r#type = "controller", %peer, error = %err, "connection error");
     }
 }
 
@@ -854,14 +857,14 @@ pub async fn serve_control(state: Arc<AppState>, shutdown: tokio::sync::watch::S
     }
     let remaining = state.in_flight.load(Relaxed);
     if remaining > 0 {
-        tracing::warn!(
+        logging::warn!(
             r#type = "controller",
             ?grace_period,
             remaining,
             "grace period elapsed with request(s) still in flight, exiting anyway"
         );
     } else {
-        tracing::info!(
+        logging::info!(
             r#type = "controller",
             "all in-flight requests finished, exiting cleanly"
         );

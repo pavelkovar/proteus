@@ -26,6 +26,7 @@ headers = "0.4"
 http-body = "1"
 http-body-util = "0.1"
 httpdate = "1"
+humantime = "2.4.0"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 ipnetwork = { version = "0.21.1", features = ["serde"] }
@@ -43,9 +44,6 @@ socket2 = { version = "0.6", features = ["all"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "time", "fs", "signal"] }
 tokio-seqpacket = "0.9"
 tokio-stream = "0.1"
-tracing = "0.1"
-tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["json", "fmt"] }
 zstd = "0.14"
 
 [dev-dependencies]

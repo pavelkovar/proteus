@@ -11,6 +11,7 @@
 //! parks the *task* via `AsyncFd`/eventfd, because blocking a shared tokio
 //! thread would stall every other pooled connection.
 
+use crate::logging;
 use std::cell::UnsafeCell;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -467,7 +468,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         // writer may be filling zeroes live data, while skipping costs only
         // residency. A necessary condition, not a proof - see the safety note.
         if self.write_pos.load(Ordering::Relaxed) != read_pos {
-            tracing::warn!(
+            logging::warn!(
                 r#type = "controller",
                 "skipped a ring reclaim: the writer is not idle"
             );
@@ -493,7 +494,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
             })
         };
         if let Err(e) = result {
-            tracing::debug!(r#type = "controller", error = %e, "fallocate(FALLOC_FL_PUNCH_HOLE) failed, skipping reclaim");
+            logging::debug!(r#type = "controller", error = %e, "fallocate(FALLOC_FL_PUNCH_HOLE) failed, skipping reclaim");
         }
         // A failed punch costs residency, not correctness, and retrying it
         // would not help.

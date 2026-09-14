@@ -11,6 +11,7 @@ use super::conditional::{
 };
 use super::range::{FileBody, parse_range};
 use crate::ipc::data::HeaderBlob;
+use crate::logging;
 use crate::master::pool_manager::BodyStream;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -87,7 +88,7 @@ fn apply_headers(
         if hyper::header::HeaderName::from_bytes(name.as_bytes()).is_err()
             || hyper::header::HeaderValue::from_bytes(value.as_bytes()).is_err()
         {
-            tracing::warn!(
+            logging::warn!(
                 r#type = "controller",
                 header = name,
                 "dropping a response header that is not valid HTTP"

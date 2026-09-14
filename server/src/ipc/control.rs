@@ -4,6 +4,7 @@
 //! EOF detection breaks when the prototype dies.
 
 use crate::ipc::shm;
+use crate::logging;
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
@@ -53,16 +54,21 @@ pub async fn request_worker(control: &UnixSeqpacket) -> std::io::Result<(WorkerR
             fds.extend(received);
         }
     }
-    let [channel_fd, liveness_fd, req_space_efd, resp_data_efd, body_fd] =
-        <[OwnedFd; 5]>::try_from(fds).map_err(|fds| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "expected exactly 5 fds in WORKER_READY reply, got {}",
-                    fds.len()
-                ),
-            )
-        })?;
+    let [
+        channel_fd,
+        liveness_fd,
+        req_space_efd,
+        resp_data_efd,
+        body_fd,
+    ] = <[OwnedFd; 5]>::try_from(fds).map_err(|fds| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "expected exactly 5 fds in WORKER_READY reply, got {}",
+                fds.len()
+            ),
+        )
+    })?;
 
     Ok((
         WorkerReadyFds {
@@ -121,10 +127,10 @@ pub fn reap_finished_workers() {
             Ok(WaitStatus::StillAlive) => break,
             // Turns a mystery 500 into a diagnosable one.
             Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                tracing::warn!(r#type = "prototype", worker_pid = %pid, ?signal, "worker killed by signal");
+                logging::warn!(r#type = "prototype", worker_pid = %pid, ?signal, "worker killed by signal");
             }
             Ok(WaitStatus::Exited(pid, code)) if code != 0 => {
-                tracing::warn!(r#type = "prototype", worker_pid = %pid, code, "worker exited with non-zero code");
+                logging::warn!(r#type = "prototype", worker_pid = %pid, code, "worker exited with non-zero code");
             }
             Ok(_status) => continue,
             Err(nix::errno::Errno::ECHILD) => break,

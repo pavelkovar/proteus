@@ -9,6 +9,7 @@
 use super::bounded_map::BoundedMap;
 use super::proxy::ClientIdentity;
 use crate::config::MatchPattern;
+use crate::logging;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
@@ -115,7 +116,7 @@ impl RateLimiter {
         // logged since the configured value is then not what's enforced.
         let capacity = requests.min(TOKEN_MASK as u32);
         if capacity != requests {
-            tracing::warn!(
+            logging::warn!(
                 r#type = "controller",
                 requests,
                 capacity,

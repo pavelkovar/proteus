@@ -11,6 +11,7 @@ use super::prototype_launch;
 use super::worker_channel::WorkerChannel;
 use crate::config::{Config, PhpOptions};
 use crate::ipc::control;
+use crate::logging;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -251,14 +252,14 @@ fn respawn_backoff_delay(consecutive_failures: u32) -> Duration {
 /// Logs rather than panics on delivery failure; ESRCH on an already-dead pid
 /// is the expected case.
 pub(crate) fn sigkill(pid: u32, context: &str) {
-    tracing::debug!(
+    logging::debug!(
         r#type = "controller",
         pid,
         context,
         "sending SIGKILL to worker"
     );
     if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
-        tracing::warn!(r#type = "controller", pid, error = %e, "signal delivery failed");
+        logging::warn!(r#type = "controller", pid, error = %e, "signal delivery failed");
     }
 }
 
@@ -360,7 +361,7 @@ impl PoolManager {
             cfg.php.no_new_privs,
         )
         .expect("failed to spawn prototype");
-        tracing::info!(
+        logging::info!(
             r#type = "controller",
             pid = child.id(),
             uid,
@@ -430,7 +431,7 @@ impl PoolManager {
         }
         backoff.last_attempt = Some(now);
 
-        tracing::info!(
+        logging::info!(
             r#type = "controller",
             consecutive_failures = backoff.consecutive_failures,
             "attempting to respawn the prototype"
@@ -464,12 +465,12 @@ impl PoolManager {
 
                 backoff.consecutive_failures = 0;
                 self.prototype_respawns.fetch_add(1, Relaxed);
-                tracing::info!(r#type = "controller", pid = new_pid, "prototype respawned");
+                logging::info!(r#type = "controller", pid = new_pid, "prototype respawned");
                 true
             }
             Err(e) => {
                 backoff.consecutive_failures += 1;
-                tracing::error!(r#type = "controller", error = %e, "failed to respawn prototype");
+                logging::error!(r#type = "controller", error = %e, "failed to respawn prototype");
                 false
             }
         }
@@ -516,7 +517,7 @@ impl PoolManager {
                 .collect()
         };
         for pid in dead {
-            tracing::warn!(
+            logging::warn!(
                 r#type = "controller",
                 pid,
                 "reaping a worker that died without master noticing"
@@ -546,7 +547,7 @@ impl PoolManager {
         // Reversed, so the warmest ends up back on top.
         for (slot, worker) in held.into_iter().rev() {
             if worker.channel.worker_has_exited() {
-                tracing::debug!(
+                logging::debug!(
                     r#type = "controller",
                     pid = worker.pid,
                     "worker retired itself on idle timeout"
@@ -566,7 +567,7 @@ impl PoolManager {
             self.idle.push(slot, worker);
         }
         if reclaimed > 0 {
-            tracing::debug!(
+            logging::debug!(
                 r#type = "controller",
                 workers = reclaimed,
                 "reclaimed ring pages from idle workers"
@@ -594,7 +595,7 @@ impl PoolManager {
                 match self.spawn_worker().await {
                     Ok(worker) => self.return_worker(worker),
                     Err(e) => {
-                        tracing::warn!(r#type = "controller", error = %e, "failed to top the pool back up to spare");
+                        logging::warn!(r#type = "controller", error = %e, "failed to top the pool back up to spare");
                         break;
                     }
                 }
@@ -631,7 +632,7 @@ impl PoolManager {
                 }
             }
             if prototype_exited {
-                tracing::warn!(
+                logging::warn!(
                     r#type = "controller",
                     "prototype exited with no pending worker-spawn attempt to notice it - respawning proactively"
                 );
@@ -642,12 +643,12 @@ impl PoolManager {
 
     /// Best-effort: fewer spares than asked for beats failing to start.
     pub async fn prespawn_spare(self: &Arc<Self>, spare: usize) {
-        tracing::info!(r#type = "controller", spare, "pre-spawning spare workers");
+        logging::info!(r#type = "controller", spare, "pre-spawning spare workers");
         for _ in 0..spare {
             match self.spawn_worker().await {
                 Ok(w) => self.return_worker(w),
                 Err(e) => {
-                    tracing::error!(r#type = "controller", error = %e, "failed to pre-spawn a spare worker")
+                    logging::error!(r#type = "controller", error = %e, "failed to pre-spawn a spare worker")
                 }
             }
         }
@@ -658,7 +659,11 @@ impl PoolManager {
     /// enough that the hop costs nothing that shows.
     async fn spawn_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
         let pool = Arc::clone(self);
-        match self.control_rt.spawn(async move { pool.spawn_worker_here().await }).await {
+        match self
+            .control_rt
+            .spawn(async move { pool.spawn_worker_here().await })
+            .await
+        {
             Ok(result) => result,
             Err(e) => Err(std::io::Error::other(format!(
                 "worker spawn task on the control runtime failed: {e}"
@@ -674,7 +679,7 @@ impl PoolManager {
             Ok(w) => Ok(w),
             Err(e) if is_pool_full(&e) => Err(e),
             Err(e) => {
-                tracing::warn!(r#type = "controller", error = %e, "spawn_worker failed, trying to respawn the prototype");
+                logging::warn!(r#type = "controller", error = %e, "spawn_worker failed, trying to respawn the prototype");
                 if self.try_respawn_prototype().await {
                     self.spawn_worker_once().await
                 } else {
@@ -704,7 +709,7 @@ impl PoolManager {
                 // is desynced: a later request could read this one's stale
                 // WORKER_READY and take fds for a worker it never asked for.
                 // Killing the prototype is what retires that channel.
-                tracing::error!(
+                logging::error!(
                     r#type = "controller",
                     spawn_timeout = ?self.spawn_timeout,
                     "prototype did not answer a worker-spawn request in time, killing it"
@@ -727,9 +732,13 @@ impl PoolManager {
         self.workers_spawned.fetch_add(1, Relaxed);
         // Past every fallible step, so the slot now belongs to a worker that
         // `workers` will account for.
-        let meta = Arc::new(WorkerMeta::new(slot.keep(), Instant::now(), self.started_at));
+        let meta = Arc::new(WorkerMeta::new(
+            slot.keep(),
+            Instant::now(),
+            self.started_at,
+        ));
         self.track_worker(pid, Arc::clone(&meta));
-        tracing::debug!(r#type = "controller", pid, "spawned worker");
+        logging::debug!(r#type = "controller", pid, "spawned worker");
         Ok(PooledWorker { channel, pid, meta })
     }
 
@@ -754,7 +763,11 @@ impl PoolManager {
         let displaced = self.workers.lock().unwrap().insert(pid, meta);
         if let Some(stale) = displaced {
             // Gone for certain: the kernel does not hand out a live pid.
-            tracing::warn!(r#type = "controller", pid, "reusing the pid of a worker that was never reaped");
+            logging::warn!(
+                r#type = "controller",
+                pid,
+                "reusing the pid of a worker that was never reaped"
+            );
             self.idle.release_slot(stale.slot);
             self.workers_reaped_dead.fetch_add(1, Relaxed);
         }
@@ -782,7 +795,7 @@ impl PoolManager {
                 if !worker.channel.worker_has_exited() {
                     return Ok(worker);
                 }
-                tracing::debug!(
+                logging::debug!(
                     r#type = "controller",
                     pid = worker.pid,
                     "discarding a worker that retired on idle timeout"

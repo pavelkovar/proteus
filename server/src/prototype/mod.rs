@@ -6,6 +6,7 @@ pub mod php_ffi;
 
 use crate::config::PhpOptions;
 use crate::ipc::{CONFIG_FD, CONTROL_FD, control, shm};
+use crate::logging;
 use crate::proctitle;
 use crate::worker;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, getsockopt, socketpair, sockopt};
@@ -81,7 +82,7 @@ pub fn run() -> ! {
     let idle_timeout =
         (idle_timeout_seconds > 0).then(|| std::time::Duration::from_secs(idle_timeout_seconds));
 
-    tracing::info!(
+    logging::info!(
         r#type = "prototype",
         pid = std::process::id(),
         "loading php-mod: {php_mod_path}"
@@ -107,7 +108,7 @@ pub fn run() -> ! {
     phpconn
         .init(&admin_entries, &to_entries(&proto_options.user))
         .expect("proteus_php_mod_init failed");
-    tracing::debug!(
+    logging::debug!(
         r#type = "prototype",
         "PHP embed SAPI + OPcache/APCu initialized, entering fork-server loop"
     );
@@ -120,7 +121,7 @@ pub fn run() -> ! {
         let cmd = match control::recv_command(&mut control_stream) {
             Ok(Some(cmd)) => cmd,
             Ok(None) => {
-                tracing::info!(
+                logging::info!(
                     r#type = "prototype",
                     "control channel closed by master, exiting"
                 );
@@ -129,13 +130,13 @@ pub fn run() -> ! {
             // The reap wakeup, with no SPAWN pending.
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => {
-                tracing::error!(r#type = "prototype", error = %e, "control read error, exiting");
+                logging::error!(r#type = "prototype", error = %e, "control read error, exiting");
                 break;
             }
         };
 
         if cmd != control::SPAWN {
-            tracing::warn!(r#type = "prototype", command = ?cmd, "unknown control command");
+            logging::warn!(r#type = "prototype", command = ?cmd, "unknown control command");
             continue;
         }
 
@@ -208,7 +209,7 @@ pub fn run() -> ! {
                 };
                 if let Err(e) = control::send_worker_ready(&mut control_stream, child.as_raw(), fds)
                 {
-                    tracing::error!(r#type = "prototype", error = %e, "send_worker_ready failed");
+                    logging::error!(r#type = "prototype", error = %e, "send_worker_ready failed");
                 }
             }
         }

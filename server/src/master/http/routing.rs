@@ -7,6 +7,7 @@ use super::php_dispatch::{build_php_request, dispatch_php};
 use super::proxy::ClientIdentity;
 use crate::config::{Config, RouteActionConfig, extension_is_listed};
 use crate::ipc::data::HeaderBlob;
+use crate::logging;
 use crate::master::pool_manager::BodyStream;
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
@@ -62,7 +63,7 @@ pub(crate) fn open_cached(path: &Path) -> Option<std::io::Result<std::fs::File>>
         // seccomp profile that refuses the call.
         Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM) | Some(libc::E2BIG) => {
             OPENAT2_USABLE.store(false, Relaxed);
-            tracing::warn!(
+            logging::warn!(
                 r#type = "controller",
                 error = %err,
                 "openat2(RESOLVE_CACHED) unavailable, every static open now goes through the blocking pool"

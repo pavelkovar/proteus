@@ -6,6 +6,7 @@
 
 use super::{PoolManager, PooledWorker, TempBodyFile, sigkill};
 use crate::ipc::data::{HeaderBlob, PhpRequest};
+use crate::logging;
 use crate::master::worker_channel::WorkerEvent;
 use bytes::Bytes;
 use std::sync::Arc;
@@ -46,7 +47,7 @@ impl Drop for CheckedOutWorker {
             return; // handed off, nothing to clean up
         };
         let pid = worker.pid;
-        tracing::debug!(
+        logging::debug!(
             r#type = "controller",
             pid,
             "request abandoned while a worker was checked out, releasing it"
@@ -218,7 +219,7 @@ impl PoolManager {
             }
             Err(DispatchAttemptError::TimedOut(permit)) => return self.timed_out(pid, permit),
             Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
-                tracing::warn!(
+                logging::warn!(
                     r#type = "controller",
                     pid,
                     error = %e,
@@ -276,7 +277,7 @@ impl PoolManager {
 
     /// Logs, counts, releases the permit.
     fn give_up(&self, context: &str, permit: OwnedSemaphorePermit) -> DispatchOutcome {
-        tracing::error!(r#type = "controller", "{context}");
+        logging::error!(r#type = "controller", "{context}");
         self.dispatch_failed.fetch_add(1, Relaxed);
         drop(permit);
         DispatchOutcome::Failed
@@ -341,7 +342,7 @@ impl PoolManager {
             // Even a worker that hung before reading the request must be
             // killed, or it runs on invisible to every later watchdog pass.
             Err(_elapsed) => {
-                tracing::warn!(
+                logging::warn!(
                     r#type = "controller",
                     pid,
                     request_timeout = ?self.request_timeout,
@@ -477,7 +478,7 @@ impl PoolManager {
                     if body_tx.send(Ok(chunk)).await.is_err() {
                         // Client gone: the worker's state can no longer be
                         // trusted enough to pool it, but this is not its fault.
-                        tracing::debug!(
+                        logging::debug!(
                             r#type = "controller",
                             pid,
                             "body receiver dropped (client gone), killing worker"
@@ -494,7 +495,7 @@ impl PoolManager {
                             "unexpected second Headers frame",
                         )))
                         .await;
-                    tracing::error!(
+                    logging::error!(
                         r#type = "controller",
                         pid,
                         "worker sent a second Headers frame, protocol violation"
@@ -521,7 +522,7 @@ impl PoolManager {
                             "worker exceeded request_timeout mid-response",
                         )))
                         .await;
-                    tracing::warn!(
+                    logging::warn!(
                         r#type = "controller",
                         pid,
                         request_timeout = ?self.request_timeout,
@@ -551,7 +552,7 @@ impl PoolManager {
         if retiring {
             // The worker exits right after this, so there is no done marker
             // coming and nothing to return to the pool.
-            tracing::debug!(
+            logging::debug!(
                 r#type = "controller",
                 pid,
                 "worker self-retired after limits.requests"
@@ -583,7 +584,7 @@ impl PoolManager {
                 );
             }
             Err(_elapsed) => {
-                tracing::warn!(
+                logging::warn!(
                     r#type = "controller",
                     pid,
                     request_timeout = ?self.request_timeout,
@@ -607,7 +608,7 @@ impl PoolManager {
     /// channel gets a *parked* worker to exit on its own, while one still
     /// inside `execute_file` would run on unowned and untracked.
     fn read_failed(&self, pid: u32, permit: OwnedSemaphorePermit, context: &str) {
-        tracing::warn!(r#type = "controller", pid, "{context}");
+        logging::warn!(r#type = "controller", pid, "{context}");
         self.dispatch_failed.fetch_add(1, Relaxed);
         sigkill(pid, "response stream failed, worker abandoned");
         self.remove_worker_meta(pid);
