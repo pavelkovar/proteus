@@ -46,10 +46,10 @@ jobs:
 
       - name: Install packages
         run: |
-          dnf -y install gcc-toolset-11 jq
-          echo "/opt/rh/gcc-toolset-11/root/usr/bin" >> $GITHUB_PATH
-          echo "CC=/opt/rh/gcc-toolset-11/root/usr/bin/gcc" >> $GITHUB_ENV
-          echo "CXX=/opt/rh/gcc-toolset-11/root/usr/bin/g++" >> $GITHUB_ENV
+          dnf -y install gcc-toolset-15 jq
+          echo "/opt/rh/gcc-toolset-15/root/usr/bin" >> $GITHUB_PATH
+          echo "CC=/opt/rh/gcc-toolset-15/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++" >> $GITHUB_ENV
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -91,11 +91,11 @@ jobs:
         run: |
           dnf -y install https://rpms.remirepo.net/enterprise/remi-release-8.rpm epel-release
           dnf -y module enable php:remi-${{ matrix.php }}
-          dnf -y install php-cli php-devel php-embedded gcc-toolset-11
+          dnf -y install php-cli php-devel php-embedded gcc-toolset-15
           
-          echo "/opt/rh/gcc-toolset-11/root/usr/bin" >> $GITHUB_PATH
-          echo "CC=/opt/rh/gcc-toolset-11/root/usr/bin/gcc" >> $GITHUB_ENV
-          echo "CXX=/opt/rh/gcc-toolset-11/root/usr/bin/g++" >> $GITHUB_ENV
+          echo "/opt/rh/gcc-toolset-15/root/usr/bin" >> $GITHUB_PATH
+          echo "CC=/opt/rh/gcc-toolset-15/root/usr/bin/gcc" >> $GITHUB_ENV
+          echo "CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++" >> $GITHUB_ENV
 
       - name: Build PHP module
         working-directory: php-mod

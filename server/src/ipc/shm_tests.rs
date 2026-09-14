@@ -994,7 +994,7 @@ async fn master_async_write_and_worker_blocking_read_survive_real_contention() {
 #[tokio::test]
 async fn a_mapped_channel_survives_being_shared_across_threads() {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
 
     const N: usize = 2_000;
 
@@ -1019,14 +1019,18 @@ async fn a_mapped_channel_survives_being_shared_across_threads() {
     // Sync: a second thread holds `&MappedChannel` while the reader below uses
     // it too, so both are dereferencing the same mapping concurrently.
     let stop = Arc::new(AtomicBool::new(false));
+    let seen = Arc::new(AtomicU64::new(0));
     let observer = std::thread::spawn({
-        let (mapped, stop) = (Arc::clone(&master_side), Arc::clone(&stop));
+        let (mapped, stop, seen) = (
+            Arc::clone(&master_side),
+            Arc::clone(&stop),
+            Arc::clone(&seen),
+        );
         move || {
-            let mut seen = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                seen = seen.max(mapped.channel().response.write_pos.load(Ordering::Acquire));
+                let pos = mapped.channel().response.write_pos.load(Ordering::Acquire);
+                seen.fetch_max(pos, Ordering::Relaxed);
             }
-            seen
         }
     });
 
@@ -1052,10 +1056,17 @@ async fn a_mapped_channel_survives_being_shared_across_threads() {
         .await
         .unwrap();
 
+    // `write_pos` only ever advances, so one sample after the writes is enough.
+    // Waiting for it keeps the assertion about sharing rather than about
+    // whether a loaded machine scheduled the observer inside the window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while seen.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
     stop.store(true, Ordering::Relaxed);
-    let seen = observer.join().unwrap();
+    observer.join().unwrap();
     assert!(
-        seen > 0,
+        seen.load(Ordering::Relaxed) > 0,
         "the observer never saw the mapping advance - it was not really sharing it"
     );
 }

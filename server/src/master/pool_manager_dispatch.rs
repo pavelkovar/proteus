@@ -470,21 +470,23 @@ impl PoolManager {
         _body_cleanup: Option<TempBodyFile>,
     ) {
         let pid = worker.pid;
+        // A script under ignore_user_abort(true) is entitled to run on past the
+        // client, and one that has already called fastcgi_finish_request() has
+        // been promised exactly that - so a client leaving mid-body only stops
+        // the forwarding, never the worker.
+        let mut client_gone = false;
         let retiring = loop {
             match tokio::time::timeout(self.request_timeout, worker.channel.read_response_frame())
                 .await
             {
                 Ok(Ok(WorkerEvent::Body(chunk))) => {
-                    if body_tx.send(Ok(chunk)).await.is_err() {
-                        // Client gone: the worker's state can no longer be
-                        // trusted enough to pool it, but this is not its fault.
+                    if !client_gone && body_tx.send(Ok(chunk)).await.is_err() {
                         logging::debug!(
                             r#type = "controller",
                             pid,
-                            "body receiver dropped (client gone), killing worker"
+                            "body receiver dropped (client gone), draining the worker to End"
                         );
-                        self.kill_worker(pid, permit);
-                        return;
+                        client_gone = true;
                     }
                 }
                 Ok(Ok(WorkerEvent::End { retiring })) => break retiring,
@@ -596,8 +598,8 @@ impl PoolManager {
         }
     }
 
-    /// Bumps no counter itself: a watchdog timeout and a disconnected client
-    /// both end in a kill, but only one is the worker's fault.
+    /// Bumps no counter itself: its callers differ in whose fault the kill is,
+    /// and each accounts for its own.
     fn kill_worker(&self, pid: u32, permit: OwnedSemaphorePermit) {
         sigkill(pid, "drive_stream_to_completion");
         self.remove_worker_meta(pid);
