@@ -26,7 +26,7 @@ pub const INTERNAL_PROTOTYPE_ARG: &str = "--internal-prototype";
 const ZOMBIE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Sent whole over `CONFIG_FD`, not argv - see that constant's doc.
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub(crate) struct ProtoConfig {
     pub(crate) php_mod_path: String,
     pub(crate) max_requests: u32,
@@ -145,14 +145,6 @@ pub fn run() -> ! {
         // blocked on WORKER_READY; a crashed prototype is respawned anyway.
         let (channel_fd, mapped_channel) =
             shm::create_channel().expect("failed to create worker data channel");
-        // Crash detection only: master watches its end for EOF.
-        let (liveness_prototype_side, liveness_worker_side) = socketpair(
-            AddressFamily::Unix,
-            SockType::Stream,
-            None,
-            SockFlag::empty(),
-        )
-        .expect("failed to create liveness socketpair");
         // Master parks on these rather than the ring's futex word. Created
         // pre-fork, for the reason above.
         let notify_efds = shm::NotifyEfds {
@@ -162,31 +154,29 @@ pub fn run() -> ! {
                 .expect("failed to create response-data eventfd"),
         };
 
-        // A spilled request body reaches the worker as an fd over this, since
-        // the ring cannot carry one. Seqpacket so one send is one receive.
-        let (body_prototype_side, body_worker_side) = socketpair(
+        // Seqpacket, so one send is one receive: the ring cannot carry an fd,
+        // and a spilled body has to arrive as exactly one message.
+        let (link_master_side, link_worker_side) = socketpair(
             AddressFamily::Unix,
             SockType::SeqPacket,
             None,
             SockFlag::empty(),
         )
-        .expect("failed to create body socketpair");
+        .expect("failed to create the worker link socketpair");
 
         // Before the fork, where this is still the value `die_with_parent`
         // needs to compare `getppid()` against.
         let prototype_pid = nix::unistd::getpid();
         match unsafe { fork() }.expect("fork failed") {
             ForkResult::Child => {
-                drop(liveness_prototype_side);
-                drop(body_prototype_side);
+                drop(link_master_side);
                 // A worker has no use for the prototype's control channel,
                 // and std::process::exit below skips Drop, so nothing else
                 // would ever close it.
                 unsafe { libc::close(CONTROL_FD) };
                 proctitle::set_title(&format!("{}: php worker", crate::APP_NAME));
                 worker::run(
-                    liveness_worker_side,
-                    body_worker_side,
+                    link_worker_side,
                     mapped_channel,
                     &phpconn,
                     max_requests,
@@ -197,15 +187,13 @@ pub fn run() -> ! {
                 std::process::exit(0);
             }
             ForkResult::Parent { child } => {
-                drop(liveness_worker_side);
-                drop(body_worker_side);
+                drop(link_worker_side);
                 // Unmaps only this view; the worker keeps its own.
                 drop(mapped_channel);
                 let fds = control::WorkerReadyFds {
                     channel: channel_fd,
-                    liveness: liveness_prototype_side,
                     notify: notify_efds,
-                    body: body_prototype_side,
+                    link: link_master_side,
                 };
                 if let Err(e) = control::send_worker_ready(&mut control_stream, child.as_raw(), fds)
                 {

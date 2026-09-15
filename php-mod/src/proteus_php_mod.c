@@ -521,6 +521,7 @@ int proteus_php_mod_init(
     /* OPcache's accel_find_sapi() hardcodes an allowlist that "embed" is not
      * on, so masquerade as one that is. */
     php_embed_module.name = "cli-server";
+    php_embed_module.pretty_name = "proteus";
 
     sapi_startup(&php_embed_module);
 

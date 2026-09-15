@@ -11,20 +11,35 @@
 //! once, so both stacks share the `next` array.
 
 use std::cell::UnsafeCell;
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Sentinel for "no slot"; 0 is a usable index.
 const NONE: u32 = u32::MAX;
+
+/// A payload that knows which slot it was claimed into, so parking it takes
+/// no index from the caller that could name someone else's.
+pub(crate) trait Slotted {
+    fn slot(&self) -> u32;
+}
 
 struct Slot<T> {
     /// Owned by the pusher until it publishes the index, then by whichever
     /// popper wins the CAS - never by two threads at once.
     value: UnsafeCell<Option<T>>,
     next: AtomicU32,
+    /// Debug-only, so release builds pay nothing: turns the rule that a slot
+    /// is on at most one list into an assertion.
+    #[cfg(debug_assertions)]
+    parked: AtomicBool,
 }
 
 /// Generic over the payload so the concurrency can be tested without a real
 /// worker channel.
+///
+/// Dropping one drops whatever is still parked in it, which for the real
+/// payload is what signals each of those workers to exit.
 pub(crate) struct IdleStack<T> {
     slots: Box<[Slot<T>]>,
     idle: AtomicU64,
@@ -60,6 +75,8 @@ impl<T> IdleStack<T> {
                 } else {
                     i as u32 + 1
                 }),
+                #[cfg(debug_assertions)]
+                parked: AtomicBool::new(false),
             })
             .collect();
         IdleStack {
@@ -77,13 +94,30 @@ impl<T> IdleStack<T> {
     }
 
     /// Exactly once per `claim_slot`, and only once the worker is out of the
-    /// idle stack - otherwise the slot is handed out while still linked here.
+    /// idle stack - otherwise the slot is handed out while still linked here,
+    /// and two requests get the same worker.
     pub(crate) fn release_slot(&self, index: u32) {
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.slots[index as usize].parked.load(Ordering::Relaxed),
+            "slot {index} released while still parked in the idle stack"
+        );
         self.push_index(&self.free, index);
     }
 
     /// Parks `worker` in its own slot, making it available to `pop`.
-    pub(crate) fn push(&self, index: u32, worker: T) {
+    pub(crate) fn push(&self, worker: T)
+    where
+        T: Slotted,
+    {
+        let index = worker.slot();
+        #[cfg(debug_assertions)]
+        assert!(
+            !self.slots[index as usize]
+                .parked
+                .swap(true, Ordering::Relaxed),
+            "slot {index} parked twice, which links it into the idle list twice"
+        );
         // Sole owner: a busy worker's slot is on neither stack, and this is
         // not published until the CAS below.
         unsafe { *self.slots[index as usize].value.get() = Some(worker) };
@@ -93,12 +127,18 @@ impl<T> IdleStack<T> {
 
     /// Most recently parked worker first: its heap and OPcache are warmest,
     /// and leaving the rest untouched lets them reach their own idle timeout.
-    pub(crate) fn pop(&self) -> Option<(u32, T)> {
+    pub(crate) fn pop(&self) -> Option<T> {
         let index = self.pop_index(&self.idle)?;
         // Sole owner, now that the CAS removed this index from the stack.
+        #[cfg(debug_assertions)]
+        self.slots[index as usize]
+            .parked
+            .store(false, Ordering::Relaxed);
         let worker = unsafe { (*self.slots[index as usize].value.get()).take() };
         self.len.fetch_sub(1, Ordering::Relaxed);
-        worker.map(|w| (index, w))
+        // A slot reached through the idle list always holds its payload;
+        // taking `None` here would drop the index out of both lists for good.
+        Some(worker.expect("a parked slot holds its worker"))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -148,24 +188,17 @@ impl<T> IdleStack<T> {
     }
 }
 
-impl<T> Drop for IdleStack<T> {
-    /// Dropping a parked worker is what signals it to exit.
-    fn drop(&mut self) {
-        while self.pop().is_some() {}
-    }
-}
-
-impl<T> IdleStack<T> {
-    /// Claim and park in one step, for callers with no long-lived worker to
-    /// attach the slot to.
+impl<T: Slotted> IdleStack<T> {
+    /// Claim and park in one step. `build` gets the slot it must record, since
+    /// nothing can be parked before it knows its own.
     #[cfg(test)]
-    pub(crate) fn push_new(&self, worker: T) -> Option<T> {
+    pub(crate) fn push_new(&self, build: impl FnOnce(u32) -> T) -> bool {
         match self.claim_slot() {
             Some(index) => {
-                self.push(index, worker);
-                None
+                self.push(build(index));
+                true
             }
-            None => Some(worker),
+            None => false,
         }
     }
 }

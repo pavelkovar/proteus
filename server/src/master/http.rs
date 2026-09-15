@@ -20,6 +20,7 @@ use response::*;
 use routing::*;
 
 use crate::config::{Config, RouteActionConfig};
+use crate::gauge::{Gauge, GaugeGuard};
 use crate::logging;
 use crate::master::pool_manager::PoolManager;
 use bytes::Bytes;
@@ -38,8 +39,9 @@ pub struct AppState {
     /// `Arc` so a background finish-watch task can hold its own reference.
     pub pool: Arc<PoolManager>,
     pub config: Config,
-    /// Polled after SIGTERM to know when it is safe to stop.
-    pub in_flight: AtomicU64,
+    /// Polled after SIGTERM to know when it is safe to stop. `Arc` because a
+    /// guard outlives `handle`, riding the response body to its last frame.
+    pub in_flight: Arc<Gauge>,
     /// Existence and type only, never content.
     pub fs_cache: FsCache,
     /// Decided once at startup, so a request need not scan every route just
@@ -61,7 +63,7 @@ impl AppState {
         AppState {
             pool,
             config,
-            in_flight: AtomicU64::new(0),
+            in_flight: Arc::default(),
             fs_cache,
             uses_host_matching,
             rate_limiter,
@@ -69,22 +71,9 @@ impl AppState {
     }
 }
 
-/// RAII so every early return decrements, panics included. Owns its state
-/// rather than borrowing, since it moves into a body that outlives `handle`.
-struct InFlightGuard(Arc<AppState>);
-
-impl InFlightGuard {
-    fn new(state: Arc<AppState>) -> Self {
-        state.in_flight.fetch_add(1, Relaxed);
-        InFlightGuard(state)
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Relaxed);
-    }
-}
+/// Owns its handle rather than borrowing: it moves into a body that outlives
+/// `handle`.
+type InFlightGuard = GaugeGuard<Arc<Gauge>>;
 
 /// Marks the connection busy for the life of the request, response body
 /// included.
@@ -212,24 +201,73 @@ impl Drop for GuardedBody {
     }
 }
 
-/// Shared shape for every early-return rejection in `handle()`: wraps a
-/// fully built response and its access-log entry with the usual guards.
-fn early_reject(
-    resp: Response<ResponseBody>,
-    log: PendingAccessLog,
+/// Everything the end of a request needs, whichever of `handle`'s exits it
+/// takes: the guards that must outlive the response, and the log fields known
+/// before any routing happens.
+struct Ending {
+    client_ip: ClientIdentity,
+    method: Method,
+    uri: hyper::Uri,
+    start: Instant,
     in_flight: InFlightGuard,
     conn_busy: ConnBusyGuard,
-) -> Result<Response<ResponseBody>, std::convert::Infallible> {
-    Ok(resp.map(|inner| {
-        GuardedBody {
-            inner,
-            _guard: in_flight,
-            _conn: conn_busy,
-            log: Some(log),
-            outcome: BodyOutcome::Complete,
-        }
-        .boxed()
-    }))
+}
+
+type Handled = Result<Response<ResponseBody>, std::convert::Infallible>;
+
+impl Ending {
+    /// Hands the response the guards and the log entry, which then ride it to
+    /// its last frame.
+    fn finish(
+        self,
+        resp: Response<ResponseBody>,
+        action: &'static str,
+        worker_pid: u32,
+        php_target: Option<Arc<str>>,
+        outcome: BodyOutcome,
+    ) -> Handled {
+        let log = PendingAccessLog {
+            client_ip: self.client_ip,
+            method: self.method,
+            uri: self.uri,
+            status: resp.status(),
+            start: self.start,
+            action,
+            worker_pid,
+            php_target,
+        };
+        Ok(resp.map(|inner| {
+            GuardedBody {
+                inner,
+                _guard: self.in_flight,
+                _conn: self.conn_busy,
+                log: Some(log),
+                outcome,
+            }
+            .boxed()
+        }))
+    }
+
+    /// A refusal `handle` built itself, so no worker and no target were
+    /// involved and the body is already complete.
+    fn reject(self, resp: Response<ResponseBody>, action: &'static str) -> Handled {
+        self.finish(resp, action, 0, None, BodyOutcome::Complete)
+    }
+
+    /// The plain-text case, where nothing but the status and the message vary.
+    fn reject_plain(
+        self,
+        status: StatusCode,
+        body: &'static [u8],
+        action: &'static str,
+    ) -> Handled {
+        let resp = build_response(
+            status,
+            body.to_vec(),
+            &crate::ipc::data::HeaderBlob::default(),
+        );
+        self.reject(resp, action)
+    }
 }
 
 async fn handle(
@@ -240,18 +278,21 @@ async fn handle(
     server_addr: std::net::IpAddr,
     conn: Arc<ConnState>,
 ) -> Result<Response<ResponseBody>, std::convert::Infallible> {
-    let in_flight = InFlightGuard::new(state.clone());
-    let conn_busy = ConnBusyGuard::new(conn);
-    let start = Instant::now();
-    let method = req.method().clone();
-    // A refcount bump, not a copy. Needed because `req` is moved below, so
-    // the path cannot simply borrow from it.
-    let uri = req.uri().clone();
     // Ahead of path decoding/routing/body collection: resolving these needs
     // no work beyond the headers already in hand, so a client about to be
     // rate-limited or otherwise rejected never pays for any of that first.
     let is_trusted_peer = peer.is_trusted_proxy();
     let client_ip = resolve_client_ip(peer, req.headers(), &state.config.trusted_proxies);
+    let ending = Ending {
+        client_ip,
+        method: req.method().clone(),
+        // A refcount bump, not a copy. Needed because `req` is moved below,
+        // so the path cannot simply borrow from it.
+        uri: req.uri().clone(),
+        start: Instant::now(),
+        in_flight: InFlightGuard::new(Arc::clone(&state.in_flight)),
+        conn_busy: ConnBusyGuard::new(conn),
+    };
 
     if let Some(limiter) = &state.rate_limiter {
         // The residual risk the gate cannot cover: a trusted proxy that
@@ -276,47 +317,22 @@ async fn handle(
             {
                 resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
             }
-            let log = PendingAccessLog {
-                client_ip,
-                method,
-                uri,
-                status: resp.status(),
-                start,
-                action: "rate-limited",
-                worker_pid: 0,
-                php_target: None,
-            };
-            return early_reject(resp, log, in_flight, conn_busy);
+            return ending.reject(resp, "rate-limited");
         }
     }
 
     // Decoded once, for routing, the filesystem and PATH_INFO alike.
     // REQUEST_URI keeps the raw form, as every other SAPI reports it.
-    let decoded_path = match percent_decode_path(uri.path()) {
+    let decoded_path = match percent_decode_path(ending.uri.path()) {
         Ok(path) => path,
         Err(reason) => {
-            let resp = build_response(
-                StatusCode::BAD_REQUEST,
-                b"400 invalid path\n".to_vec(),
-                &crate::ipc::data::HeaderBlob::default(),
-            );
             logging::debug!(
                 r#type = "controller",
                 ?reason,
-                raw_path = uri.path(),
+                raw_path = ending.uri.path(),
                 "rejected an undecodable request path"
             );
-            let log = PendingAccessLog {
-                client_ip,
-                method,
-                uri,
-                status: resp.status(),
-                start,
-                action: "rejected",
-                worker_pid: 0,
-                php_target: None,
-            };
-            return early_reject(resp, log, in_flight, conn_busy);
+            return ending.reject_plain(StatusCode::BAD_REQUEST, b"400 invalid path\n", "rejected");
         }
     };
     let path = decoded_path.as_ref();
@@ -326,7 +342,6 @@ async fn handle(
         .as_ref()
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let min_size = state.config.compression.min_size_bytes;
 
     // Skipped unless some route matches on it.
     let host_for_matching = if state.uses_host_matching {
@@ -336,7 +351,12 @@ async fn handle(
     } else {
         String::new()
     };
-    let decision = match_route(&state.config, path, method.as_str(), &host_for_matching);
+    let decision = match_route(
+        &state.config,
+        path,
+        ending.method.as_str(),
+        &host_for_matching,
+    );
     // Only Static consults these.
     let is_static_route = matches!(
         &decision,
@@ -351,27 +371,16 @@ async fn handle(
         ConditionalHeaders::default()
     };
 
-    let mime_types = &state.config.compression.mime_types;
+    let compression = CompressionParams {
+        accept_encoding,
+        min_size_bytes: state.config.compression.min_size_bytes,
+        mime_types: &state.config.compression.mime_types,
+    };
 
     // Once, before any routing, rather than per match arm: a new arm added
     // without repeating the check would silently admit traversal.
     if path_escapes_root(path) {
-        let resp = build_response(
-            StatusCode::BAD_REQUEST,
-            b"400 invalid path\n".to_vec(),
-            &crate::ipc::data::HeaderBlob::default(),
-        );
-        let log = PendingAccessLog {
-            client_ip,
-            method,
-            uri,
-            status: resp.status(),
-            start,
-            action: "rejected",
-            worker_pid: 0,
-            php_target: None,
-        };
-        return early_reject(resp, log, in_flight, conn_busy);
+        return ending.reject_plain(StatusCode::BAD_REQUEST, b"400 invalid path\n", "rejected");
     }
 
     let ctx = RequestContext {
@@ -396,11 +405,6 @@ async fn handle(
             meta,
             candidate,
         } => {
-            let compression = CompressionParams {
-                accept_encoding,
-                min_size_bytes: min_size,
-                mime_types,
-            };
             build_static_response(
                 file,
                 &meta,
@@ -408,7 +412,7 @@ async fn handle(
                 path,
                 compression,
                 &conditional,
-                method == Method::HEAD,
+                ending.method == Method::HEAD,
             )
             .await
         }
@@ -416,42 +420,22 @@ async fn handle(
             status,
             headers,
             body,
-        } => {
-            let compression = CompressionParams {
-                accept_encoding,
-                min_size_bytes: min_size,
-                mime_types,
-            };
-            build_php_stream_response(status, &headers, body, compression)
-        }
+        } => build_php_stream_response(status, &headers, body, compression),
         ActionBody::Buffered {
             status,
             body,
             headers,
         } => build_response(status, body, &headers),
     };
-    let log = PendingAccessLog {
-        client_ip,
-        method,
-        uri,
-        status: resp.status(),
-        start,
-        action: log_action,
-        worker_pid,
-        php_target,
-    };
     // `Aborted` until proven otherwise, so a body dropped before its end
     // records the client hanging up.
-    Ok(resp.map(|inner| {
-        GuardedBody {
-            inner,
-            _guard: in_flight,
-            _conn: conn_busy,
-            log: Some(log),
-            outcome: BodyOutcome::Aborted,
-        }
-        .boxed()
-    }))
+    ending.finish(
+        resp,
+        log_action,
+        worker_pid,
+        php_target,
+        BodyOutcome::Aborted,
+    )
 }
 
 /// Lets an idle keep-alive connection be closed without disturbing one
@@ -481,6 +465,9 @@ impl ConnState {
         self.in_flight.fetch_add(1, Relaxed);
     }
 
+    /// Not a `Gauge`, because the order here is load-bearing: decrementing
+    /// first would let `idle_for` pair a zero count with the *previous*
+    /// request's stamp and close a connection that just went idle.
     fn request_finished(&self) {
         self.last_finished_ms
             .store(self.epoch.elapsed().as_millis() as u64, Relaxed);
@@ -859,10 +846,10 @@ pub async fn serve_control(state: Arc<AppState>, shutdown: tokio::sync::watch::S
     let grace_period =
         std::time::Duration::from_secs(state.config.php.shutdown.grace_period_seconds);
     let deadline = tokio::time::Instant::now() + grace_period;
-    while state.in_flight.load(Relaxed) > 0 && tokio::time::Instant::now() < deadline {
+    while state.in_flight.get() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let remaining = state.in_flight.load(Relaxed);
+    let remaining = state.in_flight.get();
     if remaining > 0 {
         logging::warn!(
             r#type = "controller",

@@ -227,16 +227,58 @@ if (strpos($_SERVER['REQUEST_URI'], '/upload') !== false) {
     echo "SIZE=" . $_FILES['upload']['size'] . "\n";
     echo "ERROR=" . $_FILES['upload']['error'] . "\n";
     echo "IS_UPLOADED_FILE=" . var_export(is_uploaded_file($tmp), true) . "\n";
-    $dest = sys_get_temp_dir() . '/proteus_upload_test_' . getmypid() . '.moved';
+    // Not just getmypid(): workers recycle at limits.requests, so across a
+    // parallel test run the OS hands the same pid out again and two requests
+    // race over one destination - one unlinks it under the other's read.
+    $dest = tempnam(sys_get_temp_dir(), 'proteus_upload_test_');
     $moved = move_uploaded_file($tmp, $dest);
     echo "MOVE_UPLOADED_FILE=" . var_export($moved, true) . "\n";
     if ($moved) {
-        echo "MOVED_CONTENT=" . file_get_contents($dest) . "\n";
+        $content = file_get_contents($dest);
+        echo "MOVED_LEN=" . strlen($content) . "\n";
+        if (strlen($content) <= 1024) {
+            echo "MOVED_CONTENT=" . $content . "\n";
+        } else {
+            // Checked here rather than echoed back: an upload big enough to
+            // spill is by definition too big to return in the response.
+            $ok = true;
+            for ($i = 0, $n = strlen($content); $i < $n; $i++) {
+                if (ord($content[$i]) !== $i % 251) {
+                    $ok = false;
+                    break;
+                }
+            }
+            echo "MOVED_PATTERN_OK=" . var_export($ok, true) . "\n";
+        }
         unlink($dest);
     }
     // A regular (non-file) field must survive alongside the file part -
     // proves the whole multipart body was parsed, not just the file.
     echo "FIELD=" . ($_POST['note'] ?? 'MISSING') . "\n";
+    exit;
+}
+
+// Busy rather than sleeping: on Unix the execution timer counts CPU time, and
+// a sleeping script would sit here until the master watchdog noticed instead.
+// Nothing is echoed first, so PHP can still put 500 on the wire.
+if (strpos($_SERVER['REQUEST_URI'], '/time-limit') !== false) {
+    if (($_GET['set'] ?? '') === '1') {
+        set_time_limit(1);
+    }
+    $x = 0;
+    while (true) {
+        $x++;
+    }
+}
+
+// Core buffers what it pulls out of read_post, so a second reader must get
+// the same bytes even though the SAPI can only be drained once.
+if (strpos($_SERVER['REQUEST_URI'], '/input-twice') !== false) {
+    $first = file_get_contents('php://input');
+    $second = file_get_contents('php://input');
+    echo "FIRST_LEN=" . strlen($first) . "\n";
+    echo "SECOND_LEN=" . strlen($second) . "\n";
+    echo "IDENTICAL=" . var_export($first === $second, true) . "\n";
     exit;
 }
 

@@ -1,7 +1,8 @@
 use super::*;
 
-/// These tests never spill a body, so the far end can go straight away.
-fn unused_body_socket() -> std::os::fd::OwnedFd {
+/// A link whose worker end is closed immediately: these tests neither spill
+/// a body nor go through the liveness watcher.
+fn unused_link() -> std::os::fd::OwnedFd {
     let (a, _b) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::SeqPacket,
@@ -49,7 +50,7 @@ fn spawn_harness(pid: u32) -> Harness {
                 req_space: req_space_efd_owned,
                 resp_data: resp_data_efd_owned,
             },
-            unused_body_socket(),
+            unused_link(),
         ),
     }
 }
@@ -425,17 +426,17 @@ async fn a_complete_headers_frame_is_forwarded_before_the_worker_sends_anything_
         .unwrap();
 }
 
-/// Any byte on the liveness socket is as fatal as EOF. Goes through the real
+/// Any byte on the link is as fatal as EOF. Goes through the real
 /// `WorkerChannel::new`, since `spawn_harness` has no liveness watcher.
 #[tokio::test]
-async fn a_stray_byte_on_the_liveness_socket_is_treated_as_fatal_same_as_eof() {
+async fn a_stray_byte_on_the_worker_link_is_treated_as_fatal_same_as_eof() {
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
     let (channel_fd, worker_side_mapping) = shm::create_channel().unwrap();
     drop(worker_side_mapping); // only needed to create+init the memfd
-    let (test_side, worker_liveness_side) = socketpair(
+    let (test_side, master_link_side) = socketpair(
         AddressFamily::Unix,
-        SockType::Stream,
+        SockType::SeqPacket,
         None,
         SockFlag::empty(),
     )
@@ -446,9 +447,8 @@ async fn a_stray_byte_on_the_liveness_socket_is_treated_as_fatal_same_as_eof() {
     };
     let fds = WorkerReadyFds {
         channel: channel_fd,
-        liveness: worker_liveness_side,
         notify,
-        body: unused_body_socket(),
+        link: master_link_side,
     };
     let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
 
@@ -460,7 +460,7 @@ async fn a_stray_byte_on_the_liveness_socket_is_treated_as_fatal_same_as_eof() {
     while !channel.worker_has_exited() {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "a stray byte on the liveness socket must be treated as fatal, same as EOF"
+            "a stray byte on the worker link must be treated as fatal, same as EOF"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -593,9 +593,9 @@ fn channel_with_live_worker_side() -> (WorkerChannel, shm::MappedChannel, shm::N
     use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
 
     let (channel_fd, worker_side) = shm::create_channel().unwrap();
-    let (liveness_master_side, liveness_worker_side) = socketpair(
+    let (link_master_side, link_worker_side) = socketpair(
         AddressFamily::Unix,
-        SockType::Stream,
+        SockType::SeqPacket,
         None,
         SockFlag::empty(),
     )
@@ -609,18 +609,16 @@ fn channel_with_live_worker_side() -> (WorkerChannel, shm::MappedChannel, shm::N
 
     let fds = WorkerReadyFds {
         channel: channel_fd,
-        liveness: liveness_master_side,
         notify,
-        body: unused_body_socket(),
+        link: link_master_side,
     };
     let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
-    (channel, worker_side, worker_notify, liveness_worker_side)
+    (channel, worker_side, worker_notify, link_worker_side)
 }
 
 #[tokio::test]
 async fn dropping_a_worker_channel_marks_the_peer_dead() {
-    let (channel, worker_side, _worker_notify, _liveness_worker_side) =
-        channel_with_live_worker_side();
+    let (channel, worker_side, _worker_notify, _link_worker_side) = channel_with_live_worker_side();
 
     assert!(
         !worker_side.channel().peer_death.is_dead(),
@@ -644,8 +642,7 @@ async fn dropping_a_worker_channel_marks_the_peer_dead() {
 /// shutdown functions.
 #[tokio::test]
 async fn a_worker_parked_on_the_request_ring_is_released_when_master_drops_the_channel() {
-    let (channel, worker_side, worker_notify, _liveness_worker_side) =
-        channel_with_live_worker_side();
+    let (channel, worker_side, worker_notify, _link_worker_side) = channel_with_live_worker_side();
     let req_space_raw = worker_notify.req_space.as_raw_fd();
 
     // A channel, not a join handle: a regression here never returns, and
@@ -690,8 +687,7 @@ async fn a_worker_parked_on_the_request_ring_is_released_when_master_drops_the_c
 /// one.
 #[tokio::test]
 async fn a_worker_blocked_writing_a_response_is_released_when_master_drops_the_channel() {
-    let (channel, worker_side, worker_notify, _liveness_worker_side) =
-        channel_with_live_worker_side();
+    let (channel, worker_side, worker_notify, _link_worker_side) = channel_with_live_worker_side();
     let resp_data_raw = worker_notify.resp_data.as_raw_fd();
 
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -781,4 +777,66 @@ async fn parking_a_channel_that_was_never_registered_keeps_it_usable() {
         .write_request(&dummy_request())
         .await
         .expect("a parked channel must still be able to register and write");
+}
+
+/// One socket does both of master's jobs on a worker. Sending over it must
+/// not consume the EOF the watcher is parked on, and the watcher must not
+/// swallow the body message the worker is waiting for.
+#[tokio::test]
+async fn the_worker_link_carries_a_body_fd_and_still_reports_the_workers_exit() {
+    let (channel, _worker_side, _worker_notify, link_worker_side) = channel_with_live_worker_side();
+
+    // Any fd identifies itself if something distinguishable comes out of it.
+    let (body_read, body_write) = nix::unistd::pipe().unwrap();
+    nix::unistd::write(&body_write, b"spilled").unwrap();
+
+    channel
+        .send_body_fd(std::os::fd::AsFd::as_fd(&body_read))
+        .expect("master must be able to hand a body fd over the link");
+
+    let received = crate::worker::recv_body_fd(&link_worker_side)
+        .expect("the worker end must receive the fd master sent");
+    let mut buf = [0u8; 7];
+    nix::unistd::read(&received, &mut buf).unwrap();
+    assert_eq!(&buf, b"spilled", "a different fd arrived");
+
+    assert!(
+        !channel.worker_has_exited(),
+        "a body hand-off must not look like the worker exiting"
+    );
+
+    drop(link_worker_side);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !channel.worker_has_exited() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "closing the worker's end of the link must still be seen as its exit"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Master's end of the link is non-blocking, which the send path shares. That
+/// is the point: a worker that has stopped reading must fail its dispatch,
+/// where a blocking send would instead park a whole tokio worker thread and
+/// stall every other connection on that core.
+#[tokio::test]
+async fn sending_a_body_fd_over_a_saturated_link_reports_rather_than_blocks() {
+    let (channel, _worker_side, _worker_notify, _link_worker_side) =
+        channel_with_live_worker_side();
+    let (body_read, _body_write) = nix::unistd::pipe().unwrap();
+    let body = std::os::fd::AsFd::as_fd(&body_read);
+
+    // Bounded so a socket that never fills fails the test instead of hanging
+    // it. Far more than the one message a real dispatch ever has in flight.
+    const ATTEMPTS: usize = 100_000;
+    let refused = (0..ATTEMPTS).find_map(|_| channel.send_body_fd(body).err());
+
+    let e = refused.expect("the link absorbed every message, so this proves nothing");
+    assert_eq!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock,
+        "a full link must report WouldBlock, not some other failure: {e}"
+    );
 }

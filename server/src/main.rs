@@ -3,6 +3,7 @@
 //! prototype needs arrives over `CONFIG_FD` rather than argv.
 
 mod config;
+mod gauge;
 mod ipc;
 mod logging;
 mod master;
@@ -18,6 +19,11 @@ use std::sync::Arc;
 /// The one source of truth for the name wherever it shows up at runtime.
 pub(crate) const APP_NAME: &str = "proteus";
 
+/// Bounds how long a dead prototype goes unnoticed while the pool still has
+/// spares to serve every request, and how long a worker that exited on its
+/// own holds its pool slot.
+const POOL_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Per-thread heaps, avoiding the lock contention glibc's malloc sees under
 /// concurrent alloc and free. Fork-safe here because the prototype is
 /// re-exec'd and so starts single-threaded.
@@ -25,7 +31,7 @@ pub(crate) const APP_NAME: &str = "proteus";
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Otherwise a dead prototype's orphaned workers reparent past us to init,
-/// which never reaps them - see `PoolManager::watch_prototype_liveness`.
+/// which never reaps them - see `PoolManager::maintain_loop`.
 #[cfg(target_os = "linux")]
 fn enable_child_subreaper() {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
@@ -88,16 +94,9 @@ async fn run_master(config: Config) {
     let pool = Arc::new(PoolManager::spawn_prototype(&config));
     pool.prespawn_spare(config.php.processes.spare).await;
 
-    // Reactive respawn alone cannot notice a dead prototype while the pool
-    // still has idle workers to serve all traffic.
-    tokio::spawn(Arc::clone(&pool).watch_prototype_liveness(std::time::Duration::from_secs(2)));
-
-    // Scale-down is the worker's own decision; master only holds the floor,
-    // since a worker cannot know whether the pool can spare it.
-    tokio::spawn(Arc::clone(&pool).maintain_pool_loop(
-        config.php.processes.spare,
-        std::time::Duration::from_secs(1),
-    ));
+    tokio::spawn(
+        Arc::clone(&pool).maintain_loop(config.php.processes.spare, POOL_MAINTENANCE_INTERVAL),
+    );
 
     let fs_cache = FsCache::new(
         config.fs_cache.max_entries,

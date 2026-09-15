@@ -4,7 +4,7 @@
 //! A child module rather than a sibling, so these `impl PoolManager` methods
 //! still reach private fields.
 
-use super::{PoolManager, PooledWorker, TempBodyFile, sigkill};
+use super::{PoolManager, PooledWorker, Retired, TempBodyFile};
 use crate::ipc::data::{HeaderBlob, PhpRequest};
 use crate::logging;
 use crate::master::worker_channel::WorkerEvent;
@@ -46,15 +46,8 @@ impl Drop for CheckedOutWorker {
         let Some(worker) = self.worker.take() else {
             return; // handed off, nothing to clean up
         };
-        let pid = worker.pid;
-        logging::debug!(
-            r#type = "controller",
-            pid,
-            "request abandoned while a worker was checked out, releasing it"
-        );
-        self.pool.note_worker_abandoned();
-        // Before the drop, whose channel close is what retires the worker.
-        self.pool.release_abandoned_worker(pid);
+        // Before the drop, whose channel close is what stops the worker.
+        self.pool.retire(worker.pid, Retired::Abandoned);
         drop(worker);
     }
 }
@@ -102,7 +95,8 @@ pub struct StreamedResponse {
     pub worker_pid: u32,
 }
 
-/// Both variants hand `permit` back so a retry can reuse it.
+/// Every variant hands `permit` back, so a retry reuses it rather than
+/// queueing again behind the requests that overtook it.
 enum StartAttempt {
     /// Never reached a Headers frame, so a fresh retry is safe.
     WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
@@ -113,9 +107,11 @@ enum StartAttempt {
     TimedOut(OwnedSemaphorePermit, Option<TempBodyFile>),
 }
 
-/// Worker metadata is already cleaned up by the time this is returned.
+/// The worker is already retired by the time one of these is returned,
+/// except where a variant says otherwise.
 enum DispatchAttemptError {
     WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
+    /// The one error no worker could have avoided, so this one is left pooled.
     RequestTooLarge(OwnedSemaphorePermit),
     TimedOut(OwnedSemaphorePermit),
 }
@@ -133,7 +129,7 @@ pub enum DispatchOutcome {
 }
 
 impl PoolManager {
-    /// Always cleans up worker metadata on `WorkerUnavailable`.
+    /// Marks the worker busy, sends, and waits for its headers.
     async fn try_dispatch_to(
         self: &Arc<Self>,
         worker: PooledWorker,
@@ -150,13 +146,16 @@ impl PoolManager {
         {
             Ok(started) => Ok(started),
             Err(StartAttempt::TimedOut(permit, _body_cleanup)) => {
+                self.retire(pid, Retired::Watchdog);
                 Err(DispatchAttemptError::TimedOut(permit))
             }
             Err(StartAttempt::RequestTooLarge(permit, _body_cleanup)) => {
                 Err(DispatchAttemptError::RequestTooLarge(permit))
             }
             Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)) => {
-                self.remove_worker_meta(pid);
+                // Probably self-retired is not certainly: a worker wedged
+                // rather than parked would otherwise run on untracked.
+                self.retire(pid, Retired::Unavailable);
                 Err(DispatchAttemptError::WorkerUnavailable(
                     e,
                     permit,
@@ -166,20 +165,18 @@ impl PoolManager {
         }
     }
 
-    /// The retry forces a fresh spawn rather than another `get_worker()`,
-    /// which could pop a second stale worker from the same recycle burst.
+    /// One retry against a fresh worker, since a pooled one that refuses a
+    /// request has usually just retired itself.
     pub async fn dispatch(
         self: &Arc<Self>,
         req: &Arc<PhpRequest<'static>>,
         body_cleanup: Option<TempBodyFile>,
     ) -> DispatchOutcome {
-        self.requests_total.fetch_add(1, Relaxed);
+        self.counters.requests_total.fetch_add(1, Relaxed);
 
         // Rejects immediately rather than waiting out queue_timeout.
-        let Some(queue_guard) =
-            super::QueueDepthGuard::try_new(&self.queue_depth, self.queue_max_depth)
-        else {
-            self.queue_timeouts.fetch_add(1, Relaxed);
+        let Some(queue_guard) = self.queue_depth.enter_under(self.queue_max_depth) else {
+            self.counters.queue_timeouts.fetch_add(1, Relaxed);
             return DispatchOutcome::QueueTimeout;
         };
         let acquire_result = tokio::time::timeout(
@@ -192,7 +189,7 @@ impl PoolManager {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) => unreachable!("semaphore never closed"),
             Err(_) => {
-                self.queue_timeouts.fetch_add(1, Relaxed);
+                self.counters.queue_timeouts.fetch_add(1, Relaxed);
                 return DispatchOutcome::QueueTimeout;
             }
         };
@@ -200,10 +197,9 @@ impl PoolManager {
         let worker = match self.get_worker().await {
             Ok(w) => w,
             Err(e) => {
-                return self.give_up(
-                    &format!("failed to obtain a worker ({e}) - prototype may be dead"),
-                    permit,
-                );
+                return self.give_up(&format!(
+                    "failed to obtain a worker ({e}) - prototype may be dead"
+                ));
             }
         };
         let pid = worker.pid;
@@ -212,12 +208,11 @@ impl PoolManager {
             .await
         {
             Ok(started) => return DispatchOutcome::Ok(started),
-            Err(DispatchAttemptError::RequestTooLarge(permit)) => {
-                self.requests_too_large.fetch_add(1, Relaxed);
-                drop(permit);
+            Err(DispatchAttemptError::RequestTooLarge(_permit)) => {
+                self.counters.requests_too_large.fetch_add(1, Relaxed);
                 return DispatchOutcome::RequestTooLarge;
             }
-            Err(DispatchAttemptError::TimedOut(permit)) => return self.timed_out(pid, permit),
+            Err(DispatchAttemptError::TimedOut(_permit)) => return DispatchOutcome::Timeout,
             Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
                 logging::warn!(
                     r#type = "controller",
@@ -225,24 +220,18 @@ impl PoolManager {
                     error = %e,
                     "dispatch to pooled worker failed - probably just self-retired, forcing a fresh spawn"
                 );
-                // Probably self-retired is not certainly: otherwise this
-                // worker is now untracked, and `mark_peer_dead` cannot reach
-                // one that is wedged rather than parked.
-                sigkill(
-                    pid,
-                    "pooled worker failed its dispatch, replaced by a fresh spawn",
-                );
                 (permit, body_cleanup)
             }
         };
 
+        // A fresh spawn rather than another `get_worker()`, which could pop a
+        // second stale worker from the same recycle burst.
         let worker = match self.spawn_worker().await {
             Ok(w) => w,
             Err(e) => {
-                return self.give_up(
-                    &format!("fresh worker spawn also failed ({e}), giving up on this request"),
-                    permit,
-                );
+                return self.give_up(&format!(
+                    "fresh worker spawn also failed ({e}), giving up on this request"
+                ));
             }
         };
         let pid = worker.pid;
@@ -251,35 +240,22 @@ impl PoolManager {
             .await
         {
             Ok(started) => DispatchOutcome::Ok(started),
-            Err(DispatchAttemptError::RequestTooLarge(permit)) => {
-                self.requests_too_large.fetch_add(1, Relaxed);
-                drop(permit);
+            Err(DispatchAttemptError::RequestTooLarge(_permit)) => {
+                self.counters.requests_too_large.fetch_add(1, Relaxed);
                 DispatchOutcome::RequestTooLarge
             }
-            Err(DispatchAttemptError::TimedOut(permit)) => self.timed_out(pid, permit),
-            Err(DispatchAttemptError::WorkerUnavailable(e, permit, _body_cleanup)) => {
-                sigkill(pid, "freshly spawned worker failed its dispatch too");
-                self.give_up(
-                    &format!("freshly spawned worker pid={pid} STILL failed ({e}), giving up"),
-                    permit,
-                )
-            }
+            Err(DispatchAttemptError::TimedOut(_permit)) => DispatchOutcome::Timeout,
+            Err(DispatchAttemptError::WorkerUnavailable(e, _permit, _body_cleanup)) => self
+                .give_up(&format!(
+                    "freshly spawned worker pid={pid} STILL failed ({e}), giving up"
+                )),
         }
     }
 
-    /// The kill has already happened; this is the shared cleanup.
-    fn timed_out(&self, pid: u32, permit: OwnedSemaphorePermit) -> DispatchOutcome {
-        self.watchdog_kills.fetch_add(1, Relaxed);
-        self.remove_worker_meta(pid);
-        drop(permit);
-        DispatchOutcome::Timeout
-    }
-
-    /// Logs, counts, releases the permit.
-    fn give_up(&self, context: &str, permit: OwnedSemaphorePermit) -> DispatchOutcome {
+    /// Nothing reached a worker at all, so there is none to retire.
+    fn give_up(&self, context: &str) -> DispatchOutcome {
         logging::error!(r#type = "controller", "{context}");
-        self.dispatch_failed.fetch_add(1, Relaxed);
-        drop(permit);
+        self.counters.dispatch_failed.fetch_add(1, Relaxed);
         DispatchOutcome::Failed
     }
 
@@ -348,7 +324,6 @@ impl PoolManager {
                     request_timeout = ?self.request_timeout,
                     "worker exceeded request_timeout writing the request or waiting for headers"
                 );
-                sigkill(pid, "write_request/headers wait timed out");
                 drop(worker.take());
                 return Err(StartAttempt::TimedOut(permit, body_cleanup));
             }
@@ -380,7 +355,8 @@ impl PoolManager {
             // Already-read bytes still go out, then the error ends the
             // stream; the worker cannot be pooled after this.
             Drained::Broken { prefix, error } => {
-                self.kill_worker(pid, permit);
+                self.retire(pid, Retired::Failed);
+                drop(permit);
                 drop(body_cleanup);
                 Ok(StreamedResponse {
                     status,
@@ -503,19 +479,15 @@ impl PoolManager {
                         pid,
                         "worker sent a second Headers frame, protocol violation"
                     );
-                    self.watchdog_kills.fetch_add(1, Relaxed);
-                    self.kill_worker(pid, permit);
+                    self.retire(pid, Retired::Watchdog);
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = body_tx
                         .send(Err(std::io::Error::new(e.kind(), e.to_string())))
                         .await;
-                    self.read_failed(
-                        pid,
-                        permit,
-                        &format!("response stream read failed ({e}), not returning it to the pool"),
-                    );
+                    logging::warn!(r#type = "controller", pid, error = %e, "response stream read failed");
+                    self.retire(pid, Retired::Failed);
                     return;
                 }
                 Err(_elapsed) => {
@@ -529,10 +501,9 @@ impl PoolManager {
                         r#type = "controller",
                         pid,
                         request_timeout = ?self.request_timeout,
-                        "worker exceeded request_timeout mid-response, sending SIGKILL"
+                        "worker exceeded request_timeout mid-response"
                     );
-                    self.watchdog_kills.fetch_add(1, Relaxed);
-                    self.kill_worker(pid, permit);
+                    self.retire(pid, Retired::Watchdog);
                     return;
                 }
             }
@@ -555,14 +526,7 @@ impl PoolManager {
         if retiring {
             // The worker exits right after this, so there is no done marker
             // coming and nothing to return to the pool.
-            logging::debug!(
-                r#type = "controller",
-                pid,
-                "worker self-retired after limits.requests"
-            );
-            self.recycled_request_limit.fetch_add(1, Relaxed);
-            self.remove_worker_meta(pid);
-            drop(permit);
+            self.retire(pid, Retired::RequestLimit);
             return;
         }
 
@@ -578,44 +542,19 @@ impl PoolManager {
                 drop(permit);
             }
             Ok(Err(e)) => {
-                self.read_failed(
-                    pid,
-                    permit,
-                    &format!(
-                        "trailing worker-done read failed ({e}), not returning it to the pool"
-                    ),
-                );
+                logging::warn!(r#type = "controller", pid, error = %e, "trailing worker-done read failed");
+                self.retire(pid, Retired::Failed);
             }
             Err(_elapsed) => {
                 logging::warn!(
                     r#type = "controller",
                     pid,
                     request_timeout = ?self.request_timeout,
-                    "worker exceeded request_timeout finishing work after fastcgi_finish_request(), sending SIGKILL"
+                    "worker exceeded request_timeout finishing work after fastcgi_finish_request()"
                 );
-                self.watchdog_kills.fetch_add(1, Relaxed);
-                self.kill_worker(pid, permit);
+                self.retire(pid, Retired::Watchdog);
             }
         }
-    }
-
-    /// Bumps no counter itself: its callers differ in whose fault the kill is,
-    /// and each accounts for its own.
-    fn kill_worker(&self, pid: u32, permit: OwnedSemaphorePermit) {
-        sigkill(pid, "drive_stream_to_completion");
-        self.remove_worker_meta(pid);
-        drop(permit);
-    }
-
-    /// A read failure rather than a timeout, but still a kill: dropping the
-    /// channel gets a *parked* worker to exit on its own, while one still
-    /// inside `execute_file` would run on unowned and untracked.
-    fn read_failed(&self, pid: u32, permit: OwnedSemaphorePermit, context: &str) {
-        logging::warn!(r#type = "controller", pid, "{context}");
-        self.dispatch_failed.fetch_add(1, Relaxed);
-        sigkill(pid, "response stream failed, worker abandoned");
-        self.remove_worker_meta(pid);
-        drop(permit);
     }
 }
 

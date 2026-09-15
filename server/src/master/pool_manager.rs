@@ -6,12 +6,14 @@
 //! knows on its own both how long a worker has been idle and whether the
 //! pool can afford to lose it.
 
-use super::idle_stack::IdleStack;
+use super::idle_stack::{IdleStack, Slotted};
 use super::prototype_launch;
 use super::worker_channel::WorkerChannel;
-use crate::config::{Config, PhpOptions};
+use crate::config::Config;
+use crate::gauge::Gauge;
 use crate::ipc::control;
 use crate::logging;
+use crate::prototype::ProtoConfig;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -39,17 +41,16 @@ impl TempBodyFile {
 }
 
 pub struct PoolManager {
-    /// tokio mutex: `spawn_worker_once` holds this guard across an `.await`.
+    /// tokio mutex: the guard is held across an `.await`.
     control: Mutex<UnixSeqpacket>,
     /// Where the control socket is registered. Everything that polls it has
     /// to run here, whatever runtime a request happens to arrive on.
     control_rt: tokio::runtime::Handle,
-    /// Lock-free, being taken and returned on every request. Workable only
-    /// because retirement is the worker's own decision, so nothing needs to
-    /// inspect this from the far end.
+    /// Nothing may inspect a parked worker from the far end, which is what
+    /// lets this stay lock-free: retirement is the worker's own decision.
     idle: IdleStack<PooledWorker>,
-    /// Caps in-flight requests. `Arc` because the finish-watch task needs an
-    /// `OwnedSemaphorePermit`.
+    /// Caps in-flight requests. `Arc` so a permit can outlive the dispatch
+    /// that took it, as far as the response's own task.
     semaphore: Arc<Semaphore>,
     max_workers: usize,
     request_timeout: Duration,
@@ -58,14 +59,26 @@ pub struct PoolManager {
     /// acquiring a permit, so without this a wedged prototype hangs every
     /// dispatch forever.
     spawn_timeout: Duration,
-    /// 0 disables the hard cap; otherwise `dispatch` rejects once
-    /// `queue_depth` reaches it.
+    /// 0 disables the hard cap.
     queue_max_depth: usize,
-    /// Only ever mutated through `QueueDepthGuard`.
-    queue_depth: AtomicU64,
+    queue_depth: Gauge,
     started_at: Instant,
-    /// `php.targets` names, sorted, for `status_json`.
+    /// `php.targets` names, kept sorted for a stable `/status`.
     target_names: Vec<String>,
+    pub(crate) counters: Counters,
+    prototype_child: StdMutex<PrototypeHandle>,
+    prototype_spec: prototype_launch::PrototypeSpec,
+    /// tokio mutex: the guard is held across an `.await`.
+    respawn_backoff: Mutex<RespawnBackoff>,
+    /// Presence doubles as "still one of ours". Off the request path, which
+    /// reaches a worker's own counters through `WorkerMeta` instead.
+    workers: StdMutex<HashMap<u32, Arc<WorkerMeta>>>,
+}
+
+/// Monotonic `/status` counters, all `Relaxed`: nothing reads one to decide
+/// anything, so no ordering is owed to any other field.
+#[derive(Default)]
+pub(crate) struct Counters {
     requests_total: AtomicU64,
     watchdog_kills: AtomicU64,
     queue_timeouts: AtomicU64,
@@ -82,29 +95,8 @@ pub struct PoolManager {
     workers_reaped_dead: AtomicU64,
     /// Clients that went away while a worker was checked out.
     workers_abandoned: AtomicU64,
-    prototype_child: StdMutex<PrototypeHandle>,
-    /// Retained so a respawn can reproduce the original launch exactly.
-    php_mod_path: String,
-    max_requests: u32,
-    /// Seconds; 0 disables. Passed on so workers can retire themselves.
-    idle_timeout: u64,
-    uid: u32,
-    gid: u32,
-    /// False means keeping master's own identity, which requires skipping
-    /// the `uid`/`gid` calls entirely rather than passing master's own.
-    drop_privileges: bool,
-    no_new_privs: bool,
-    options: PhpOptions,
-    environment: HashMap<String, String>,
-    /// tokio mutex: held across `.await`. Not hot-path - only touched after
-    /// a spawn already failed.
-    respawn_backoff: Mutex<RespawnBackoff>,
-    crash_loop_backoffs: AtomicU64,
     prototype_respawns: AtomicU64,
-    /// Keyed by pid; presence doubles as "still one of ours". Touched twice
-    /// in a worker's life plus once per `/status`, never per HTTP request -
-    /// those updates go through `WorkerMeta` and take no lock here.
-    workers: StdMutex<HashMap<u32, Arc<WorkerMeta>>>,
+    crash_loop_backoffs: AtomicU64,
 }
 
 #[derive(Default)]
@@ -113,43 +105,17 @@ struct RespawnBackoff {
     consecutive_failures: u32,
 }
 
-/// RAII guard for one `queue_depth` slot. The check and increment are one
-/// `fetch_update`, since a separate load and add would let a racing burst
-/// past `max`. `Drop` also covers cancellation mid-wait, which would
-/// otherwise leak the slot forever.
-struct QueueDepthGuard<'a>(&'a AtomicU64);
-
-impl<'a> QueueDepthGuard<'a> {
-    fn try_new(counter: &'a AtomicU64, max: usize) -> Option<Self> {
-        if max == 0 {
-            counter.fetch_add(1, Relaxed);
-            return Some(QueueDepthGuard(counter));
-        }
-        counter
-            .try_update(Relaxed, Relaxed, |d| {
-                if (d as usize) < max {
-                    Some(d + 1)
-                } else {
-                    None
-                }
-            })
-            .ok()?;
-        Some(QueueDepthGuard(counter))
-    }
-}
-
-impl Drop for QueueDepthGuard<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Relaxed);
-    }
-}
-
 /// Carried together so the hot path never looks a worker up by pid.
 pub(crate) struct PooledWorker {
     pub(crate) channel: WorkerChannel,
     pub(crate) pid: u32,
-    /// Also carries the worker's idle-stack slot.
     pub(crate) meta: Arc<WorkerMeta>,
+}
+
+impl Slotted for PooledWorker {
+    fn slot(&self) -> u32 {
+        self.meta.slot
+    }
 }
 
 const STATE_IDLE: u8 = 0;
@@ -162,9 +128,8 @@ const STATE_BUSY: u8 = 1;
 /// `last_active_ms` rather than an `Instant`, there being no atomic
 /// `Instant` and no consumer needing sub-second resolution.
 pub(crate) struct WorkerMeta {
-    /// Held for the worker's whole life, so parking and unparking touch only
-    /// the idle head. Kept here, not on `PooledWorker`, so a caller holding
-    /// just a pid can return it - and so it exists once rather than twice.
+    /// Claimed at spawn and held until death, so parking and unparking touch
+    /// only the idle head.
     pub(crate) slot: u32,
     state: std::sync::atomic::AtomicU8,
     request_count: std::sync::atomic::AtomicU32,
@@ -196,11 +161,6 @@ impl WorkerMeta {
             .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
     }
 
-    /// Checked out to a request, so not sitting in the idle stack.
-    fn is_busy(&self) -> bool {
-        self.state.load(Relaxed) == STATE_BUSY
-    }
-
     fn state_str(&self) -> &'static str {
         match self.state.load(Relaxed) {
             STATE_BUSY => "busy",
@@ -209,34 +169,73 @@ impl WorkerMeta {
     }
 }
 
-/// The prototype's pid, plus whether it has already been reaped.
+/// The prototype's pid and everything that may be done to it.
 ///
-/// An unreaped pid cannot be recycled, so signalling it stays safe right up
-/// to the moment something reaps it - which is what this tracks.
+/// A pid rather than a `std::process::Child`: master reaps through
+/// `waitpid(-1)`, which a `Child::wait` would race for the status.
+///
+/// An unreaped pid cannot be recycled, so signalling it stays safe until
+/// something reaps it - which is what `reaped` tracks.
 struct PrototypeHandle {
-    child: std::process::Child,
+    pid: u32,
     reaped: bool,
 }
 
 impl PrototypeHandle {
-    fn new(child: std::process::Child) -> Self {
-        PrototypeHandle {
-            child,
-            reaped: false,
-        }
+    fn new(pid: u32) -> Self {
+        PrototypeHandle { pid, reaped: false }
     }
 
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.pid
     }
 
     /// `None` once reaped: the only safe answer to what may be signalled.
     fn live_pid(&self) -> Option<u32> {
-        (!self.reaped).then(|| self.child.id())
+        (!self.reaped).then_some(self.pid)
     }
 
-    fn mark_reaped(&mut self) {
+    /// Records a reaped child, reporting whether it was the prototype.
+    fn note_exit(&mut self, pid: u32, status: WaitStatus) -> bool {
+        if self.reaped || pid != self.pid {
+            return false;
+        }
         self.reaped = true;
+        log_prototype_death(pid, status);
+        true
+    }
+
+    /// Its workers need no separate kill: they follow via `PR_SET_PDEATHSIG`.
+    fn kill(&self, context: &str) {
+        if let Some(pid) = self.live_pid() {
+            sigkill(pid, context);
+        }
+    }
+
+    /// Kills and reaps whatever it replaces: not every respawn follows a
+    /// death, and forgetting a wedged prototype's pid leaves it orphaned with
+    /// its whole PHP heap, tracked by nothing.
+    ///
+    /// Reaps before killing, so a death that already happened keeps the status
+    /// that explains it instead of reporting SIGKILL.
+    fn replace(&mut self, new_pid: u32) {
+        if let Some(pid) = self.live_pid() {
+            match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
+                Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                    log_prototype_death(pid, status);
+                }
+                // Reaped by something else, so the pid may name an unrelated
+                // process by now.
+                Err(Errno::ECHILD) => {}
+                // A failed wait included: an unkilled prototype is the one
+                // outcome that leaks a PHP heap.
+                _ => {
+                    sigkill(pid, "replacing a prototype that is still running");
+                    let _ = waitpid(Pid::from_raw(pid as i32), None);
+                }
+            }
+        }
+        *self = PrototypeHandle::new(new_pid);
     }
 }
 
@@ -246,18 +245,53 @@ fn respawn_backoff_delay(consecutive_failures: u32) -> Duration {
     Duration::from_secs((1u64 << consecutive_failures.min(6)).min(60))
 }
 
-/// SIGKILL only: every kill site is a worker already known to be wedged or
-/// abandoned, where asking politely is what has been shown not to work.
+/// Why a worker is leaving the pool.
+#[derive(Clone, Copy)]
+pub(crate) enum Retired {
+    /// Retired itself after `processes.idle_timeout`.
+    IdleTimeout,
+    /// Retired itself after `limits.requests`.
+    RequestLimit,
+    /// The client went away while the worker was checked out.
+    Abandoned,
+    /// Overran `limits.timeout`, or broke the response protocol.
+    Watchdog,
+    /// Its channel failed mid-response.
+    Failed,
+    /// Would not take a request. Uncounted: only the caller knows whether the
+    /// retry that follows went on to succeed.
+    Unavailable,
+}
+
+impl Retired {
+    /// A worker retiring itself exits on its own; anything else is still
+    /// running and has to be stopped.
+    fn needs_kill(self) -> bool {
+        matches!(
+            self,
+            Retired::Watchdog | Retired::Failed | Retired::Unavailable
+        )
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Retired::IdleTimeout => "idle timeout",
+            Retired::RequestLimit => "request limit",
+            Retired::Abandoned => "client abandoned the request",
+            Retired::Watchdog => "watchdog",
+            Retired::Failed => "channel failed",
+            Retired::Unavailable => "worker would not take the request",
+        }
+    }
+}
+
+/// SIGKILL rather than SIGTERM: this is only ever reached for a process
+/// already known to be wedged or abandoned, which will not shut itself down.
 ///
 /// Logs rather than panics on delivery failure; ESRCH on an already-dead pid
 /// is the expected case.
 pub(crate) fn sigkill(pid: u32, context: &str) {
-    logging::debug!(
-        r#type = "controller",
-        pid,
-        context,
-        "sending SIGKILL to worker"
-    );
+    logging::debug!(r#type = "controller", pid, context, "sending SIGKILL");
     if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
         logging::warn!(r#type = "controller", pid, error = %e, "signal delivery failed");
     }
@@ -290,13 +324,6 @@ fn log_prototype_death(pid: u32, status: WaitStatus) {
 /// finds it; `PROTEUS_PHP_MOD_PATH` overrides with an absolute path.
 fn resolve_php_mod_path() -> String {
     std::env::var("PROTEUS_PHP_MOD_PATH").unwrap_or_else(|_| "libproteus-php-mod.so".to_string())
-}
-
-/// Whether `pid` still names a live process. `EPERM` counts as alive: a
-/// worker running as `php.user` is not master's to signal. Racy against pid
-/// reuse, at the cost of dropping one worker's metadata early.
-fn process_is_alive(pid: u32) -> bool {
-    !matches!(kill(Pid::from_raw(pid as i32), None), Err(Errno::ESRCH))
 }
 
 /// The pool is at `processes.max`. `WouldBlock` so callers can tell it from
@@ -373,20 +400,22 @@ impl PoolManager {
             )
         });
 
-        let php_mod_path = resolve_php_mod_path();
-        let (control, child) = prototype_launch::spawn(
-            &php_mod_path,
-            cfg.php.limits.requests,
-            cfg.php.processes.idle_timeout,
+        let spec = prototype_launch::PrototypeSpec {
+            config: ProtoConfig {
+                php_mod_path: resolve_php_mod_path(),
+                max_requests: cfg.php.limits.requests,
+                idle_timeout_seconds: cfg.php.processes.idle_timeout,
+                options: cfg.php.options.clone(),
+                environment: cfg.php.environment.clone(),
+            },
             drop_to,
-            &cfg.php.options,
-            &cfg.php.environment,
-            cfg.php.no_new_privs,
-        )
-        .expect("failed to spawn prototype");
+            no_new_privs: cfg.php.no_new_privs,
+        };
+        let (control, prototype_pid) =
+            prototype_launch::spawn(&spec).expect("failed to spawn prototype");
         logging::info!(
             r#type = "controller",
-            pid = child.id(),
+            pid = prototype_pid,
             uid,
             gid,
             dropped = drop_to.is_some(),
@@ -403,39 +432,17 @@ impl PoolManager {
             queue_timeout: Duration::from_secs(cfg.php.queue.timeout),
             spawn_timeout: Duration::from_secs(cfg.php.processes.spawn_timeout),
             queue_max_depth: cfg.php.queue.max_depth,
-            queue_depth: AtomicU64::new(0),
+            queue_depth: Gauge::default(),
             started_at: Instant::now(),
             target_names: {
                 let mut names: Vec<String> = cfg.php.targets.keys().cloned().collect();
                 names.sort();
                 names
             },
-            requests_total: AtomicU64::new(0),
-            watchdog_kills: AtomicU64::new(0),
-            queue_timeouts: AtomicU64::new(0),
-            dispatch_failed: AtomicU64::new(0),
-            requests_too_large: AtomicU64::new(0),
-            workers_spawned: AtomicU64::new(0),
-            recycled_request_limit: AtomicU64::new(0),
-            recycled_idle_timeout: AtomicU64::new(0),
-            workers_reaped_dead: AtomicU64::new(0),
-            workers_abandoned: AtomicU64::new(0),
-            prototype_child: StdMutex::new(PrototypeHandle::new(child)),
-            php_mod_path,
-            max_requests: cfg.php.limits.requests,
-            idle_timeout: cfg.php.processes.idle_timeout,
-            uid,
-            gid,
-            drop_privileges: drop_to.is_some(),
-            no_new_privs: cfg.php.no_new_privs,
-            options: PhpOptions {
-                admin: cfg.php.options.admin.clone(),
-                user: cfg.php.options.user.clone(),
-            },
-            environment: cfg.php.environment.clone(),
+            counters: Counters::default(),
+            prototype_child: StdMutex::new(PrototypeHandle::new(prototype_pid)),
+            prototype_spec: spec,
             respawn_backoff: Mutex::new(RespawnBackoff::default()),
-            crash_loop_backoffs: AtomicU64::new(0),
-            prototype_respawns: AtomicU64::new(0),
             workers: StdMutex::new(HashMap::new()),
         }
     }
@@ -448,7 +455,7 @@ impl PoolManager {
         if let Some(last) = backoff.last_attempt {
             let required_delay = respawn_backoff_delay(backoff.consecutive_failures);
             if now.duration_since(last) < required_delay {
-                self.crash_loop_backoffs.fetch_add(1, Relaxed);
+                self.counters.crash_loop_backoffs.fetch_add(1, Relaxed);
                 return false;
             }
         }
@@ -460,34 +467,17 @@ impl PoolManager {
             "attempting to respawn the prototype"
         );
         // fork()+exec() blocks, and this one runs while the pool is live.
-        let php_mod_path = self.php_mod_path.clone();
-        let max_requests = self.max_requests;
-        let drop_to = self.drop_privileges.then_some((self.uid, self.gid));
-        let options = self.options.clone();
-        let environment = self.environment.clone();
-        let idle_timeout = self.idle_timeout;
-        let no_new_privs = self.no_new_privs;
-        let spawn_result = tokio::task::spawn_blocking(move || {
-            prototype_launch::spawn(
-                &php_mod_path,
-                max_requests,
-                idle_timeout,
-                drop_to,
-                &options,
-                &environment,
-                no_new_privs,
-            )
-        })
-        .await
-        .expect("prototype_launch::spawn blocking task panicked");
+        let spec = self.prototype_spec.clone();
+        let spawn_result = tokio::task::spawn_blocking(move || prototype_launch::spawn(&spec))
+            .await
+            .expect("prototype_launch::spawn blocking task panicked");
         match spawn_result {
-            Ok((new_control, new_child)) => {
-                let new_pid = new_child.id();
+            Ok((new_control, new_pid)) => {
                 *self.control.lock().await = new_control;
-                self.replace_prototype_child(new_child);
+                self.prototype_child.lock().unwrap().replace(new_pid);
 
                 backoff.consecutive_failures = 0;
-                self.prototype_respawns.fetch_add(1, Relaxed);
+                self.counters.prototype_respawns.fetch_add(1, Relaxed);
                 logging::info!(r#type = "controller", pid = new_pid, "prototype respawned");
                 true
             }
@@ -499,77 +489,15 @@ impl PoolManager {
         }
     }
 
-    /// Kills and reaps whatever it replaces. Not every respawn follows a
-    /// death - a wedged prototype is replaced while still running, and
-    /// dropping its `Child` would leave it orphaned with its whole PHP heap,
-    /// tracked by nothing.
-    fn replace_prototype_child(&self, new_child: std::process::Child) {
-        let mut child_guard = self.prototype_child.lock().unwrap();
-        if let Some(pid) = child_guard.live_pid() {
-            // The lock serialises this against the sweep, so exactly one of
-            // the two reaps this pid.
-            match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
-                // Reaped ahead of any kill, or the SIGKILL below becomes the
-                // status and buries whatever actually killed it.
-                Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
-                    log_prototype_death(pid, status);
-                }
-                // Reaped by something else, so the pid may name an unrelated
-                // process by now.
-                Err(Errno::ECHILD) => {}
-                // Including a failed wait: leaving a live prototype unkilled
-                // orphans a whole PHP heap that nothing else tracks.
-                _ => {
-                    sigkill(pid, "replacing a prototype that is still running");
-                    let _ = waitpid(Pid::from_raw(pid as i32), None);
-                }
-            }
-        }
-        *child_guard = PrototypeHandle::new(new_child);
-    }
-
-    /// Only ever runs on a prototype that has already stopped answering. Its
-    /// workers follow via `PR_SET_PDEATHSIG`.
-    fn kill_prototype(&self) {
-        let pid = self.prototype_child.lock().unwrap().live_pid();
-        if let Some(pid) = pid {
-            sigkill(pid, "prototype stopped answering");
-        }
-    }
-
-    /// Drops metadata for workers whose process is gone - the OOM killer, a
-    /// segfault in an extension, an operator's `kill`. Each such death would
-    /// otherwise hold a slot for good and lower the pool's real ceiling.
-    fn reap_dead_worker_metas(&self) {
-        // Checked-out workers only, to satisfy `remove_worker_meta`: freeing
-        // the slot of one still linked in the idle stack hands that slot out
-        // twice. Idle deaths are `sweep_idle_workers`'s to find.
-        let dead: Vec<u32> = {
-            let workers = self.workers.lock().unwrap();
-            workers
-                .iter()
-                .filter(|(_, meta)| meta.is_busy())
-                .map(|(pid, _)| *pid)
-                .filter(|&pid| !process_is_alive(pid))
-                .collect()
-        };
-        for pid in dead {
-            logging::warn!(
-                r#type = "controller",
-                pid,
-                "reaping a worker that died without master noticing"
-            );
-            self.remove_worker_meta(pid);
-            self.workers_reaped_dead.fetch_add(1, Relaxed);
-        }
-    }
-
-    /// Checked workers are held aside, not pushed straight back: the LIFO
-    /// stack would hand the same one out again. Popping is also the exclusion
-    /// `Ring::reclaim_if_due` needs - nothing dispatches to a worker off it.
+    /// Retires the workers that timed themselves out and returns ring pages
+    /// the rest have consumed.
+    ///
+    /// Each worker is held aside rather than pushed straight back, since a
+    /// LIFO stack would hand the same one out again. Being off the stack is
+    /// also the exclusion `Ring::reclaim_if_due` needs.
     async fn sweep_idle_workers(&self) {
-        // Draining does not await, so the pool is short only for as long as
-        // the pops take; each worker goes back as soon as it is handled.
+        // Nothing between here and the pushes below awaits, so the pool is
+        // short only for as long as the pops take.
         let ceiling = self.idle.len();
         let mut held = Vec::with_capacity(ceiling);
         for _ in 0..ceiling {
@@ -582,16 +510,9 @@ impl PoolManager {
         let deadline = Instant::now() + RECLAIM_BUDGET;
         let mut reclaimed = 0usize;
         // Reversed, so the warmest ends up back on top.
-        for (slot, worker) in held.into_iter().rev() {
+        for worker in held.into_iter().rev() {
             if worker.channel.worker_has_exited() {
-                logging::debug!(
-                    r#type = "controller",
-                    pid = worker.pid,
-                    "worker retired itself on idle timeout"
-                );
-                self.recycled_idle_timeout.fetch_add(1, Relaxed);
-                self.remove_worker_meta(worker.pid);
-                // Dropping releases the channel and its mapping.
+                self.retire(worker.pid, Retired::IdleTimeout);
                 continue;
             }
             if Instant::now() < deadline && worker.channel.reclaim_is_due() {
@@ -601,7 +522,7 @@ impl PoolManager {
                 let _ = tokio::task::spawn_blocking(move || mapped.reclaim_if_due()).await;
                 reclaimed += 1;
             }
-            self.idle.push(slot, worker);
+            self.return_worker(worker);
         }
         if reclaimed > 0 {
             logging::debug!(
@@ -612,22 +533,28 @@ impl PoolManager {
         }
     }
 
-    /// Master's half of retirement: reap what workers left behind and hold
-    /// the `spare` floor, without which the pool drains to zero on any quiet
-    /// period and the next request pays a cold fork.
+    /// All of master's periodic process management. One task, so a respawn
+    /// cannot run concurrently with a spawn against the control socket it is
+    /// replacing.
     ///
-    /// Polls rather than reacting to each exit, which is observed by a
-    /// per-worker task with no route back to the pool.
-    pub async fn maintain_pool_loop(self: Arc<Self>, spare: usize, interval: Duration) {
+    /// Polls rather than reacting to each exit: a prototype that dies while
+    /// the pool still has spares is otherwise unnoticed until they run out.
+    pub async fn maintain_loop(self: Arc<Self>, spare: usize, interval: Duration) {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            self.reap_dead_worker_metas();
+            if self.reap_children() {
+                logging::warn!(
+                    r#type = "controller",
+                    "prototype exited with no pending worker-spawn attempt to notice it - respawning proactively"
+                );
+                self.try_respawn_prototype().await;
+            }
             self.sweep_idle_workers().await;
-            // Bounded by the total worker count, not the idle count: this
-            // spawns without a semaphore permit, so topping up while others
-            // are busy would push the pool past `processes.max` and past the
-            // slot array sized for it.
+            // Bounded by the total worker count, not the idle count: these
+            // spawns hold no semaphore permit, so topping up while others are
+            // busy would push the pool past the slot array sized for
+            // `processes.max`.
             while self.idle.len() < spare && self.workers.lock().unwrap().len() < self.max_workers {
                 match self.spawn_worker().await {
                     Ok(worker) => self.return_worker(worker),
@@ -640,45 +567,17 @@ impl PoolManager {
         }
     }
 
-    /// `try_respawn_prototype` is reactive only: with enough spare workers,
-    /// nothing would notice a dead prototype until the spares ran out.
-    ///
-    /// Also reaps anything `PR_SET_CHILD_SUBREAPER` reparents here.
-    pub async fn watch_prototype_liveness(self: Arc<Self>, interval: Duration) {
-        let mut tick = tokio::time::interval(interval);
-        loop {
-            tick.tick().await;
-            let mut prototype_death = None;
-            {
-                // Held for the whole sweep so the pid compared against cannot
-                // be replaced halfway through it.
-                let mut child_guard = self.prototype_child.lock().unwrap();
-                let prototype_pid = child_guard.pid();
-                loop {
-                    match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                        Ok(WaitStatus::StillAlive) | Err(Errno::ECHILD) => break,
-                        Ok(
-                            status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)),
-                        ) => {
-                            if pid.as_raw() as u32 == prototype_pid {
-                                child_guard.mark_reaped();
-                                prototype_death = Some((prototype_pid, status));
-                            }
-                        }
-                        Err(Errno::EINTR) => continue,
-                        Ok(_) | Err(_) => break,
-                    }
-                }
-            }
-            if let Some((pid, status)) = prototype_death {
-                log_prototype_death(pid, status);
-                logging::warn!(
-                    r#type = "controller",
-                    "prototype exited with no pending worker-spawn attempt to notice it - respawning proactively"
-                );
-                self.try_respawn_prototype().await;
-            }
-        }
+    /// Reaps everything `PR_SET_CHILD_SUBREAPER` has left here, reporting
+    /// whether the prototype was among them.
+    fn reap_children(&self) -> bool {
+        // Held for the whole sweep so the pid compared against cannot be
+        // replaced halfway through it.
+        let mut child_guard = self.prototype_child.lock().unwrap();
+        let mut prototype_died = false;
+        control::reap_exited_children(|pid, status| {
+            prototype_died |= child_guard.note_exit(pid.as_raw() as u32, status);
+        });
+        prototype_died
     }
 
     /// Best-effort: fewer spares than asked for beats failing to start.
@@ -694,39 +593,33 @@ impl PoolManager {
         }
     }
 
-    /// Spawns on the control runtime, where the control socket and the
-    /// prototype respawn already have their fds registered. Spawns are rare
-    /// enough that the hop costs nothing that shows.
+    /// Hops to the control runtime, which owns the control socket's
+    /// registration whatever runtime the caller arrived on.
+    ///
+    /// A failed spawn escalates to a prototype respawn, but a full pool must
+    /// not: that would kill a healthy prototype and fail every worker in
+    /// flight, only to lose the same race again.
     async fn spawn_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
         let pool = Arc::clone(self);
-        match self
-            .control_rt
-            .spawn(async move { pool.spawn_worker_here().await })
-            .await
-        {
-            Ok(result) => result,
-            Err(e) => Err(std::io::Error::other(format!(
-                "worker spawn task on the control runtime failed: {e}"
-            ))),
-        }
-    }
-
-    /// A dead prototype fails individual dispatches, never the whole master -
-    /// but a full pool must not escalate to a respawn, which would kill the
-    /// prototype and fail every worker in flight to lose the same race again.
-    async fn spawn_worker_here(self: Arc<Self>) -> std::io::Result<PooledWorker> {
-        match self.spawn_worker_once().await {
-            Ok(w) => Ok(w),
-            Err(e) if is_pool_full(&e) => Err(e),
-            Err(e) => {
-                logging::warn!(r#type = "controller", error = %e, "spawn_worker failed, trying to respawn the prototype");
-                if self.try_respawn_prototype().await {
-                    self.spawn_worker_once().await
-                } else {
-                    Err(e)
+        let spawned = self.control_rt.spawn(async move {
+            match pool.spawn_worker_once().await {
+                Ok(w) => Ok(w),
+                Err(e) if is_pool_full(&e) => Err(e),
+                Err(e) => {
+                    logging::warn!(r#type = "controller", error = %e, "worker spawn failed, trying to respawn the prototype");
+                    if pool.try_respawn_prototype().await {
+                        pool.spawn_worker_once().await
+                    } else {
+                        Err(e)
+                    }
                 }
             }
-        }
+        });
+        spawned.await.unwrap_or_else(|e| {
+            Err(std::io::Error::other(format!(
+                "worker spawn task on the control runtime failed: {e}"
+            )))
+        })
     }
 
     async fn spawn_worker_once(&self) -> std::io::Result<PooledWorker> {
@@ -754,7 +647,10 @@ impl PoolManager {
                     spawn_timeout = ?self.spawn_timeout,
                     "prototype did not answer a worker-spawn request in time, killing it"
                 );
-                self.kill_prototype();
+                self.prototype_child
+                    .lock()
+                    .unwrap()
+                    .kill("prototype stopped answering a worker-spawn request");
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "prototype did not answer a worker-spawn request in time",
@@ -769,7 +665,7 @@ impl PoolManager {
             sigkill(pid, "failed to set up the worker channel after the fork");
         })?;
 
-        self.workers_spawned.fetch_add(1, Relaxed);
+        self.counters.workers_spawned.fetch_add(1, Relaxed);
         // Past every fallible step, so the slot now belongs to a worker that
         // `workers` will account for.
         let meta = Arc::new(WorkerMeta::new(
@@ -782,18 +678,6 @@ impl PoolManager {
         Ok(PooledWorker { channel, pid, meta })
     }
 
-    pub(crate) fn note_worker_abandoned(&self) {
-        self.workers_abandoned.fetch_add(1, Relaxed);
-    }
-
-    /// A checked-out worker is out of the idle stack, which is
-    /// `remove_worker_meta`'s precondition.
-    pub(crate) fn release_abandoned_worker(&self, pid: u32) {
-        self.remove_worker_meta(pid);
-    }
-
-    /// Forgets a worker and returns its slot. The worker must already be out
-    /// of the idle stack.
     /// Takes the slot back from any entry this displaces: the OS reuses pids,
     /// and a worker whose pid came round again before it was reaped would
     /// otherwise take its slot out of circulation for good.
@@ -809,39 +693,56 @@ impl PoolManager {
                 "reusing the pid of a worker that was never reaped"
             );
             self.idle.release_slot(stale.slot);
-            self.workers_reaped_dead.fetch_add(1, Relaxed);
+            self.counters.workers_reaped_dead.fetch_add(1, Relaxed);
         }
     }
 
-    fn remove_worker_meta(&self, pid: u32) {
+    /// The one way a worker leaves the pool.
+    ///
+    /// It must already be out of the idle stack: releasing the slot of one
+    /// still linked there hands that slot out twice.
+    pub(crate) fn retire(&self, pid: u32, why: Retired) {
+        let counter = match why {
+            Retired::IdleTimeout => Some(&self.counters.recycled_idle_timeout),
+            Retired::RequestLimit => Some(&self.counters.recycled_request_limit),
+            Retired::Abandoned => Some(&self.counters.workers_abandoned),
+            Retired::Watchdog => Some(&self.counters.watchdog_kills),
+            Retired::Failed => Some(&self.counters.dispatch_failed),
+            Retired::Unavailable => None,
+        };
+        if let Some(counter) = counter {
+            counter.fetch_add(1, Relaxed);
+        }
+        if why.needs_kill() {
+            sigkill(pid, why.as_str());
+        } else {
+            logging::debug!(
+                r#type = "controller",
+                pid,
+                reason = why.as_str(),
+                "retiring worker"
+            );
+        }
         if let Some(meta) = self.workers.lock().unwrap().remove(&pid) {
             self.idle.release_slot(meta.slot);
         }
     }
 
-    /// LIFO, and load-bearing: FIFO would cycle evenly through every idle
-    /// worker, so under steady traffic none would reach its own
-    /// `idle_timeout` and the pool would never scale back down.
+    /// An idle worker, or a freshly spawned one.
     async fn get_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
-        // The caller holds one of `processes.max` permits with the pool at
-        // `processes.max`, so a worker is owed to it and merely busy or
-        // mid-return - a wait that is usually sub-millisecond.
+        // A caller holding a permit with the pool at `processes.max` is owed a
+        // worker that is merely busy or mid-return, so this polls for one
+        // rather than failing the request.
         const POOL_FULL_ATTEMPTS: u32 = 1000;
         const POOL_FULL_BACKOFF: Duration = Duration::from_millis(1);
 
         for _ in 0..POOL_FULL_ATTEMPTS {
             // A worker can retire itself while still parked here.
-            while let Some((_slot, worker)) = self.idle.pop() {
+            while let Some(worker) = self.idle.pop() {
                 if !worker.channel.worker_has_exited() {
                     return Ok(worker);
                 }
-                logging::debug!(
-                    r#type = "controller",
-                    pid = worker.pid,
-                    "discarding a worker that retired on idle timeout"
-                );
-                self.recycled_idle_timeout.fetch_add(1, Relaxed);
-                self.remove_worker_meta(worker.pid);
+                self.retire(worker.pid, Retired::IdleTimeout);
             }
             match self.spawn_worker().await {
                 Err(e) if is_pool_full(&e) => {
@@ -854,7 +755,7 @@ impl PoolManager {
     }
 
     fn return_worker(&self, worker: PooledWorker) {
-        self.idle.push(worker.meta.slot, worker);
+        self.idle.push(worker);
     }
 
     pub fn status_json(&self) -> serde_json::Value {
@@ -888,22 +789,22 @@ impl PoolManager {
                     "idle": idle_count, "busy": busy, "total": idle_count + busy, "max": self.max_workers
                 },
                 "queue": {
-                    "depth": self.queue_depth.load(Relaxed),
+                    "depth": self.queue_depth.get(),
                     "max_depth": self.queue_max_depth,
                 },
                 "counters": {
-                    "requests_total": self.requests_total.load(Relaxed),
-                    "requests_failed": self.dispatch_failed.load(Relaxed),
-                    "requests_too_large": self.requests_too_large.load(Relaxed),
-                    "watchdog_kills": self.watchdog_kills.load(Relaxed),
-                    "queue_timeouts": self.queue_timeouts.load(Relaxed),
-                    "workers_spawned_total": self.workers_spawned.load(Relaxed),
-                    "recycled_request_limit": self.recycled_request_limit.load(Relaxed),
-                    "recycled_idle_timeout": self.recycled_idle_timeout.load(Relaxed),
-                    "workers_reaped_dead": self.workers_reaped_dead.load(Relaxed),
-                    "workers_abandoned": self.workers_abandoned.load(Relaxed),
-                    "prototype_respawns_total": self.prototype_respawns.load(Relaxed),
-                    "crash_loop_backoffs": self.crash_loop_backoffs.load(Relaxed),
+                    "requests_total": self.counters.requests_total.load(Relaxed),
+                    "requests_failed": self.counters.dispatch_failed.load(Relaxed),
+                    "requests_too_large": self.counters.requests_too_large.load(Relaxed),
+                    "watchdog_kills": self.counters.watchdog_kills.load(Relaxed),
+                    "queue_timeouts": self.counters.queue_timeouts.load(Relaxed),
+                    "workers_spawned_total": self.counters.workers_spawned.load(Relaxed),
+                    "recycled_request_limit": self.counters.recycled_request_limit.load(Relaxed),
+                    "recycled_idle_timeout": self.counters.recycled_idle_timeout.load(Relaxed),
+                    "workers_reaped_dead": self.counters.workers_reaped_dead.load(Relaxed),
+                    "workers_abandoned": self.counters.workers_abandoned.load(Relaxed),
+                    "prototype_respawns_total": self.counters.prototype_respawns.load(Relaxed),
+                    "crash_loop_backoffs": self.counters.crash_loop_backoffs.load(Relaxed),
                 },
                 "workers": workers,
             }

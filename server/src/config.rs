@@ -590,8 +590,54 @@ fn default_fs_cache_max_entries() -> usize {
 /// Cross-field checks serde's structural parsing cannot express.
 pub fn validate(cfg: &Config) -> Vec<String> {
     let mut errors = Vec::new();
-    if cfg.php.processes.max == 0 {
-        errors.push("php.processes.max must be at least 1".to_string());
+    // Settings whose zero is a degenerate value rather than an off switch.
+    // Each entry completes "<name> must be at least 1 (0 would ...)".
+    let rate_limit = cfg.rate_limit.as_ref();
+    for (name, is_zero, consequence) in [
+        (
+            "php.processes.max",
+            cfg.php.processes.max == 0,
+            "leave no worker to serve anything",
+        ),
+        (
+            "php.limits.timeout",
+            cfg.php.limits.timeout == 0,
+            "time out every request immediately",
+        ),
+        (
+            "php.limits.requests",
+            cfg.php.limits.requests == 0,
+            "recycle every worker after its first request",
+        ),
+        (
+            "php.queue.timeout",
+            cfg.php.queue.timeout == 0,
+            "time out every request immediately",
+        ),
+        (
+            "php.processes.spawn_timeout",
+            cfg.php.processes.spawn_timeout == 0,
+            "fail every worker spawn immediately",
+        ),
+        (
+            "connection.header_read_timeout",
+            cfg.connection.header_read_timeout == 0,
+            "reject every request before it arrives",
+        ),
+        (
+            "rate_limit.requests",
+            rate_limit.is_some_and(|r| r.requests == 0),
+            "reject every matching request immediately",
+        ),
+        (
+            "rate_limit.period_seconds",
+            rate_limit.is_some_and(|r| r.period_seconds == 0),
+            "never refill",
+        ),
+    ] {
+        if is_zero {
+            errors.push(format!("{name} must be at least 1 (0 would {consequence})"));
+        }
     }
     if cfg.php.processes.spare > cfg.php.processes.max {
         errors.push(format!(
@@ -599,49 +645,12 @@ pub fn validate(cfg: &Config) -> Vec<String> {
             cfg.php.processes.spare, cfg.php.processes.max
         ));
     }
-    // 0 here times out immediately rather than disabling.
-    if cfg.php.limits.timeout == 0 {
-        errors.push(
-            "php.limits.timeout must be at least 1 (0 would time out every request immediately)"
-                .to_string(),
-        );
-    }
-    if cfg.php.limits.requests == 0 {
-        errors.push("php.limits.requests must be at least 1 (0 would recycle every worker after its first request)".to_string());
-    }
     if cfg.php.user.is_some() != cfg.php.group.is_some() {
         errors.push(
             "php.user and php.group must be set together or not at all (a half-drop would leave the other \
              at whatever identity master happened to start as)"
                 .to_string(),
         );
-    }
-    if cfg.php.queue.timeout == 0 {
-        errors.push(
-            "php.queue.timeout must be at least 1 (0 would time out every request immediately)"
-                .to_string(),
-        );
-    }
-    if cfg.connection.header_read_timeout == 0 {
-        errors.push(
-            "connection.header_read_timeout must be at least 1 (0 would reject every request before it arrives)"
-                .to_string(),
-        );
-    }
-    if cfg.php.processes.spawn_timeout == 0 {
-        errors.push(
-            "php.processes.spawn_timeout must be at least 1 (0 would fail every worker spawn immediately)".to_string(),
-        );
-    }
-    if let Some(rate_limit) = &cfg.rate_limit {
-        if rate_limit.requests == 0 {
-            errors.push("rate_limit.requests must be at least 1 (0 would reject every matching request immediately)".to_string());
-        }
-        if rate_limit.period_seconds == 0 {
-            errors.push(
-                "rate_limit.period_seconds must be at least 1 (0 would never refill)".to_string(),
-            );
-        }
     }
     if cfg.php.script_extensions.is_empty() {
         errors.push(

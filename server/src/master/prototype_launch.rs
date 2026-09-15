@@ -1,15 +1,25 @@
 //! Master's side of bringing up a prototype: fork+exec, privilege drop, and
 //! the fixed-fd config handoff.
 
-use crate::config::PhpOptions;
 use crate::ipc::{CONFIG_FD, CONTROL_FD};
 use crate::prototype::{INTERNAL_PROTOTYPE_ARG, ProtoConfig};
-use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use tokio_seqpacket::UnixSeqpacket;
+
+/// Everything one launch needs, so a respawn reproduces the original exactly.
+#[derive(Clone)]
+pub(crate) struct PrototypeSpec {
+    pub(crate) config: ProtoConfig,
+    /// `None` must skip the `uid`/`gid` calls entirely rather than pass
+    /// master's own identity: `Command::uid` always triggers
+    /// `setgroups(0, NULL)` even for a same-value drop, silently wiping
+    /// supplementary groups a deployment set up on purpose.
+    pub(crate) drop_to: Option<(u32, u32)>,
+    pub(crate) no_new_privs: bool,
+}
 
 /// Moves `fd` above `floor` so a later `dup2` onto a fixed low number cannot
 /// clobber it. The caller closes the result after the `dup2`s consuming it.
@@ -26,21 +36,10 @@ unsafe fn relocate_above(
     Ok(moved)
 }
 
-/// Returns master's end of the control channel and the child handle.
-///
-/// `drop_to: None` must skip the `uid`/`gid` calls entirely rather than pass
-/// master's own identity: `Command::uid` always triggers `setgroups(0, NULL)`
-/// even for a same-value drop, silently wiping supplementary groups a
-/// deployment set up on purpose.
-pub fn spawn(
-    php_mod_path: &str,
-    max_requests: u32,
-    idle_timeout_seconds: u64,
-    drop_to: Option<(u32, u32)>,
-    options: &PhpOptions,
-    environment: &HashMap<String, String>,
-    no_new_privs: bool,
-) -> std::io::Result<(UnixSeqpacket, std::process::Child)> {
+/// Returns master's end of the control channel and the prototype's pid - see
+/// `PrototypeHandle` for why the `Child` is not handed out.
+pub(crate) fn spawn(spec: &PrototypeSpec) -> std::io::Result<(UnixSeqpacket, u32)> {
+    let no_new_privs = spec.no_new_privs;
     let (master_end, prototype_end) = UnixSeqpacket::pair()?;
     let prototype_fd = prototype_end.into_raw_fd();
 
@@ -53,19 +52,9 @@ pub fn spawn(
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
-    let proto_config = ProtoConfig {
-        php_mod_path: php_mod_path.to_string(),
-        max_requests,
-        idle_timeout_seconds,
-        options: PhpOptions {
-            admin: options.admin.clone(),
-            user: options.user.clone(),
-        },
-        environment: environment.clone(),
-    };
-    let config_json = serde_json::to_vec(&proto_config).unwrap_or_else(|_| b"{}".to_vec());
+    let config_json = serde_json::to_vec(&spec.config).unwrap_or_else(|_| b"{}".to_vec());
     cmd.arg(INTERNAL_PROTOTYPE_ARG);
-    if let Some((uid, gid)) = drop_to {
+    if let Some((uid, gid)) = spec.drop_to {
         cmd.uid(uid).gid(gid);
     }
     unsafe {
@@ -128,12 +117,13 @@ pub fn spawn(
     };
     if let Err(e) = write_result {
         // The child is already running and would otherwise block forever on
-        // an incomplete config.
+        // an incomplete config. Left for master's own sweep to reap, which is
+        // the only place allowed to wait on it.
         let _ = child.kill();
         return Err(e);
     }
 
-    Ok((master_end, child))
+    Ok((master_end, child.id()))
 }
 
 #[cfg(test)]

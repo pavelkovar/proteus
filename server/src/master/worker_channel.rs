@@ -10,9 +10,7 @@ use bytes::Bytes;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::AsyncReadExt;
 use tokio::io::unix::AsyncFd;
-use tokio::net::UnixStream as TokioUnixStream;
 
 /// Bounds one run of `Headers` frames. The run length is worker-controlled,
 /// so leaving it unbounded is an amplification risk against a shared process,
@@ -28,8 +26,9 @@ pub struct WorkerChannel {
     pid: u32,
     mapped: Arc<shm::MappedChannel>,
     notify: Notify,
-    /// Master's end of the socket a spilled body's fd goes over.
-    body: OwnedFd,
+    /// Master's end of the worker link. Non-blocking, so a worker that has
+    /// stopped reading fails its dispatch instead of stalling master.
+    link: OwnedFd,
     /// Reused for the worker's whole life, so a steady-state request neither
     /// encodes nor decodes with an allocation.
     read_scratch: Vec<u8>,
@@ -42,9 +41,8 @@ pub struct WorkerChannel {
     /// hands it out in the order the worker wrote it. `Some(None)` is the
     /// worker-done marker.
     deferred: Option<Option<WorkerEvent>>,
-    /// A plain flag rather than a `watch`: nothing awaits it, and it is read
-    /// on every pop from the idle pool, where an atomic load beats
-    /// `watch::Receiver::borrow` taking an internal read lock.
+    /// A plain flag rather than a `watch`, which takes an internal lock to
+    /// read and is never awaited here anyway.
     worker_gone: Arc<AtomicBool>,
 }
 
@@ -186,23 +184,27 @@ impl WorkerChannel {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Spawns the liveness watcher, torn down on drop.
+    /// Spawns the liveness watcher, which outlives this channel and ends only
+    /// when the worker does.
     pub fn new(fds: WorkerReadyFds, pid: u32) -> std::io::Result<Self> {
         let WorkerReadyFds {
             channel: channel_fd,
-            liveness: liveness_fd,
             notify,
-            body,
+            link,
         } = fds;
         let mapped = Arc::new(shm::map_existing_channel(channel_fd)?);
 
+        // Parking on readiness needs O_NONBLOCK, and the flag lives on the
+        // open file description, so the `dup` below shares it and sends go
+        // non-blocking too - deliberately, see `send_body_fd`.
+        set_nonblocking(&link)?;
         // Its own dup'd fds, so it can never notify through a number this
         // channel has closed and the OS has reused.
         let watcher_notify = notify.try_clone()?;
 
         let worker_gone = Arc::new(AtomicBool::new(false));
         spawn_liveness_watcher(
-            liveness_fd,
+            link.try_clone()?,
             Arc::clone(&mapped),
             Arc::clone(&worker_gone),
             watcher_notify,
@@ -211,7 +213,7 @@ impl WorkerChannel {
         Ok(WorkerChannel {
             pid,
             mapped,
-            body,
+            link,
             notify: Notify::Parked(notify),
             read_scratch: Vec::new(),
             encode_scratch: Vec::new(),
@@ -229,12 +231,12 @@ impl WorkerChannel {
         pid: u32,
         mapped: Arc<shm::MappedChannel>,
         notify: shm::NotifyEfds,
-        body: OwnedFd,
+        link: OwnedFd,
     ) -> Self {
         WorkerChannel {
             pid,
             mapped,
-            body,
+            link,
             notify: Notify::Parked(notify),
             read_scratch: Vec::new(),
             encode_scratch: Vec::new(),
@@ -271,7 +273,7 @@ impl WorkerChannel {
             encoded,
             req_space_efd,
         )
-        .await
+            .await
     }
 
     /// The next frame if the worker has already published one. `None` means
@@ -350,10 +352,10 @@ impl WorkerChannel {
     /// back-to-back would otherwise pay a round-trip of TTFB.
     fn absorb(&mut self, raw: Option<ResponseFrame<'static>>) -> std::io::Result<Absorbed> {
         let Some(ResponseFrame::Headers {
-            status,
-            headers,
-            more,
-        }) = raw
+                     status,
+                     headers,
+                     more,
+                 }) = raw
         else {
             let displaced = raw.map(|frame| match frame {
                 ResponseFrame::Body(chunk) => WorkerEvent::Body(Bytes::from(chunk.into_owned())),
@@ -401,12 +403,16 @@ impl WorkerChannel {
     /// Hands a spilled body to the worker. Only ever called after the request
     /// frame is on the ring, so a frame that failed to go leaves nothing
     /// queued here for the next request to pick up by mistake.
+    ///
+    /// `WouldBlock` rather than waiting: this runs on a connection's own task,
+    /// where blocking on a worker that stopped reading would stall every other
+    /// connection sharing that thread.
     pub fn send_body_fd(&self, fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
         use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
         let raw = [fd.as_raw_fd()];
         let cmsg = [ControlMessage::ScmRights(&raw)];
         let iov = [std::io::IoSlice::new(b"B")];
-        sendmsg::<()>(self.body.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
+        sendmsg::<()>(self.link.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
             .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
         Ok(())
     }
@@ -456,22 +462,33 @@ fn unexpected_marker() -> std::io::Error {
     )
 }
 
-/// Watches for the worker's exit: EOF is expected, and any byte arriving is
-/// itself a fatal protocol violation. Either way it wakes both kinds of
-/// waiter - `mark_peer_dead` alone reaches only the futex ones, since it
-/// knows nothing outside shared memory.
+fn set_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let flags = OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL)?);
+    fcntl(fd, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+    Ok(())
+}
+
+/// Watches master's end of the link for the worker's exit. The worker never
+/// sends, so anything readable means it is gone.
+///
+/// Wakes both kinds of waiter: `mark_peer_dead` knows nothing outside shared
+/// memory, so it reaches only the futex ones.
 fn spawn_liveness_watcher(
-    liveness_fd: OwnedFd,
+    link: OwnedFd,
     mapped: Arc<shm::MappedChannel>,
     worker_gone: Arc<AtomicBool>,
     notify: shm::NotifyEfds,
 ) -> std::io::Result<()> {
-    let std_stream = std::os::unix::net::UnixStream::from(liveness_fd);
-    std_stream.set_nonblocking(true)?;
-    let mut stream = TokioUnixStream::from_std(std_stream)?;
+    let link = AsyncFd::new(link)?;
     tokio::spawn(async move {
-        let mut buf = [0u8; 1];
-        let _ = stream.read(&mut buf).await;
+        // Looped because readiness can be reported without a message behind
+        // it; only a completed read settles the question.
+        while let Ok(mut ready) = link.readable().await {
+            if ready.try_io(|fd| recv_byte(fd.get_ref())).is_ok() {
+                break;
+            }
+        }
         mapped.channel().mark_peer_dead();
         // Unconditional: this fires once in a worker's life, so there is no
         // hot-path cost to save by checking for a parked waiter first.
@@ -480,6 +497,25 @@ fn spawn_liveness_watcher(
         worker_gone.store(true, Ordering::Relaxed);
     });
     Ok(())
+}
+
+/// `Ok` on EOF, on a byte, and on a reset alike - each says the worker is
+/// gone. `WouldBlock` is the only answer that means "nothing yet", so it is
+/// the only one that must reach `try_io` as an error.
+fn recv_byte(fd: &OwnedFd) -> std::io::Result<()> {
+    let mut buf = [0u8; 1];
+    loop {
+        let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if n >= 0 {
+            return Ok(());
+        }
+        let e = std::io::Error::last_os_error();
+        match e.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return Err(e),
+            _ => return Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]

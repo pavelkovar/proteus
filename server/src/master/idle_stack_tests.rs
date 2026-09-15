@@ -2,16 +2,36 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// The smallest payload that can be parked: something that remembers its own
+/// slot, exactly as a real worker does through its `WorkerMeta`.
+#[derive(Debug, PartialEq, Eq)]
+struct Item {
+    slot: u32,
+    value: usize,
+}
+
+impl Slotted for Item {
+    fn slot(&self) -> u32 {
+        self.slot
+    }
+}
+
+fn item(value: usize) -> impl FnOnce(u32) -> Item {
+    move |slot| Item { slot, value }
+}
+
 #[test]
 fn pops_in_lifo_order() {
     // LIFO keeps one worker hot and lets the rest reach their idle timeout.
-    let stack: IdleStack<u32> = IdleStack::new(4);
+    let stack: IdleStack<Item> = IdleStack::new(4);
     for i in 0..4 {
-        assert!(stack.push_new(i).is_none());
+        assert!(stack.push_new(item(i)));
     }
     assert_eq!(stack.len(), 4);
     assert_eq!(
-        (0..4).map(|_| stack.pop().unwrap().1).collect::<Vec<_>>(),
+        (0..4)
+            .map(|_| stack.pop().unwrap().value)
+            .collect::<Vec<_>>(),
         vec![3, 2, 1, 0]
     );
     assert!(stack.pop().is_none());
@@ -19,13 +39,13 @@ fn pops_in_lifo_order() {
 }
 
 #[test]
-fn push_beyond_capacity_hands_the_value_back() {
-    let stack: IdleStack<u32> = IdleStack::new(2);
-    assert!(stack.push_new(1).is_none());
-    assert!(stack.push_new(2).is_none());
-    // Unreachable behind the semaphore, but returning beats dropping
-    // something the caller still owns.
-    assert_eq!(stack.push_new(3), Some(3));
+fn push_beyond_capacity_is_refused() {
+    let stack: IdleStack<Item> = IdleStack::new(2);
+    assert!(stack.push_new(item(1)));
+    assert!(stack.push_new(item(2)));
+    // Unreachable behind the semaphore, but refusing beats parking a third
+    // entry in a slot another worker already owns.
+    assert!(!stack.push_new(item(3)));
     assert_eq!(stack.len(), 2);
 }
 
@@ -33,15 +53,21 @@ fn push_beyond_capacity_hands_the_value_back() {
 fn slots_are_reused_after_popping() {
     // Capacity bounds live entries, not lifetime pushes: a free-list leak
     // fails on the second round.
-    let stack: IdleStack<u32> = IdleStack::new(2);
+    let stack: IdleStack<Item> = IdleStack::new(2);
     // Round-trips slots through claim and release as the pool does.
     for round in 0..1000 {
         let a = stack.claim_slot().expect("slot available");
         let b = stack.claim_slot().expect("slot available");
-        stack.push(a, round);
-        stack.push(b, round + 10_000);
-        assert_eq!(stack.pop().map(|(_, v)| v), Some(round + 10_000));
-        assert_eq!(stack.pop().map(|(_, v)| v), Some(round));
+        stack.push(Item {
+            slot: a,
+            value: round,
+        });
+        stack.push(Item {
+            slot: b,
+            value: round + 10_000,
+        });
+        assert_eq!(stack.pop().map(|i| i.value), Some(round + 10_000));
+        assert_eq!(stack.pop().map(|i| i.value), Some(round));
         stack.release_slot(a);
         stack.release_slot(b);
     }
@@ -50,11 +76,10 @@ fn slots_are_reused_after_popping() {
 
 #[test]
 fn an_empty_stack_pops_none() {
-    let stack: IdleStack<u32> = IdleStack::new(0);
+    let stack: IdleStack<Item> = IdleStack::new(0);
     assert!(stack.pop().is_none());
-    assert_eq!(
-        stack.push_new(1),
-        Some(1),
+    assert!(
+        !stack.push_new(item(1)),
         "a zero-capacity stack can hold nothing"
     );
 }
@@ -68,9 +93,19 @@ fn concurrent_push_pop_neither_duplicates_nor_loses_a_value() {
     const PER_THREAD: usize = 20_000;
     const CAPACITY: usize = 16;
 
-    let stack: Arc<IdleStack<usize>> = Arc::new(IdleStack::new(CAPACITY));
-
+    let stack: Arc<IdleStack<Item>> = Arc::new(IdleStack::new(CAPACITY));
     let seen: Arc<Vec<AtomicUsize>> = Arc::new((0..THREADS).map(|_| AtomicUsize::new(0)).collect());
+
+    // Parks a value in a freshly claimed slot, then takes whatever is on top
+    // and frees that one's slot - so the same few indices keep coming back.
+    fn churn(stack: &IdleStack<Item>, value: usize) -> Option<usize> {
+        if !stack.push_new(item(value)) {
+            return Some(value);
+        }
+        let taken = stack.pop()?;
+        stack.release_slot(taken.slot);
+        Some(taken.value)
+    }
 
     let handles: Vec<_> = (0..THREADS)
         .map(|id| {
@@ -78,32 +113,22 @@ fn concurrent_push_pop_neither_duplicates_nor_loses_a_value() {
             std::thread::spawn(move || {
                 let mut held: Option<usize> = Some(id);
                 for _ in 0..PER_THREAD {
-                    match held.take() {
-                        // Take whatever is on top, usually someone else's.
+                    held = match held.take() {
                         Some(v) => {
-                            if let Some(rejected) = stack.push_new(v) {
-                                held = Some(rejected);
-                                continue;
-                            }
-                            held = stack.pop().map(|(slot, v)| {
-                                stack.release_slot(slot);
-                                v
-                            });
-                            if let Some(v) = held {
+                            let next = churn(&stack, v);
+                            if let Some(v) = next {
                                 seen[v].fetch_add(1, Ordering::Relaxed);
                             }
+                            next
                         }
-                        None => {
-                            held = stack.pop().map(|(slot, v)| {
-                                stack.release_slot(slot);
-                                v
-                            })
-                        }
-                    }
+                        None => stack.pop().map(|taken| {
+                            stack.release_slot(taken.slot);
+                            taken.value
+                        }),
+                    };
                 }
-
                 if let Some(v) = held {
-                    let _ = stack.push_new(v);
+                    stack.push_new(item(v));
                 }
             })
         })
@@ -113,10 +138,9 @@ fn concurrent_push_pop_neither_duplicates_nor_loses_a_value() {
     }
 
     // The multiset of live values must be exactly what went in.
-    let mut remaining = Vec::new();
-    while let Some((_slot, v)) = stack.pop() {
-        remaining.push(v);
-    }
+    let mut remaining: Vec<usize> = std::iter::from_fn(|| stack.pop())
+        .map(|item| item.value)
+        .collect();
     remaining.sort_unstable();
     assert_eq!(
         remaining,
@@ -131,16 +155,16 @@ fn concurrent_push_pop_neither_duplicates_nor_loses_a_value() {
 #[test]
 fn len_tracks_contents_under_concurrency() {
     const THREADS: usize = 8;
-    let stack: Arc<IdleStack<u32>> = Arc::new(IdleStack::new(THREADS));
-    let handles: Vec<_> = (0..THREADS as u32)
+    let stack: Arc<IdleStack<Item>> = Arc::new(IdleStack::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
         .map(|id| {
             let stack = Arc::clone(&stack);
             std::thread::spawn(move || {
                 for _ in 0..10_000 {
-                    if stack.push_new(id).is_none()
-                        && let Some((slot, _)) = stack.pop()
+                    if stack.push_new(item(id))
+                        && let Some(taken) = stack.pop()
                     {
-                        stack.release_slot(slot);
+                        stack.release_slot(taken.slot);
                     }
                 }
             })
@@ -161,10 +185,18 @@ fn len_tracks_contents_under_concurrency() {
 /// that is what signals each parked worker to exit.
 #[test]
 fn dropping_the_stack_drops_the_values_it_still_holds() {
-    struct CountsDrops(Arc<AtomicUsize>);
+    struct CountsDrops {
+        slot: u32,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Slotted for CountsDrops {
+        fn slot(&self) -> u32 {
+            self.slot
+        }
+    }
     impl Drop for CountsDrops {
         fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
+            self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -172,7 +204,10 @@ fn dropping_the_stack_drops_the_values_it_still_holds() {
     {
         let stack: IdleStack<CountsDrops> = IdleStack::new(4);
         for _ in 0..3 {
-            assert!(stack.push_new(CountsDrops(Arc::clone(&drops))).is_none());
+            assert!(stack.push_new(|slot| CountsDrops {
+                slot,
+                drops: Arc::clone(&drops),
+            }));
         }
         assert_eq!(drops.load(Ordering::Relaxed), 0);
     }
@@ -181,4 +216,29 @@ fn dropping_the_stack_drops_the_values_it_still_holds() {
         3,
         "values left in the stack were leaked, not dropped"
     );
+}
+
+/// The whole point of the guard: releasing a slot whose worker is still
+/// linked here hands that slot to a second worker, and the idle stack then
+/// holds one entry under two owners.
+#[test]
+#[should_panic(expected = "still parked")]
+#[cfg(debug_assertions)]
+fn releasing_a_slot_that_is_still_parked_is_caught() {
+    let stack: IdleStack<Item> = IdleStack::new(4);
+    let slot = stack.claim_slot().expect("a free slot");
+    stack.push(Item { slot, value: 1 });
+    stack.release_slot(slot);
+}
+
+/// Parking two payloads under one index links that slot into the list twice,
+/// and the list then loops back on itself.
+#[test]
+#[should_panic(expected = "parked twice")]
+#[cfg(debug_assertions)]
+fn parking_the_same_slot_twice_is_caught() {
+    let stack: IdleStack<Item> = IdleStack::new(4);
+    let slot = stack.claim_slot().expect("a free slot");
+    stack.push(Item { slot, value: 1 });
+    stack.push(Item { slot, value: 2 });
 }

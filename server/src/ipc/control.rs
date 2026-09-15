@@ -21,11 +21,11 @@ pub const SPAWN: &[u8] = b"SPAWN";
 /// transposed at a call site without a compile error.
 pub struct WorkerReadyFds {
     pub channel: OwnedFd,
-    pub liveness: OwnedFd,
     pub notify: shm::NotifyEfds,
-    /// Carries the fd of a spilled request body, which needs a socket rather
-    /// than the ring: `SCM_RIGHTS` is the only way to hand one over.
-    pub body: OwnedFd,
+    /// Master to worker, one socket for the worker's whole life: it carries
+    /// the fd of a spilled request body, which the ring cannot, and the
+    /// worker's end closing is how master learns the process is gone.
+    pub link: OwnedFd,
 }
 
 /// Unpacks the reply's fds in the same fixed order `send_worker_ready` packs
@@ -54,31 +54,25 @@ pub async fn request_worker(control: &UnixSeqpacket) -> std::io::Result<(WorkerR
             fds.extend(received);
         }
     }
-    let [
-        channel_fd,
-        liveness_fd,
-        req_space_efd,
-        resp_data_efd,
-        body_fd,
-    ] = <[OwnedFd; 5]>::try_from(fds).map_err(|fds| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "expected exactly 5 fds in WORKER_READY reply, got {}",
-                fds.len()
-            ),
-        )
-    })?;
+    let [channel_fd, req_space_efd, resp_data_efd, link_fd] = <[OwnedFd; 4]>::try_from(fds)
+        .map_err(|fds| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "expected exactly 4 fds in WORKER_READY reply, got {}",
+                    fds.len()
+                ),
+            )
+        })?;
 
     Ok((
         WorkerReadyFds {
             channel: channel_fd,
-            liveness: liveness_fd,
             notify: shm::NotifyEfds {
                 req_space: req_space_efd,
                 resp_data: resp_data_efd,
             },
-            body: body_fd,
+            link: link_fd,
         },
         pid,
     ))
@@ -106,10 +100,9 @@ pub fn send_worker_ready(
 
     let raw_fds = [
         fds.channel.as_raw_fd(),
-        fds.liveness.as_raw_fd(),
         fds.notify.req_space.as_raw_fd(),
         fds.notify.resp_data.as_raw_fd(),
-        fds.body.as_raw_fd(),
+        fds.link.as_raw_fd(),
     ];
     let cmsg = [ControlMessage::ScmRights(&raw_fds)];
     let iov = [IoSlice::new(&payload)];
@@ -120,23 +113,36 @@ pub fn send_worker_ready(
     // Closes the prototype's own copies; master holds its own duplicates.
 }
 
-/// Non-blocking, so zombies do not accumulate while waiting for a command.
-pub fn reap_finished_workers() {
+/// Reaps every child that has already exited, handing each terminal status to
+/// `on_exit`. Non-blocking, so zombies do not accumulate while the caller is
+/// waiting on something else.
+pub fn reap_exited_children(mut on_exit: impl FnMut(Pid, WaitStatus)) {
     loop {
         match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-            Ok(WaitStatus::StillAlive) => break,
-            // Turns a mystery 500 into a diagnosable one.
-            Ok(WaitStatus::Signaled(pid, signal, _)) => {
-                logging::warn!(r#type = "prototype", worker_pid = %pid, ?signal, "worker killed by signal");
+            Ok(status @ (WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _))) => {
+                on_exit(pid, status)
             }
-            Ok(WaitStatus::Exited(pid, code)) if code != 0 => {
-                logging::warn!(r#type = "prototype", worker_pid = %pid, code, "worker exited with non-zero code");
-            }
-            Ok(_status) => continue,
-            Err(nix::errno::Errno::ECHILD) => break,
-            Err(_) => break,
+            // A stop or a continue is not an exit, and leaving the loop on one
+            // would strand every zombie behind it until the next sweep.
+            Ok(WaitStatus::StillAlive) => return,
+            Ok(_) | Err(nix::errno::Errno::EINTR) => continue,
+            Err(_) => return,
         }
     }
+}
+
+/// Prototype side: a worker's abnormal exit turns a mystery 500 into a
+/// diagnosable one.
+pub fn reap_finished_workers() {
+    reap_exited_children(|pid, status| match status {
+        WaitStatus::Signaled(_, signal, _) => {
+            logging::warn!(r#type = "prototype", worker_pid = %pid, ?signal, "worker killed by signal")
+        }
+        WaitStatus::Exited(_, code) if code != 0 => {
+            logging::warn!(r#type = "prototype", worker_pid = %pid, code, "worker exited with non-zero code")
+        }
+        _ => {}
+    });
 }
 
 /// For the prototype's inherited copy; master keeps its own fd async.

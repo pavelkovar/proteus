@@ -13,6 +13,32 @@ use std::os::fd::OwnedFd;
 /// The cost is that small, gapped writes wait for the buffer to fill.
 pub(crate) const COALESCE_FLUSH_THRESHOLD: usize = 64 * 1024;
 
+/// All the loop below needs from PHP, as a trait so that the loop's own side
+/// of the protocol can be exercised without a PHP runtime behind it.
+pub(crate) trait ExecuteFile {
+    fn execute_file(
+        &self,
+        script_path: &str,
+        req: &data::PhpRequest<'_>,
+        body_fd: Option<std::os::fd::BorrowedFd<'_>>,
+        client_gone: &std::sync::atomic::AtomicBool,
+        on_chunk: &mut dyn FnMut(PhpChunk),
+    ) -> crate::prototype::php_ffi::ExecuteResult;
+}
+
+impl ExecuteFile for PhpConn {
+    fn execute_file(
+        &self,
+        script_path: &str,
+        req: &data::PhpRequest<'_>,
+        body_fd: Option<std::os::fd::BorrowedFd<'_>>,
+        client_gone: &std::sync::atomic::AtomicBool,
+        on_chunk: &mut dyn FnMut(PhpChunk),
+    ) -> crate::prototype::php_ffi::ExecuteResult {
+        PhpConn::execute_file(self, script_path, req, body_fd, client_gone, on_chunk)
+    }
+}
+
 /// Last-resort orphan guard. The in-band shutdown path needs someone alive
 /// to set it, so once master and then the prototype exit, a parked worker
 /// would be reparented to init and wait forever on a ring nobody will write
@@ -41,14 +67,13 @@ fn die_with_parent(_expected_parent: nix::unistd::Pid) {}
 
 /// Serves requests until `max_requests` or the peer goes away.
 ///
-/// `_liveness` is held for the worker's whole life, so its process exit is
-/// the EOF master watches for. `prototype_pid` must be read before the
-/// `fork()` - see `die_with_parent`.
+/// `link` is held for the worker's whole life, so its process exit is the EOF
+/// master watches for. `prototype_pid` must be read before the `fork()` - see
+/// `die_with_parent`.
 pub(crate) fn run(
-    _liveness: OwnedFd,
-    body_socket: OwnedFd,
+    link: OwnedFd,
     channel: shm::MappedChannel,
-    phpconn: &PhpConn,
+    phpconn: &impl ExecuteFile,
     max_requests: u32,
     notify: shm::NotifyEfds,
     prototype_pid: nix::unistd::Pid,
@@ -97,7 +122,7 @@ pub(crate) fn run(
         // Master sends the fd only after the frame it belongs to is on the
         // ring, so by the time this runs it is either here or on its way.
         let body_fd = match req.body {
-            data::RequestBody::File { .. } => match recv_body_fd(&body_socket) {
+            data::RequestBody::File { .. } => match recv_body_fd(&link) {
                 Ok(fd) => Some(fd),
                 Err(e) => {
                     logging::warn!(r#type = "worker", pid, error = %e, "no fd arrived for a spilled request body");
@@ -196,7 +221,7 @@ pub(crate) fn run(
 
 /// The body fd master sent for this request. Blocking: master has already
 /// written the frame, so it is sending or has sent.
-fn recv_body_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
+pub(crate) fn recv_body_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
     use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
     use std::os::fd::{AsRawFd, FromRawFd};
     let mut buf = [0u8; 8];
@@ -224,3 +249,7 @@ fn recv_body_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
         "body message carried no fd",
     ))
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

@@ -38,6 +38,16 @@ const DEAD: u32 = 2;
 /// Little-endian frame length, ahead of every payload.
 const LEN_PREFIX: usize = 4;
 
+/// How the peer parked, and so how to wake it. Fixed by who sits on the far
+/// end of a given call, never discovered at runtime.
+#[derive(Clone, Copy)]
+enum Wake {
+    /// A worker, parked on the ring's own state word.
+    Futex,
+    /// Master, parked on this eventfd by `AsyncFd`.
+    Eventfd(RawFd),
+}
+
 /// A `Ring` sits on the master<->worker trust boundary, where a
 /// peer-triggered panic would take down the whole process. Errors, never
 /// panics; both variants are fatal to the channel.
@@ -270,41 +280,20 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         Ok(true)
     }
 
-    /// Parks without spinning first: the wait is for the next unit of work
-    /// and may be unbounded, unlike a mutex's short critical section.
-    fn wait_for_space(&self, needed: usize, peer: &PeerDeath) -> Result<(), RingError> {
-        let w = self.write_pos.load(Ordering::Relaxed); // producer-only
-        loop {
-            if self.has_space(w, needed) {
-                return Ok(());
-            }
-            if peer.is_dead() {
-                return Err(RingError::PeerGone);
-            }
-            if Self::declare_waiting(&self.space_state, peer, || self.has_space(w, needed))? {
-                unsafe { futex_wait(&self.space_state, WAITING, None) };
-            } else {
-                return Ok(());
-            }
-        }
-    }
-
-    fn wait_for_data(&self, needed: usize, peer: &PeerDeath) -> Result<(), RingError> {
-        self.wait_for_data_until(needed, peer, None).map(|_| ())
-    }
-
-    /// `Ok(false)` once `deadline` passes. The clock is rechecked around the
-    /// park rather than inferred from the futex returning, which also happens
-    /// on spurious wakes and on every real notify.
-    fn wait_for_data_until(
-        &self,
-        needed: usize,
+    /// Parks the calling thread until `ready`, `deadline`, or the peer's
+    /// death; `Ok(false)` means the deadline passed.
+    ///
+    /// No spin first: this waits for the next unit of work, which unlike a
+    /// mutex's critical section may never come. The deadline is rechecked
+    /// around the park, the futex also returning on spurious wakes.
+    fn park_on(
+        state: &AtomicU32,
         peer: &PeerDeath,
         deadline: Option<std::time::Instant>,
+        ready: impl Fn() -> bool,
     ) -> Result<bool, RingError> {
-        let r = self.read_pos.load(Ordering::Relaxed); // consumer-only
         loop {
-            if self.has_data(r, needed) {
+            if ready() {
                 return Ok(true);
             }
             if peer.is_dead() {
@@ -319,12 +308,32 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
                 }
                 None => None,
             };
-            if Self::declare_waiting(&self.data_state, peer, || self.has_data(r, needed))? {
-                unsafe { futex_wait(&self.data_state, WAITING, remaining) };
-            } else {
+            if !Self::declare_waiting(state, peer, &ready)? {
                 return Ok(true);
             }
+            unsafe { futex_wait(state, WAITING, remaining) };
         }
+    }
+
+    fn wait_for_space(&self, needed: usize, peer: &PeerDeath) -> Result<(), RingError> {
+        let w = self.write_pos.load(Ordering::Relaxed); // producer-only
+        Self::park_on(&self.space_state, peer, None, || self.has_space(w, needed)).map(|_| ())
+    }
+
+    fn wait_for_data(&self, needed: usize, peer: &PeerDeath) -> Result<(), RingError> {
+        self.wait_for_data_until(needed, peer, None).map(|_| ())
+    }
+
+    fn wait_for_data_until(
+        &self,
+        needed: usize,
+        peer: &PeerDeath,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<bool, RingError> {
+        let r = self.read_pos.load(Ordering::Relaxed); // consumer-only
+        Self::park_on(&self.data_state, peer, deadline, || {
+            self.has_data(r, needed)
+        })
     }
 
     /// `SeqCst` so `declare_waiting`'s recheck joins the same total order as
@@ -340,21 +349,21 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         (w - r) as usize >= needed
     }
 
-    async fn wait_for_space_async(
-        &self,
-        needed: usize,
+    /// Parks the task until `ready` or the peer's death.
+    async fn park_on_async(
+        state: &AtomicU32,
         peer: &PeerDeath,
         efd: &AsyncFd<OwnedFd>,
+        ready: impl Fn() -> bool,
     ) -> Result<(), RingError> {
-        let w = self.write_pos.load(Ordering::Relaxed);
         loop {
-            if self.has_space(w, needed) {
+            if ready() {
                 return Ok(());
             }
             if peer.is_dead() {
                 return Err(RingError::PeerGone);
             }
-            if !Self::declare_waiting(&self.space_state, peer, || self.has_space(w, needed))? {
+            if !Self::declare_waiting(state, peer, &ready)? {
                 return Ok(());
             }
             // A broken eventfd is as unrecoverable as a dead peer.
@@ -364,6 +373,16 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         }
     }
 
+    async fn wait_for_space_async(
+        &self,
+        needed: usize,
+        peer: &PeerDeath,
+        efd: &AsyncFd<OwnedFd>,
+    ) -> Result<(), RingError> {
+        let w = self.write_pos.load(Ordering::Relaxed);
+        Self::park_on_async(&self.space_state, peer, efd, || self.has_space(w, needed)).await
+    }
+
     async fn wait_for_data_async(
         &self,
         needed: usize,
@@ -371,52 +390,23 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         efd: &AsyncFd<OwnedFd>,
     ) -> Result<(), RingError> {
         let r = self.read_pos.load(Ordering::Relaxed);
-        loop {
-            if self.has_data(r, needed) {
-                return Ok(());
-            }
-            if peer.is_dead() {
-                return Err(RingError::PeerGone);
-            }
-            if !Self::declare_waiting(&self.data_state, peer, || self.has_data(r, needed))? {
-                return Ok(());
-            }
-            if wait_readable_and_drain(efd).await.is_err() {
-                return Err(RingError::PeerGone);
-            }
-        }
+        Self::park_on_async(&self.data_state, peer, efd, || self.has_data(r, needed)).await
     }
 
-    /// Clears a waiter's claim and reports whether there was one. `SeqCst`
-    /// for `declare_waiting`'s reason - this RMW is the other half of that
-    /// total order. Clobbering `DEAD` back to `EMPTY` is harmless, since
+    /// Wakes whoever is parked on `state`, claiming the park with a swap so no
+    /// two notifiers wake one waiter. An unparked word costs no syscall, which
+    /// is the steady-state case.
+    ///
+    /// `SeqCst` for `declare_waiting`'s reason - this RMW is the other half of
+    /// that total order. Clobbering a `DEAD` word back to `EMPTY` is harmless:
     /// `peer_death` is the authority and waiters recheck it.
-    fn take_waiter(state: &AtomicU32) -> bool {
-        state.swap(EMPTY, Ordering::SeqCst) == WAITING
-    }
-
-    fn notify_data_written(&self) {
-        if Self::take_waiter(&self.data_state) {
-            unsafe { futex_wake_all(&self.data_state) };
+    fn notify(state: &AtomicU32, wake: Wake) {
+        if state.swap(EMPTY, Ordering::SeqCst) != WAITING {
+            return;
         }
-    }
-
-    /// For a reader parked on `AsyncFd` rather than the futex word.
-    fn notify_data_written_eventfd(&self, efd: RawFd) {
-        if Self::take_waiter(&self.data_state) {
-            eventfd_notify(efd);
-        }
-    }
-
-    fn notify_space_freed(&self) {
-        if Self::take_waiter(&self.space_state) {
-            unsafe { futex_wake_all(&self.space_state) };
-        }
-    }
-
-    fn notify_space_freed_eventfd(&self, efd: RawFd) {
-        if Self::take_waiter(&self.space_state) {
-            eventfd_notify(efd);
+        match wake {
+            Wake::Futex => unsafe { futex_wake_all(state) },
+            Wake::Eventfd(efd) => eventfd_notify(efd),
         }
     }
 
@@ -613,7 +603,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         unsafe {
             self.raw_write_frame(payload);
         }
-        self.notify_data_written_eventfd(notify_efd);
+        Self::notify(&self.data_state, Wake::Eventfd(notify_efd));
         Ok(())
     }
 
@@ -650,7 +640,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         self.wait_for_data(len, peer)?;
         unsafe { self.read_into_scratch(scratch, len) };
         // Once per frame, not per raw_read.
-        self.notify_space_freed_eventfd(notify_efd);
+        Self::notify(&self.space_state, Wake::Eventfd(notify_efd));
         Ok(true)
     }
 
@@ -668,8 +658,8 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         unsafe {
             self.raw_write_frame(payload);
         }
-        // The reader here is always a worker, so always a futex waiter.
-        self.notify_data_written();
+        // The reader here is always a worker.
+        Self::notify(&self.data_state, Wake::Futex);
         Ok(())
     }
 
@@ -705,8 +695,8 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
             self.raw_read(&mut len_buf);
             self.read_into_scratch(scratch, len);
         }
-        // The writer here is always a worker, so always a futex waiter.
-        self.notify_space_freed();
+        // The writer here is always a worker.
+        Self::notify(&self.space_state, Wake::Futex);
         Ok(true)
     }
 

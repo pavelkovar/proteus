@@ -251,7 +251,7 @@ fn read_frame_rejects_corrupt_length_prefix_not_panicked() {
     // is another process scribbling on shared memory, not a caller of this API.
     unsafe { ring.copy_at(0, &9_999u32.to_le_bytes()) };
     ring.write_pos.store(LEN_PREFIX as u64, Ordering::Release);
-    ring.notify_data_written();
+    Ring::<16>::notify(&ring.data_state, Wake::Futex);
 
     let mut scratch = Vec::new();
     let err = ring
@@ -1137,7 +1137,7 @@ fn declare_waiting_retracts_the_claim_unless_the_caller_will_actually_park() {
         "claim must be retracted, not left set"
     );
 
-    // The claim must stay published for `take_waiter` to see.
+    // The claim must stay published for a notifier to see.
     let park = Ring::<64>::declare_waiting(&state, peer, || false).unwrap();
     assert!(park);
     assert_eq!(
@@ -1215,7 +1215,7 @@ fn a_waiter_bounced_by_the_dead_stamp_finds_peer_death_already_set() {
     );
 }
 
-/// `take_waiter` may clobber `DEAD` back to `EMPTY`; this pins that it stays
+/// A notify may clobber `DEAD` back to `EMPTY`; this pins that it stays
 /// harmless, a later waiter still exiting via `peer_death`.
 #[test]
 fn a_notify_landing_after_peer_death_does_not_resurrect_the_ring() {
@@ -1223,7 +1223,7 @@ fn a_notify_landing_after_peer_death_does_not_resurrect_the_ring() {
     let channel = mapped.channel();
     channel.mark_peer_dead();
 
-    Ring::<REQUEST_RING_CAPACITY>::take_waiter(&channel.request.data_state);
+    Ring::<REQUEST_RING_CAPACITY>::notify(&channel.request.data_state, Wake::Futex);
     assert_eq!(channel.request.data_state.load(Ordering::SeqCst), EMPTY);
 
     let mut scratch = Vec::new();
@@ -1322,4 +1322,61 @@ fn channel_mapping_stays_within_its_per_worker_budget() {
         actual <= BUDGET,
         "per-worker channel mapping grew to {actual} bytes, over the {BUDGET} byte budget"
     );
+}
+
+/// The deadline is what turns an idle worker's blocked read into its own
+/// decision to retire; without it a quiet pool never scales back down.
+#[test]
+fn read_frame_until_gives_up_on_its_deadline_rather_than_blocking() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+    let mut scratch = Vec::new();
+
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_millis(50);
+    let got = ring
+        .read_frame_until(&mut scratch, peer, efd.as_raw_fd(), Some(deadline))
+        .expect("an expired deadline is not an error");
+
+    assert!(!got, "nothing was written, so this must report no frame");
+    assert!(
+        started.elapsed() >= Duration::from_millis(50),
+        "returned before the deadline, so it never really waited"
+    );
+}
+
+/// A deadline already in the past must not park at all, which is the state a
+/// worker reaches when its idle timeout elapsed while it was busy.
+#[test]
+fn read_frame_until_with_an_expired_deadline_returns_at_once() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+    let mut scratch = Vec::new();
+
+    let deadline = std::time::Instant::now() - Duration::from_secs(1);
+    let got = ring
+        .read_frame_until(&mut scratch, peer, efd.as_raw_fd(), Some(deadline))
+        .unwrap();
+    assert!(!got);
+}
+
+/// A frame already on the ring wins over the deadline: data present must be
+/// read, not discarded as a timeout.
+#[test]
+fn read_frame_until_prefers_a_ready_frame_over_an_expired_deadline() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+    let mut scratch = Vec::new();
+
+    ring.write_frame(b"work", peer, efd.as_raw_fd()).unwrap();
+    let deadline = std::time::Instant::now() - Duration::from_secs(1);
+    let got = ring
+        .read_frame_until(&mut scratch, peer, efd.as_raw_fd(), Some(deadline))
+        .unwrap();
+
+    assert!(got, "a published frame must not be lost to the deadline");
+    assert_eq!(scratch, b"work");
 }

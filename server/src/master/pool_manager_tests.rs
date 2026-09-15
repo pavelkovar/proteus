@@ -1,9 +1,9 @@
 use super::*;
 
-/// Enough real state for the prototype-lifecycle tests, which touch only the
-/// child handle and the counters. The child must be a real killable process;
-/// which one does not matter.
-fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
+/// Enough real state for the lifecycle tests, which touch only the prototype
+/// handle, the slots and the counters. `prototype_pid` must name a real
+/// killable process, since these tests signal and reap it.
+fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
     let (control_sock, _unused_other_end) = UnixSeqpacket::pair().unwrap();
     PoolManager {
         control: Mutex::new(control_sock),
@@ -14,100 +14,33 @@ fn make_test_pool_manager(prototype_child: std::process::Child) -> PoolManager {
         request_timeout: Duration::from_secs(30),
         queue_timeout: Duration::from_secs(5),
         spawn_timeout: Duration::from_secs(30),
-        idle_timeout: 0,
         queue_max_depth: 0,
-        queue_depth: AtomicU64::new(0),
+        queue_depth: Gauge::default(),
         started_at: Instant::now(),
         target_names: Vec::new(),
-        requests_total: AtomicU64::new(0),
-        watchdog_kills: AtomicU64::new(0),
-        queue_timeouts: AtomicU64::new(0),
-        dispatch_failed: AtomicU64::new(0),
-        requests_too_large: AtomicU64::new(0),
-        workers_spawned: AtomicU64::new(0),
-        recycled_request_limit: AtomicU64::new(0),
-        recycled_idle_timeout: AtomicU64::new(0),
-        workers_reaped_dead: AtomicU64::new(0),
-        workers_abandoned: AtomicU64::new(0),
-        prototype_child: StdMutex::new(PrototypeHandle::new(prototype_child)),
-        php_mod_path: String::new(),
-        max_requests: 500,
-        uid: nix::unistd::getuid().as_raw(),
-        gid: nix::unistd::getgid().as_raw(),
-        drop_privileges: false,
-        no_new_privs: true,
-        options: PhpOptions::default(),
-        environment: HashMap::new(),
+        counters: Counters::default(),
+        prototype_child: StdMutex::new(PrototypeHandle::new(prototype_pid)),
+        prototype_spec: prototype_launch::PrototypeSpec {
+            config: ProtoConfig::default(),
+            drop_to: None,
+            no_new_privs: true,
+        },
         respawn_backoff: Mutex::new(RespawnBackoff::default()),
-        crash_loop_backoffs: AtomicU64::new(0),
-        prototype_respawns: AtomicU64::new(0),
         workers: StdMutex::new(HashMap::new()),
     }
 }
 
-/// A zero max takes the unbounded branch and must never reject, however many
-/// slots are held at once.
-#[test]
-fn queue_depth_guard_with_zero_max_never_rejects() {
-    let counter = AtomicU64::new(0);
-    let guards: Vec<_> = (0..10_000)
-        .map(|_| QueueDepthGuard::try_new(&counter, 0).expect("max=0 must never reject"))
-        .collect();
-    assert_eq!(counter.load(Relaxed), 10_000);
-    drop(guards);
-    assert_eq!(counter.load(Relaxed), 0);
-}
-
-/// A real cap must reject once full and admit again once a slot frees.
-#[test]
-fn queue_depth_guard_rejects_once_a_real_cap_is_reached() {
-    let counter = AtomicU64::new(0);
-    let first = QueueDepthGuard::try_new(&counter, 2).expect("slot 1 of 2");
-    let second = QueueDepthGuard::try_new(&counter, 2).expect("slot 2 of 2");
-    assert!(
-        QueueDepthGuard::try_new(&counter, 2).is_none(),
-        "a 3rd slot must be rejected at max=2"
-    );
-
-    drop(first);
-    let _third =
-        QueueDepthGuard::try_new(&counter, 2).expect("a freed slot must be admitted again");
-    drop(second);
-}
-
-/// The slot must be released when the holding future is cancelled mid-wait,
-/// not only on a normal return. Shaped like the real caller, with the guard
-/// alive across an `.await` that never completes.
-#[tokio::test]
-async fn queue_depth_guard_releases_its_slot_when_the_waiting_future_is_cancelled() {
-    let counter = Arc::new(AtomicU64::new(0));
-    let semaphore = Arc::new(Semaphore::new(0)); // never has a free permit to hand out
-
-    let counter_task = Arc::clone(&counter);
-    let semaphore_task = Arc::clone(&semaphore);
-    let task = tokio::spawn(async move {
-        let guard =
-            QueueDepthGuard::try_new(&counter_task, 0).expect("unlimited depth always admits");
-        let _permit = semaphore_task.acquire_owned().await;
-        drop(guard); // unreachable: the semaphore never yields a permit
-    });
-
-    // Let it park on the await before cancelling.
-    tokio::task::yield_now().await;
-    assert_eq!(
-        counter.load(Relaxed),
-        1,
-        "guard should have incremented the counter before parking"
-    );
-
-    task.abort();
-    let _ = task.await;
-
-    assert_eq!(
-        counter.load(Relaxed),
-        0,
-        "QueueDepthGuard must release its slot even when cancelled mid-await, or queue_depth leaks forever"
-    );
+/// A real, killable process standing in for a prototype or a worker; which
+/// one it is does not matter.
+// The `Child` is dropped unwaited on purpose: these tests reap through
+// `waitpid`, as master does, and a second reaper would race it.
+#[allow(clippy::zombie_processes)]
+fn spawn_sleeper() -> u32 {
+    let child = std::process::Command::new("sleep")
+        .arg("100")
+        .spawn()
+        .expect("failed to spawn `sleep 100`");
+    child.id()
 }
 
 #[test]
@@ -216,23 +149,15 @@ fn worker_meta_counts_are_exact_under_concurrent_updates() {
 }
 
 /// A respawn may replace a prototype that is still running but no longer
-/// answering. `Child` does not kill on drop, so overwriting the handle would
-/// orphan it: alive, holding its PHP heap, referenced and reaped by nobody.
+/// answering. Overwriting the handle without killing it would orphan it:
+/// alive, holding its PHP heap, referenced and reaped by nobody.
 #[tokio::test]
 async fn replacing_a_still_running_prototype_kills_and_reaps_it() {
-    let old = std::process::Command::new("sleep")
-        .arg("100")
-        .spawn()
-        .unwrap();
-    let old_pid = old.id() as i32;
-    let pool = make_test_pool_manager(old);
+    let old_pid = spawn_sleeper() as i32;
+    let pool = make_test_pool_manager(old_pid as u32);
 
-    let replacement = std::process::Command::new("sleep")
-        .arg("100")
-        .spawn()
-        .unwrap();
-    let new_pid = replacement.id();
-    pool.replace_prototype_child(replacement);
+    let new_pid = spawn_sleeper();
+    pool.prototype_child.lock().unwrap().replace(new_pid);
 
     // Signal 0 probes existence without sending anything. Already reaped, so
     // ESRCH rather than a zombie still answering.
@@ -244,7 +169,7 @@ async fn replacing_a_still_running_prototype_kills_and_reaps_it() {
     assert_eq!(
         pool.prototype_child.lock().unwrap().pid(),
         new_pid,
-        "the new child must be the tracked one"
+        "the replacement must be the tracked one"
     );
     reap_tracked_prototype(&pool);
 }
@@ -273,15 +198,16 @@ fn proc_state(pid: i32) -> Option<char> {
 /// which stands in for whatever the kernel handed the number to next.
 #[tokio::test]
 async fn a_reaped_prototype_pid_is_never_signalled_again() {
-    let squatter = std::process::Command::new("sleep")
-        .arg("100")
-        .spawn()
-        .unwrap();
-    let squatter_pid = squatter.id() as i32;
-    let pool = make_test_pool_manager(squatter);
-    pool.prototype_child.lock().unwrap().mark_reaped();
-
-    pool.kill_prototype();
+    let squatter_pid = spawn_sleeper() as i32;
+    let pool = make_test_pool_manager(squatter_pid as u32);
+    {
+        let mut handle = pool.prototype_child.lock().unwrap();
+        handle.note_exit(
+            squatter_pid as u32,
+            WaitStatus::Exited(Pid::from_raw(squatter_pid), 0),
+        );
+        handle.kill("a reaped pid must never be signalled");
+    }
 
     // Waits out delivery rather than assuming it: a signal that was sent shows
     // up as a zombie, since nothing here reaps.
@@ -308,18 +234,17 @@ async fn a_reaped_prototype_pid_is_never_signalled_again() {
 async fn replacing_an_already_exited_prototype_just_reaps_it() {
     let mut old = std::process::Command::new("true").spawn().unwrap();
     let old_pid = old.id() as i32;
-    // Exit first, so this takes the already-reaped branch rather than racing it.
+    // Exit and be reaped first, so this takes the ECHILD branch rather than
+    // racing it.
     while !matches!(old.try_wait(), Ok(Some(_))) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    // Already reaped above; hand the pool a fresh handle to that same state.
-    let pool = make_test_pool_manager(old);
+    let pool = make_test_pool_manager(old_pid as u32);
 
-    let replacement = std::process::Command::new("sleep")
-        .arg("100")
-        .spawn()
-        .unwrap();
-    pool.replace_prototype_child(replacement);
+    pool.prototype_child
+        .lock()
+        .unwrap()
+        .replace(spawn_sleeper());
 
     assert!(
         kill(Pid::from_raw(old_pid), None).is_err(),
@@ -329,14 +254,14 @@ async fn replacing_an_already_exited_prototype_just_reaps_it() {
     reap_tracked_prototype(&pool);
 }
 
-fn unused_body_socket() -> std::os::fd::OwnedFd {
+fn unused_link() -> std::os::fd::OwnedFd {
     let (a, _b) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,
         nix::sys::socket::SockType::SeqPacket,
         None,
         nix::sys::socket::SockFlag::empty(),
     )
-    .expect("socketpair");
+        .expect("socketpair");
     a
 }
 
@@ -350,7 +275,7 @@ fn idle_worker(pool: &PoolManager, pid: u32, retired: bool) -> PooledWorker {
             req_space: crate::ipc::shm::create_notify_eventfd().unwrap(),
             resp_data: crate::ipc::shm::create_notify_eventfd().unwrap(),
         },
-        unused_body_socket(),
+        unused_link(),
     );
     if retired {
         channel.mark_worker_gone_for_test();
@@ -368,16 +293,12 @@ fn idle_worker(pool: &PoolManager, pid: u32, retired: bool) -> PooledWorker {
 /// worker that retired underneath it is reported idle forever.
 #[tokio::test]
 async fn a_retired_worker_below_the_top_of_the_idle_stack_is_still_reaped() {
-    let child = std::process::Command::new("sleep")
-        .arg("100")
-        .spawn()
-        .unwrap();
-    let pool = make_test_pool_manager(child);
+    let pool = make_test_pool_manager(spawn_sleeper());
 
     // Pushed first, so it ends up at the bottom; the two live ones cover it.
     for (pid, retired) in [(101, true), (102, false), (103, false)] {
         let worker = idle_worker(&pool, pid, retired);
-        pool.idle.push(worker.meta.slot, worker);
+        pool.idle.push(worker);
     }
     assert_eq!(pool.idle.len(), 3);
 
@@ -388,7 +309,7 @@ async fn a_retired_worker_below_the_top_of_the_idle_stack_is_still_reaped() {
         2,
         "the retired worker under the live ones was never looked at"
     );
-    assert_eq!(pool.recycled_idle_timeout.load(Relaxed), 1);
+    assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 1);
     reap_tracked_prototype(&pool);
 }
 
@@ -397,11 +318,7 @@ async fn a_retired_worker_below_the_top_of_the_idle_stack_is_still_reaped() {
 /// pool's ceiling drops by one for good every time that happens.
 #[tokio::test]
 async fn reusing_a_pid_that_was_never_reaped_gives_its_slot_back() {
-    let child = std::process::Command::new("sleep")
-        .arg("100")
-        .spawn()
-        .unwrap();
-    let pool = make_test_pool_manager(child);
+    let pool = make_test_pool_manager(spawn_sleeper());
     let free_at_rest = pool.idle.claim_slot().map(|s| {
         pool.idle.release_slot(s);
         s
@@ -442,5 +359,192 @@ async fn reusing_a_pid_that_was_never_reaped_gives_its_slot_back() {
         reclaimed.contains(&stale_slot),
         "the displaced entry's slot never came back: {reclaimed:?}"
     );
+    reap_tracked_prototype(&pool);
+}
+
+/// Blocks until `pid` is a zombie, or gives up. Nothing in these tests reaps,
+/// so a delivered SIGKILL leaves the corpse visible.
+async fn became_a_zombie(pid: i32) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if proc_state(pid) == Some('Z') {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// A live worker the pool accounts for, holding a slot as a real one does.
+fn tracked_worker(pool: &PoolManager, pid: u32) -> u32 {
+    let slot = pool.idle.claim_slot().expect("a free slot");
+    pool.track_worker(
+        pid,
+        Arc::new(WorkerMeta::new(slot, pool.started_at, pool.started_at)),
+    );
+    slot
+}
+
+/// Every retirement path gives the slot back. Leaking one lowers the pool's
+/// real ceiling for good, and the reason it left must not change that.
+#[tokio::test]
+async fn every_retirement_reason_returns_the_slot() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+
+    for why in [
+        Retired::IdleTimeout,
+        Retired::RequestLimit,
+        Retired::Abandoned,
+        Retired::Watchdog,
+        Retired::Failed,
+        Retired::Unavailable,
+    ] {
+        // Out of range, so the kill variants fail harmlessly with ESRCH.
+        const NO_REAL_WORKER_PID: u32 = 999_999_999;
+        let slot = tracked_worker(&pool, NO_REAL_WORKER_PID);
+        pool.retire(NO_REAL_WORKER_PID, why);
+        assert_eq!(
+            pool.idle.claim_slot(),
+            Some(slot),
+            "retiring for {:?} kept the slot",
+            why.as_str()
+        );
+        pool.idle.release_slot(slot);
+        assert!(
+            !pool
+                .workers
+                .lock()
+                .unwrap()
+                .contains_key(&NO_REAL_WORKER_PID),
+            "a retired worker is still tracked after {:?}",
+            why.as_str()
+        );
+    }
+    reap_tracked_prototype(&pool);
+}
+
+/// A worker that is retiring itself is already on its way out; signalling it
+/// would race a pid master no longer owns. One that is merely unwanted has to
+/// be stopped, or it runs on holding its PHP heap with nothing tracking it.
+#[tokio::test]
+async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+
+    for (why, expect_killed) in [
+        (Retired::IdleTimeout, false),
+        (Retired::RequestLimit, false),
+        (Retired::Abandoned, false),
+        (Retired::Watchdog, true),
+        (Retired::Failed, true),
+        (Retired::Unavailable, true),
+    ] {
+        let worker_pid = spawn_sleeper();
+        let slot = tracked_worker(&pool, worker_pid);
+
+        pool.retire(worker_pid, why);
+
+        assert_eq!(
+            became_a_zombie(worker_pid as i32).await,
+            expect_killed,
+            "wrong kill decision for {:?}",
+            why.as_str()
+        );
+        let pid = Pid::from_raw(worker_pid as i32);
+        let _ = kill(pid, Signal::SIGKILL);
+        let _ = waitpid(pid, None);
+        pool.idle.release_slot(slot);
+    }
+    reap_tracked_prototype(&pool);
+}
+
+/// Every reason has a counter of its own, except the one whose caller knows
+/// better than the pool whether the request ultimately failed.
+#[tokio::test]
+async fn each_reason_counts_under_its_own_name() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    const NO_REAL_WORKER_PID: u32 = 999_999_999;
+
+    let counters = |p: &PoolManager| {
+        [
+            p.counters.recycled_idle_timeout.load(Relaxed),
+            p.counters.recycled_request_limit.load(Relaxed),
+            p.counters.workers_abandoned.load(Relaxed),
+            p.counters.watchdog_kills.load(Relaxed),
+            p.counters.dispatch_failed.load(Relaxed),
+        ]
+    };
+
+    for (why, expected) in [
+        (Retired::IdleTimeout, [1, 0, 0, 0, 0]),
+        (Retired::RequestLimit, [1, 1, 0, 0, 0]),
+        (Retired::Abandoned, [1, 1, 1, 0, 0]),
+        (Retired::Watchdog, [1, 1, 1, 1, 0]),
+        (Retired::Failed, [1, 1, 1, 1, 1]),
+        // Nothing moves: the caller accounts for this one.
+        (Retired::Unavailable, [1, 1, 1, 1, 1]),
+    ] {
+        let slot = tracked_worker(&pool, NO_REAL_WORKER_PID);
+        pool.retire(NO_REAL_WORKER_PID, why);
+        pool.idle.release_slot(slot);
+        assert_eq!(counters(&pool), expected, "after {:?}", why.as_str());
+    }
+    reap_tracked_prototype(&pool);
+}
+
+/// The prototype's own death is the only one that triggers a respawn; a
+/// worker reparented here by `PR_SET_CHILD_SUBREAPER` must not.
+#[tokio::test]
+async fn only_the_prototypes_own_exit_is_reported_as_its_death() {
+    let prototype_pid = spawn_sleeper();
+    let pool = make_test_pool_manager(prototype_pid);
+    let mut handle = pool.prototype_child.lock().unwrap();
+
+    let stray = WaitStatus::Exited(Pid::from_raw(prototype_pid as i32 + 1), 0);
+    assert!(
+        !handle.note_exit(prototype_pid + 1, stray),
+        "another child's exit is not the prototype's"
+    );
+
+    let own = WaitStatus::Exited(Pid::from_raw(prototype_pid as i32), 0);
+    assert!(handle.note_exit(prototype_pid, own));
+    assert!(
+        !handle.note_exit(prototype_pid, own),
+        "a second report of the same death would respawn twice"
+    );
+    drop(handle);
+
+    // Already accounted for above, so nothing is left to kill.
+    assert_eq!(pool.prototype_child.lock().unwrap().live_pid(), None);
+    let pid = Pid::from_raw(prototype_pid as i32);
+    let _ = kill(pid, Signal::SIGKILL);
+    let _ = waitpid(pid, None);
+}
+
+/// A prototype reaped by the sweep and then replaced must not be signalled on
+/// the way out: `replace` would otherwise `waitpid` and `kill` a pid the
+/// kernel may already have handed to something unrelated.
+#[tokio::test]
+async fn replacing_a_prototype_already_reaped_by_the_sweep_never_signals_it() {
+    let squatter_pid = spawn_sleeper() as i32;
+    let pool = make_test_pool_manager(squatter_pid as u32);
+    // Stands in for the sweep having reaped it, with a live process still on
+    // the number - as a recycled pid would be.
+    pool.prototype_child.lock().unwrap().note_exit(
+        squatter_pid as u32,
+        WaitStatus::Exited(Pid::from_raw(squatter_pid), 0),
+    );
+
+    pool.prototype_child
+        .lock()
+        .unwrap()
+        .replace(spawn_sleeper());
+
+    assert!(
+        !became_a_zombie(squatter_pid).await,
+        "a reaped pid was signalled while being replaced"
+    );
+    let pid = Pid::from_raw(squatter_pid);
+    let _ = kill(pid, Signal::SIGKILL);
+    let _ = waitpid(pid, None);
     reap_tracked_prototype(&pool);
 }

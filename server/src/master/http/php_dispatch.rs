@@ -11,8 +11,11 @@ use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper::{Method, Request, StatusCode, Version};
 use std::borrow::Cow;
+use std::ffi::CString;
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use tokio::io::AsyncWriteExt;
 
 /// Only a real extension method needs allocating.
@@ -58,6 +61,11 @@ const SPILL_WRITE_THRESHOLD: usize = 64 * 1024;
 
 static BODY_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Latched off the first time the temp filesystem refuses `O_TMPFILE`, so the
+/// named fallback is reached without re-trying a call that cannot start
+/// succeeding.
+static TMPFILE_USABLE: AtomicBool = AtomicBool::new(true);
+
 /// pid plus a counter, so no randomness is needed to avoid collisions.
 fn temp_body_path() -> PathBuf {
     let n = BODY_FILE_COUNTER.fetch_add(1, Relaxed);
@@ -66,6 +74,101 @@ fn temp_body_path() -> PathBuf {
         crate::APP_NAME,
         std::process::id()
     ))
+}
+
+/// A spill file with no name at any point, so there is no window in which
+/// anything could open, replace or symlink it, and nothing to unlink or clean
+/// up afterwards - closing the fd is the whole of it.
+///
+/// `None` means this filesystem has no `O_TMPFILE`.
+fn open_unnamed_spill_file() -> Option<std::io::Result<std::fs::File>> {
+    if !TMPFILE_USABLE.load(Relaxed) {
+        return None;
+    }
+    let dir = std::env::temp_dir();
+    let Ok(c_dir) = CString::new(dir.as_os_str().as_bytes()) else {
+        return None;
+    };
+    // Readable as well as writable: the worker reads the body back through
+    // this same open file description.
+    let fd = unsafe {
+        libc::open(
+            c_dir.as_ptr(),
+            libc::O_TMPFILE | libc::O_RDWR | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd >= 0 {
+        return Some(Ok(unsafe { std::fs::File::from_raw_fd(fd) }));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        // No O_TMPFILE on this filesystem, or a kernel without it: both come
+        // back as one of these, and neither changes while the process runs.
+        Some(libc::EOPNOTSUPP) | Some(libc::EISDIR) | Some(libc::EINVAL) => {
+            TMPFILE_USABLE.store(false, Relaxed);
+            logging::warn!(
+                r#type = "controller",
+                dir = %dir.display(),
+                error = %err,
+                "O_TMPFILE unavailable, spilled request bodies now go through a named file"
+            );
+            None
+        }
+        _ => Some(Err(err)),
+    }
+}
+
+/// Prefers an unnamed file; falls back to creating and immediately unlinking
+/// a named one where the filesystem has no `O_TMPFILE`.
+///
+/// Both run on the blocking pool: opening resolves a path, and on a cold
+/// dentry cache that is real I/O.
+async fn open_spill_file() -> Result<tokio::fs::File, ()> {
+    if let Some(result) = tokio::task::spawn_blocking(open_unnamed_spill_file)
+        .await
+        .expect("open_unnamed_spill_file cannot panic")
+    {
+        return match result {
+            Ok(file) => Ok(tokio::fs::File::from_std(file)),
+            Err(e) => {
+                logging::warn!(r#type = "controller", error = %e, "failed creating an unnamed spilled request body file");
+                Err(())
+            }
+        };
+    }
+
+    let path = temp_body_path();
+    // `create_new` is O_EXCL, which is what refuses a symlink planted at this
+    // predictable name. Readable because the worker reads the body back
+    // through this same open file description.
+    let mut open_options = tokio::fs::OpenOptions::new();
+    open_options
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600);
+    let file = match open_options.open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            logging::warn!(r#type = "controller", path = %path.display(), error = %e, "failed creating spilled request body file");
+            return Err(());
+        }
+    };
+    // Immediately: from here the body has no name either, so nothing can open
+    // it, replace it, or need cleaning up.
+    match tokio::fs::remove_file(&path).await {
+        Ok(()) => {}
+        // Someone else got there first, which is the state wanted.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        // The name outlives this request: nothing later knows it, and retrying
+        // the call that just failed would not help.
+        Err(e) => {
+            logging::warn!(r#type = "controller", path = %path.display(), error = %e, "could not unlink the spilled request body, it will be left behind");
+            return Err(());
+        }
+    }
+    Ok(file)
 }
 
 enum CollectedBody {
@@ -177,37 +280,10 @@ async fn collect_frames(
 
         inline.extend_from_slice(&data);
         if inline.len() > BODY_MEMORY_THRESHOLD {
-            let path = temp_body_path();
-            // `create_new` is O_EXCL, which is what refuses a symlink planted
-            // at this predictable name. Readable because the worker reads
-            // through this same open file description.
-            let mut open_options = tokio::fs::OpenOptions::new();
-            open_options
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600);
-            let mut file = match open_options.open(&path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    logging::warn!(r#type = "controller", path = %path.display(), error = %e, "failed creating spilled request body file");
-                    return Err(BodyCollectError::Spill);
-                }
+            let mut file = match open_spill_file().await {
+                Ok(file) => file,
+                Err(()) => return Err(BodyCollectError::Spill),
             };
-            // Immediately: from here the body has no name, so nothing can open
-            // it, replace it, or need cleaning up - closing the fd is the
-            // whole of it.
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                // Someone else got there first, which is the state wanted.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                // The name outlives this request: nothing later knows it, and
-                // retrying the call that just failed would not help.
-                Err(e) => {
-                    logging::warn!(r#type = "controller", path = %path.display(), error = %e, "could not unlink the spilled request body, it will be left behind");
-                    return Err(BodyCollectError::Spill);
-                }
-            }
             if let Err(e) = file.write_all(&inline).await {
                 logging::warn!(r#type = "controller", error = %e, "failed writing spilled request body");
                 return Err(BodyCollectError::Spill);
@@ -303,36 +379,21 @@ pub(crate) async fn build_php_request(
                 Some(TempBodyFile::new(file)),
             ),
             Err(BodyCollectError::TooLarge) => {
-                return Err(Box::new(DispatchResult::new(
-                    ActionBody::Buffered {
-                        status: StatusCode::PAYLOAD_TOO_LARGE,
-                        body: b"413 request body exceeds the configured limit\n".to_vec(),
-                        headers: HeaderBlob::default(),
-                    },
-                    "php",
-                    0,
+                return Err(Box::new(php_error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    b"413 request body exceeds the configured limit\n",
                 )));
             }
             Err(BodyCollectError::Stalled) => {
-                return Err(Box::new(DispatchResult::new(
-                    ActionBody::Buffered {
-                        status: StatusCode::REQUEST_TIMEOUT,
-                        body: b"408 request body stopped arriving\n".to_vec(),
-                        headers: HeaderBlob::default(),
-                    },
-                    "php",
-                    0,
+                return Err(Box::new(php_error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    b"408 request body stopped arriving\n",
                 )));
             }
             Err(BodyCollectError::Io | BodyCollectError::Spill) => {
-                return Err(Box::new(DispatchResult::new(
-                    ActionBody::Buffered {
-                        status: StatusCode::INTERNAL_SERVER_ERROR,
-                        body: b"500 Internal Server Error\n".to_vec(),
-                        headers: HeaderBlob::default(),
-                    },
-                    "php",
-                    0,
+                return Err(Box::new(php_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"500 Internal Server Error\n",
                 )));
             }
         };
@@ -402,13 +463,5 @@ pub(crate) async fn dispatch_php(
 
 /// Shared shape for the failure arms.
 fn php_error_response(status: StatusCode, body: &'static [u8]) -> DispatchResult {
-    DispatchResult::new(
-        ActionBody::Buffered {
-            status,
-            body: body.to_vec(),
-            headers: HeaderBlob::default(),
-        },
-        "php",
-        0,
-    )
+    DispatchResult::new(ActionBody::plain(status, body), "php", 0)
 }

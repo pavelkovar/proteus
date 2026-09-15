@@ -219,12 +219,18 @@ pub(crate) enum ActionBody {
 }
 
 impl ActionBody {
-    pub(crate) fn not_found() -> Self {
+    /// A body this server wrote itself, so it carries no headers from a route
+    /// or a worker.
+    pub(crate) fn plain(status: StatusCode, body: &'static [u8]) -> Self {
         ActionBody::Buffered {
-            status: StatusCode::NOT_FOUND,
-            body: b"404 not found\n".to_vec(),
+            status,
+            body: body.to_vec(),
             headers: HeaderBlob::default(),
         }
+    }
+
+    pub(crate) fn not_found() -> Self {
+        ActionBody::plain(StatusCode::NOT_FOUND, b"404 not found\n")
     }
 }
 
@@ -330,15 +336,7 @@ pub(crate) async fn dispatch_action(
                 let status = StatusCode::from_u16(*status).unwrap_or_else(|_| {
                     panic!("route return status {status} is not a valid HTTP status - config::validate should have caught this at startup")
                 });
-                return DispatchResult::new(
-                    ActionBody::Buffered {
-                        status,
-                        body: Vec::new(),
-                        headers: HeaderBlob::default(),
-                    },
-                    "return",
-                    0,
-                );
+                return DispatchResult::new(ActionBody::plain(status, b""), "return", 0);
             }
             RouteActionConfig::Php { target } => {
                 let mut result = match resolve_script(state, target, path).await {

@@ -3160,6 +3160,160 @@ async fn php_receives_post_body() {
     );
 }
 
+/// Workers are forked, and POSIX timers do not survive `fork()`, so PHP's own
+/// execution limit is the one engine facility this design has a reason to
+/// break. If it never fires, the master watchdog still cleans up - with a
+/// SIGKILL, losing the worker and its shutdown functions, and answering 504
+/// where every other SAPI answers 500.
+#[tokio::test]
+async fn php_stops_a_runaway_script_on_its_own_time_limit_not_the_watchdog() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "time-limit",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": {
+                "processes": { "max": 1, "spare": 1 },
+                // User, not admin: an admin lock would also reject
+                // set_time_limit(), which the second request needs.
+                "options": { "user": { "max_execution_time": "1" } },
+                // Far enough above the limit that whichever answers is
+                // unambiguous.
+                "limits": { "requests": 10, "timeout": 15 },
+                "queue": { "timeout": 15 }
+            }
+        }),
+    )
+    .await;
+
+    let worker_pid = async |port: u16| -> u64 {
+        let status: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        status["php"]["workers"][0]["pid"].as_u64().unwrap()
+    };
+    let before = worker_pid(server.status_port).await;
+
+    for query in ["", "?set=1"] {
+        let started = std::time::Instant::now();
+        let resp = reqwest::get(format!(
+            "http://127.0.0.1:{}/time-limit{query}",
+            server.port
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            resp.status(),
+            500,
+            "{query:?}: a 504 here means the watchdog got there first and PHP's \
+             own limit never fired in the forked worker"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{query:?}: took {:?}, so this was the watchdog, not the 1s limit",
+            started.elapsed()
+        );
+    }
+
+    // The payoff: PHP's own abort unwinds the request and leaves the worker
+    // usable, where a watchdog SIGKILL would have taken it with the script.
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/", server.port))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        worker_pid(server.status_port).await,
+        before,
+        "the worker did not survive its own script timing out"
+    );
+}
+
+/// The raw-body spill path is covered elsewhere, but rfc1867 drains read_post
+/// in its own pattern - many small reads while it scans for boundaries - and
+/// only a file over the threshold sends it down the fd instead of the inline
+/// buffer. Everyday production traffic; nothing exercised it.
+#[tokio::test]
+async fn a_multipart_upload_large_enough_to_spill_still_reaches_php_whole() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("upload-big", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    // Positional, so PHP can verify every byte itself rather than echo back
+    // something this response could not hold. Comfortably over the 63KiB
+    // spill threshold.
+    const LEN: usize = 200 * 1024;
+    let file_content: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let before = list_spilled_body_files();
+
+    let part = reqwest::multipart::Part::bytes(file_content)
+        .file_name("big.bin")
+        .mime_str("application/octet-stream")
+        .unwrap();
+    let form = reqwest::multipart::Form::new()
+        .part("upload", part)
+        .text("note", "a-regular-field");
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/upload", server.port))
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+
+    assert!(body.contains("NAME=big.bin"), "got: {body}");
+    assert!(body.contains(&format!("SIZE={LEN}")), "got: {body}");
+    assert!(body.contains("ERROR=0"), "got: {body}");
+    assert!(body.contains("IS_UPLOADED_FILE=true"), "got: {body}");
+    assert!(body.contains("MOVE_UPLOADED_FILE=true"), "got: {body}");
+    assert!(body.contains(&format!("MOVED_LEN={LEN}")), "got: {body}");
+    assert!(body.contains("MOVED_PATTERN_OK=true"), "got: {body}");
+    // The ordinary field must survive a body the parser read off a file
+    // descriptor rather than out of memory.
+    assert!(body.contains("FIELD=a-regular-field"), "got: {body}");
+
+    let after = list_spilled_body_files();
+    let leftover: Vec<_> = after.difference(&before).collect();
+    assert!(
+        leftover.is_empty(),
+        "the spilled body outlived the request: {leftover:?}"
+    );
+}
+
+/// `php://input` is re-readable because core buffers what it pulls out of
+/// read_post - which this SAPI can only drain once, and off an fd when the
+/// body spilled.
+#[tokio::test]
+async fn php_input_reads_the_same_bytes_twice_inline_and_spilled() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("input-twice", www.to_str().unwrap(), serde_json::json!({})).await;
+    let client = reqwest::Client::new();
+
+    // Either side of the spill threshold: the second is served off the fd.
+    for size in [1024usize, 200 * 1024] {
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/input-twice", server.port))
+            .body("z".repeat(size))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{size} byte body");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains(&format!("FIRST_LEN={size}")),
+            "{size} byte body: {body}"
+        );
+        assert!(
+            body.contains(&format!("SECOND_LEN={size}")),
+            "{size} byte body did not survive a second read: {body}"
+        );
+        assert!(body.contains("IDENTICAL=true"), "{size} byte body: {body}");
+    }
+}
+
 /// Not merely that PHP saw bytes: `is_uploaded_file()` and
 /// `move_uploaded_file()` succeed only if PHP's own rfc1867 handler ran, which
 /// php_embed's default server context silently disables rather than erroring.
@@ -3240,15 +3394,14 @@ async fn php_receives_a_large_spilled_request_body_correctly() {
     }
 }
 
-/// The spill path is fully predictable, so creating it without `O_EXCL` would
-/// follow a pre-planted symlink and land request-body bytes in any file master
-/// can write. A file a planted symlink points at must come back untouched.
+/// A spilled body is opened with `O_TMPFILE`, so it has no name at any point
+/// and the once-predictable path is never touched. A file a symlink planted
+/// there points at must come back untouched.
 ///
-/// A blocked spillover must fail the whole request (500), not silently
-/// dispatch it to PHP as an empty body: a request whose body could not be
-/// prepared must never look like a valid, merely-empty one.
+/// The request must also still succeed: the old named path let any local user
+/// deny every spilling upload just by squatting the next name.
 #[tokio::test]
-async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
+async fn a_symlink_planted_at_the_old_spill_path_cannot_touch_a_spilled_body() {
     let www = fixtures_dir().join("www");
     let server = start_server(
         "body-symlink-attack",
@@ -3260,9 +3413,9 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
     let canary = std::env::temp_dir().join(format!("symlink-attack-canary-{}", std::process::id()));
     std::fs::write(&canary, b"untouched").expect("failed to create canary file");
 
-    // The exact path `temp_body_path()` will use for this fresh server's
-    // FIRST spillover - `BODY_FILE_COUNTER` starts at 0 in every new
-    // process, so this is predictable by construction, not a guess.
+    // The name the named fallback would use for this fresh server's FIRST
+    // spillover - `BODY_FILE_COUNTER` starts at 0 in every new process, so
+    // this is predictable by construction, not a guess.
     let predicted_path = std::env::temp_dir().join(format!("proteus-body-{}-0", server.child.id()));
     std::os::unix::fs::symlink(&canary, &predicted_path).expect("failed to plant symlink");
 
@@ -3273,15 +3426,13 @@ async fn spilled_body_file_creation_refuses_to_follow_a_preplanted_symlink() {
         .send()
         .await
         .unwrap();
+    // A failure here on a filesystem without `O_TMPFILE` is the named
+    // fallback refusing the planted symlink, which is the older, weaker
+    // outcome rather than a regression.
     assert_eq!(
         resp.status(),
-        500,
-        "a blocked spillover must fail the request, not dispatch it as an empty body"
-    );
-    let resp_body = resp.text().await.unwrap();
-    assert!(
-        resp_body.contains("500 Internal Server Error"),
-        "must be the server's own synthesized error, not anything PHP-generated: got {resp_body:?}"
+        200,
+        "an unnamed spill file must be unaffected by anything planted at the old path"
     );
 
     let canary_contents = std::fs::read(&canary).expect("canary file should still exist");
