@@ -91,7 +91,7 @@ jobs:
         run: |
           dnf -y install https://rpms.remirepo.net/enterprise/remi-release-8.rpm epel-release
           dnf -y module enable php:remi-${{ matrix.php }}
-          dnf -y install php-cli php-devel php-embedded gcc-toolset-15
+          dnf -y install php-cli php-devel php-embedded php-opcache php-pecl-apcu gcc-toolset-15
           
           echo "/opt/rh/gcc-toolset-15/root/usr/bin" >> $GITHUB_PATH
           echo "CC=/opt/rh/gcc-toolset-15/root/usr/bin/gcc" >> $GITHUB_ENV

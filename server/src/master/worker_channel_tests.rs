@@ -71,6 +71,7 @@ fn dummy_request() -> PhpRequest<'static> {
         client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         body: data::RequestBody::Inline(Cow::Borrowed(&[])),
         server_name: Cow::Borrowed("localhost"),
+        server_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         server_port: 80,
         server_protocol: Cow::Borrowed("HTTP/1.1"),
         https: false,

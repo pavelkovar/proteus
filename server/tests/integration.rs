@@ -2225,6 +2225,12 @@ async fn php_receives_server_vars_and_environment() {
 
     assert!(body.contains("SERVER_NAME=example.test"), "got: {body}");
     assert!(body.contains("SERVER_PORT=9999"), "got: {body}");
+    // The socket's own address, so the forwarded-host spoofing above cannot
+    // reach it, and a name without a version.
+    assert!(body.contains("SERVER_ADDR=127.0.0.1"), "got: {body}");
+    assert!(body.contains("SERVER_SOFTWARE=proteus\n"), "got: {body}");
+    // X-Forwarded-Proto above, from a trusted proxy.
+    assert!(body.contains("REQUEST_SCHEME=https"), "got: {body}");
     assert!(body.contains("SERVER_PROTOCOL=HTTP/1.1"), "got: {body}");
     assert!(body.contains("GATEWAY_INTERFACE=CGI/1.1"), "got: {body}");
     assert!(
@@ -2349,6 +2355,147 @@ async fn disable_functions_actually_disables_the_function() {
             body.contains("EXEC_OUTPUT_LINES=0"),
             "the command must not have run: {body}"
         );
+    }
+}
+
+/// The whole fork-server design rests on the prototype warming OPcache once and
+/// every worker inheriting it, which in turn rests on php-mod renaming the SAPI
+/// to `cli-server` so `accel_find_sapi()` admits it. Neither was ever checked,
+/// and a change on either side would cost only speed - nothing would fail.
+#[tokio::test]
+async fn opcache_is_admitted_under_the_sapi_name_and_caches_across_requests() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("opcache", www.to_str().unwrap(), serde_json::json!({})).await;
+
+    let read_status = async |port: u16| -> String {
+        reqwest::get(format!("http://127.0.0.1:{port}/opcache-status"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    let hits_in = |body: &str| -> i64 {
+        body.lines()
+            .find_map(|line| line.strip_prefix("OPCACHE_HITS="))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("fixture must report OPCACHE_HITS: {body}"))
+    };
+
+    let first = read_status(server.port).await;
+    assert!(
+        first.contains("OPCACHE_EXT=true"),
+        "the php-opcache extension is not installed, so this deployment's central \
+         premise cannot be checked at all: {first}"
+    );
+    assert!(
+        first.contains("OPCACHE_ENABLED=true"),
+        "OPcache is loaded but refused to start under this SAPI name, so every \
+         worker recompiles every script: {first}"
+    );
+
+    // A second run of the same script must come out of the shared cache the
+    // first one filled, whichever worker serves it.
+    let second = read_status(server.port).await;
+    assert!(
+        hits_in(&second) > hits_in(&first),
+        "no cache hit between two runs of the same script: {first} / {second}"
+    );
+}
+
+/// A client that leaves mid-response reaches PHP as a failed write, which is
+/// what leaves the decision to `ignore_user_abort`. One worker, so all three
+/// requests land on the same one and the signal must not outlive its request.
+#[tokio::test]
+async fn a_client_leaving_mid_response_aborts_the_script_unless_it_opted_out() {
+    use std::io::Read;
+
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "abort-mid-response",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": {
+                "processes": { "max": 1, "spare": 1 },
+                // Buffered output would never reach a write while the script
+                // runs, so nothing would surface the lost client.
+                "options": { "admin": { "output_buffering": "0" } },
+                // Generous: the script deliberately outlives the hang-up.
+                "limits": { "requests": 10, "timeout": 10 },
+                "queue": { "timeout": 10 }
+            }
+        }),
+    )
+    .await;
+
+    // Reads far enough to know the script is running, then hangs up.
+    let hang_up_mid_response = |marker_id: &str, ignore: &str| {
+        let url = format!(
+            "GET /abort-check?marker={}&ignore={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            marker_id, ignore
+        );
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        write!(sock, "{url}").unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            assert!(head.len() < 8192, "no end of headers in sight");
+            assert_eq!(sock.read(&mut byte).unwrap(), 1, "connection closed early");
+            head.push(byte[0]);
+        }
+        sock.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(sock);
+    };
+
+    let marker_of =
+        |id: &str| std::path::PathBuf::from(format!("/tmp/proteus_abort_marker_{id}.txt"));
+    let aborted_id = format!("aborted-{}", server.port);
+    let ignored_id = format!("ignored-{}", server.port);
+    let intact_id = format!("intact-{}", server.port);
+    for id in [&aborted_id, &ignored_id, &intact_id] {
+        let _ = std::fs::remove_file(marker_of(id));
+    }
+
+    // Default ignore_user_abort: the next write after the hang-up ends the
+    // script, so its tail never runs.
+    hang_up_mid_response(&aborted_id, "0");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !marker_of(&aborted_id).exists(),
+        "the script ran to completion despite the client leaving and never asking to ignore it"
+    );
+
+    // Same hang-up, opted out: PHP is told, and chooses to carry on.
+    hang_up_mid_response(&ignored_id, "1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker_of(&ignored_id).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ignore_user_abort(true) did not keep the script running to its end"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // A client that stays must be unaffected on the very worker that just
+    // served an aborted request.
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{}/abort-check?marker={}&ignore=0",
+        server.port, intact_id
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("chunk 24"), "truncated response: {body}");
+    assert!(
+        marker_of(&intact_id).exists(),
+        "a stale abort flag cut short a request whose client never left"
+    );
+
+    for id in [&aborted_id, &ignored_id, &intact_id] {
+        let _ = std::fs::remove_file(marker_of(id));
     }
 }
 

@@ -58,6 +58,7 @@ pub struct PhpRequest<'a> {
     /// Resolved master-side; php-mod knows nothing of listeners or proxy hops.
     #[serde(borrow)]
     pub server_name: Cow<'a, str>,
+    pub server_addr: std::net::IpAddr,
     pub server_port: u16,
     #[serde(borrow)]
     pub server_protocol: Cow<'a, str>,

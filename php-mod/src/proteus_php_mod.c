@@ -197,8 +197,13 @@ static size_t proteus_php_mod_ub_write(const char *str, size_t str_length) {
     if (!SG(headers_sent)) {
         sapi_send_headers();
     }
-    if (!g_ctx.finished && g_ctx.chunk_cb) {
-        g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_BODY, 0, str, str_length, g_ctx.chunk_cb_user_data);
+    if (!g_ctx.finished && g_ctx.chunk_cb
+        && g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_BODY, 0, str, str_length,
+                          g_ctx.chunk_cb_user_data) != 0) {
+        /* Reporting rather than deciding: this honours ignore_user_abort,
+         * and does not return when PHP chooses to bail. */
+        php_handle_aborted_connection();
+        return 0;
     }
     return str_length;
 }

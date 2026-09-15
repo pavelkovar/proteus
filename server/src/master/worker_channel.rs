@@ -177,6 +177,15 @@ impl Drop for WorkerChannel {
 }
 
 impl WorkerChannel {
+    /// Tells the worker its client stopped listening, so PHP can apply
+    /// `ignore_user_abort` to the rest of the script.
+    pub fn mark_client_gone(&self) {
+        self.mapped
+            .channel()
+            .client_gone
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Spawns the liveness watcher, torn down on drop.
     pub fn new(fds: WorkerReadyFds, pid: u32) -> std::io::Result<Self> {
         let WorkerReadyFds {

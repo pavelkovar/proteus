@@ -97,8 +97,14 @@ pub enum PhpChunk<'a> {
 }
 
 /// Matches `proteus_php_mod_chunk_fn` in the C header. `data` is valid only
-/// for the duration of the call.
-type ChunkFn = unsafe extern "C" fn(c_int, c_int, *const c_char, c_ulong, *mut c_void);
+/// for the duration of the call, and a non-zero return says the client is gone
+type ChunkFn = unsafe extern "C" fn(c_int, c_int, *const c_char, c_ulong, *mut c_void) -> c_int;
+
+/// What the trampoline needs from behind C's opaque `user_data`.
+struct ChunkCtx<'a> {
+    on_chunk: &'a mut dyn FnMut(PhpChunk),
+    client_gone: &'a std::sync::atomic::AtomicBool,
+}
 
 type InitFn =
     unsafe extern "C" fn(*const *const c_char, c_ulong, *const *const c_char, c_ulong) -> c_int;
@@ -177,10 +183,12 @@ impl PhpRequestFfi {
         // the extra term.
         let header_bytes = req.headers.byte_len() + 6 * req.headers.iter().count();
         let mut vars = CgiVarBuf::with_capacity(
-            256 + document_root.len() + 2 * (script_name.len() + path_info.len()) + header_bytes,
+            384 + document_root.len() + 2 * (script_name.len() + path_info.len()) + header_bytes,
         );
         vars.push("REMOTE_ADDR", format_args!("{}", req.client_ip));
+        vars.push("SERVER_SOFTWARE", format_args!("{}", crate::APP_NAME));
         vars.push("SERVER_NAME", format_args!("{}", req.server_name));
+        vars.push("SERVER_ADDR", format_args!("{}", req.server_addr));
         vars.push("SERVER_PORT", format_args!("{}", req.server_port));
         vars.push("SERVER_PROTOCOL", format_args!("{}", req.server_protocol));
         vars.push("DOCUMENT_ROOT", format_args!("{document_root}"));
@@ -188,6 +196,10 @@ impl PhpRequestFfi {
         vars.push("SCRIPT_NAME", format_args!("{script_name}"));
         vars.push("PATH_INFO", format_args!("{path_info}"));
         vars.push("PHP_SELF", format_args!("{script_name}{path_info}"));
+        vars.push(
+            "REQUEST_SCHEME",
+            format_args!("{}", if req.https { "https" } else { "http" }),
+        );
         if req.https {
             // Absent entirely over plain HTTP, per CGI convention, so that
             // `!empty($_SERVER['HTTPS'])` behaves as PHP code expects.
@@ -320,6 +332,7 @@ impl PhpConn {
         script_path: &str,
         req: &PhpRequest<'_>,
         body_fd: Option<std::os::fd::BorrowedFd<'_>>,
+        client_gone: &std::sync::atomic::AtomicBool,
         on_chunk: &mut dyn FnMut(PhpChunk),
     ) -> ExecuteResult {
         // Unreachable through hyper, but a panic on request-derived data
@@ -336,10 +349,13 @@ impl PhpConn {
         // Must outlive the FFI call below - see `PhpRequestFfi`.
         let ffi = PhpRequestFfi::build(script_path, req, body_fd);
 
-        // C sees only the trampoline and an opaque pointer to a local
-        // holding the real closure.
-        let mut cb_ref: &mut dyn FnMut(PhpChunk) = &mut *on_chunk;
-        let cb_user_data = &mut cb_ref as *mut _ as *mut c_void;
+        // C sees only the trampoline and an opaque pointer to a local. The
+        // reborrow keeps `on_chunk` usable on the failure path below.
+        let mut ctx = ChunkCtx {
+            on_chunk: &mut *on_chunk,
+            client_gone,
+        };
+        let cb_user_data = &mut ctx as *mut _ as *mut c_void;
 
         let mut out_early_sent: c_int = 0;
         let rc = unsafe {
@@ -351,6 +367,7 @@ impl PhpConn {
                 &mut out_early_sent,
             )
         };
+        drop(ctx);
 
         if rc != 0 {
             // request_startup() failed, so the callback never fired;
@@ -369,8 +386,9 @@ impl PhpConn {
     }
 }
 
-/// Rebuilds the closure from `user_data` and calls it once. `data` lives
-/// only for this call, and `PhpChunk::Body` inherits that borrow.
+/// Rebuilds the context from `user_data`, delivers one chunk and reports back
+/// whether the client is still there. `data` lives only for this call, and
+/// `PhpChunk::Body` inherits that borrow.
 // Looks like a no-op on aarch64, where `c_char` is `u8`, but it is `i8` on
 // most other targets.
 #[allow(clippy::unnecessary_cast)]
@@ -380,8 +398,9 @@ unsafe extern "C" fn chunk_trampoline(
     data: *const c_char,
     data_len: c_ulong,
     user_data: *mut c_void,
-) {
-    let cb = unsafe { &mut *(user_data as *mut &mut dyn FnMut(PhpChunk)) };
+) -> c_int {
+    let ctx = unsafe { &mut *(user_data as *mut ChunkCtx) };
+    let cb = &mut ctx.on_chunk;
     let bytes: &[u8] = if data.is_null() {
         &[]
     } else {
@@ -409,6 +428,7 @@ unsafe extern "C" fn chunk_trampoline(
             "php-mod sent an unrecognized chunk kind, dropping it"
         );
     }
+    c_int::from(ctx.client_gone.load(std::sync::atomic::Ordering::Acquire))
 }
 
 /// Request headers that must never become a `$_SERVER['HTTP_*']` var.

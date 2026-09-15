@@ -38,7 +38,9 @@ typedef enum {
     PROTEUS_PHP_MOD_CHUNK_END = 3,
 } proteus_php_mod_chunk_kind;
 
-typedef void (*proteus_php_mod_chunk_fn)(
+/* Returns non-zero once the client has stopped listening, which the body write
+ * reports to PHP as a failed write. */
+typedef int (*proteus_php_mod_chunk_fn)(
     proteus_php_mod_chunk_kind kind,
     int status,
     const char *data, size_t data_len,

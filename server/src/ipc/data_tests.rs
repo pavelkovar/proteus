@@ -679,6 +679,7 @@ fn a_decoded_request_borrows_every_field_from_the_scratch_buffer() {
         client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 7)),
         body: RequestBody::Inline(Cow::Owned(vec![7u8; 256])),
         server_name: Cow::Owned("example.com".into()),
+        server_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10)),
         server_port: 443,
         server_protocol: Cow::Borrowed("HTTP/1.1"),
         https: true,
@@ -711,6 +712,8 @@ fn a_decoded_request_borrows_every_field_from_the_scratch_buffer() {
 
     // The content has to survive too, not just the borrowing.
     assert_eq!(decoded.script_path, owned.script_path);
+    // Not a `Cow`, so the loop above cannot cover it.
+    assert_eq!(decoded.server_addr, owned.server_addr);
     assert_eq!(
         decoded.headers.iter().collect::<Vec<_>>(),
         vec![("host", "example.com"), ("user-agent", "curl/8.0")]

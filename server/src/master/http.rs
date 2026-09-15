@@ -237,6 +237,7 @@ async fn handle(
     state: Arc<AppState>,
     peer: Peer,
     listen_addr: &str,
+    server_addr: std::net::IpAddr,
     conn: Arc<ConnState>,
 ) -> Result<Response<ResponseBody>, std::convert::Infallible> {
     let in_flight = InFlightGuard::new(state.clone());
@@ -376,6 +377,7 @@ async fn handle(
     let ctx = RequestContext {
         client_ip,
         listen_addr,
+        server_addr,
         is_trusted_peer,
     };
     let DispatchResult {
@@ -797,6 +799,11 @@ async fn serve_one_connection(
     timeouts: ConnTimeouts,
 ) {
     set_nodelay_or_log(&stream);
+    // Before the stream is consumed. A connected socket always has one, so the
+    // fallback only keeps SERVER_ADDR present rather than meaningful.
+    let server_addr = stream
+        .local_addr()
+        .map_or(std::net::IpAddr::from([0, 0, 0, 0]), |addr| addr.ip());
     let io = TokioIo::new(stream);
     let peer_identity = Peer::resolve(peer.ip(), &state.config.trusted_proxies);
     let conn = Arc::new(ConnState::new());
@@ -806,7 +813,7 @@ async fn serve_one_connection(
             let state = state.clone();
             let listen_addr = listen_addr.clone();
             let conn = Arc::clone(&conn);
-            async move { handle(req, state, peer_identity, &listen_addr, conn).await }
+            async move { handle(req, state, peer_identity, &listen_addr, server_addr, conn).await }
         })
     };
     let mut connection = std::pin::pin!(

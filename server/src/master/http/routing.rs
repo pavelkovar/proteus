@@ -193,6 +193,7 @@ fn hex_nibble(b: u8) -> Option<u8> {
 pub(crate) struct RequestContext<'a> {
     pub(crate) client_ip: ClientIdentity,
     pub(crate) listen_addr: &'a str,
+    pub(crate) server_addr: std::net::IpAddr,
     pub(crate) is_trusted_peer: bool,
 }
 

@@ -107,6 +107,11 @@ pub(crate) fn run(
             data::RequestBody::Inline(_) => None,
         };
         served += 1;
+        // Master raises this for the request it was watching; this one has a
+        // client of its own.
+        channel
+            .client_gone
+            .store(false, std::sync::atomic::Ordering::Release);
         // Computed before execute_file, because `End` can fire well ahead of
         // its return via fastcgi_finish_request() and must carry this.
         let retiring = served >= max_requests;
@@ -155,6 +160,7 @@ pub(crate) fn run(
             &req.script_path,
             &req,
             body_fd.as_ref().map(std::os::fd::AsFd::as_fd),
+            &channel.client_gone,
             &mut on_chunk,
         );
 

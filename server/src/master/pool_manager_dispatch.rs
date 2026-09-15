@@ -487,6 +487,7 @@ impl PoolManager {
                             "body receiver dropped (client gone), draining the worker to End"
                         );
                         client_gone = true;
+                        worker.channel.mark_client_gone();
                     }
                 }
                 Ok(Ok(WorkerEvent::End { retiring })) => break retiring,

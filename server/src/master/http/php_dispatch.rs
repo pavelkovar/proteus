@@ -260,6 +260,7 @@ pub(crate) async fn build_php_request(
     let RequestContext {
         client_ip,
         listen_addr,
+        server_addr,
         is_trusted_peer,
     } = ctx;
 
@@ -348,6 +349,7 @@ pub(crate) async fn build_php_request(
             client_ip: client_ip.ip(),
             body,
             server_name: Cow::Owned(server_name),
+            server_addr,
             server_port,
             server_protocol,
             https,

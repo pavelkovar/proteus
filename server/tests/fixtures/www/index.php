@@ -28,7 +28,10 @@ if (strpos($_SERVER['REQUEST_URI'], '/fastcgi-finish') !== false) {
     // Must never reach the client.
     usleep(300000);
     $marker = '/tmp/fastcgi_finish_marker_' . ($_GET['marker'] ?? 'none') . '.txt';
-    file_put_contents($marker, 'background-work-done:' . var_export($ok, true));
+    // Via rename, or a reader polling for the file can catch it between
+    // O_TRUNC and the write and read a half-written value.
+    file_put_contents($marker . '.tmp', 'background-work-done:' . var_export($ok, true));
+    rename($marker . '.tmp', $marker);
     exit;
 }
 
@@ -265,6 +268,36 @@ if (strpos($_SERVER['REQUEST_URI'], '/call-disabled-function') !== false) {
     exit;
 }
 
+// php-mod renames the SAPI to `cli-server` purely so OPcache's accel_find_sapi()
+// admits it. Nothing else can tell whether that worked.
+if (strpos($_SERVER['REQUEST_URI'], '/opcache-status') !== false) {
+    $present = function_exists('opcache_get_status');
+    echo "OPCACHE_EXT=" . var_export($present, true) . "\n";
+    if ($present) {
+        // false: the per-script list is large and nothing here reads it.
+        $status = opcache_get_status(false);
+        echo "OPCACHE_ENABLED=" . var_export($status['opcache_enabled'] ?? false, true) . "\n";
+        echo "OPCACHE_HITS=" . ($status['opcache_statistics']['hits'] ?? -1) . "\n";
+    }
+    exit;
+}
+
+// A lost client only surfaces through a write, so this keeps writing well past
+// the point the caller hangs up. The marker is reached only if PHP did not
+// abort, which is ignore_user_abort()'s call to make.
+if (strpos($_SERVER['REQUEST_URI'], '/abort-check') !== false) {
+    ignore_user_abort(($_GET['ignore'] ?? '0') === '1');
+    $marker = '/tmp/proteus_abort_marker_' . ($_GET['marker'] ?? 'none') . '.txt';
+    @unlink($marker);
+    echo str_repeat('x', 512) . "\n";
+    for ($i = 0; $i < 25; $i++) {
+        usleep(20000);
+        echo "chunk $i\n";
+    }
+    file_put_contents($marker, 'completed');
+    exit;
+}
+
 // Admin is applied after user and so wins a collision, and its value is
 // locked, so a script's own ini_set() on that key must fail.
 if (strpos($_SERVER['REQUEST_URI'], '/ini-check') !== false) {
@@ -293,8 +326,11 @@ echo "HTTP_PROXY=" . ($_SERVER['HTTP_PROXY'] ?? 'MISSING') . "\n";
 echo "REMOTE_ADDR=" . ($_SERVER['REMOTE_ADDR'] ?? 'MISSING') . "\n";
 // Standard CGI vars.
 echo "SERVER_NAME=" . ($_SERVER['SERVER_NAME'] ?? 'MISSING') . "\n";
+echo "SERVER_ADDR=" . ($_SERVER['SERVER_ADDR'] ?? 'MISSING') . "\n";
+echo "SERVER_SOFTWARE=" . ($_SERVER['SERVER_SOFTWARE'] ?? 'MISSING') . "\n";
 echo "SERVER_PORT=" . ($_SERVER['SERVER_PORT'] ?? 'MISSING') . "\n";
 echo "SERVER_PROTOCOL=" . ($_SERVER['SERVER_PROTOCOL'] ?? 'MISSING') . "\n";
+echo "REQUEST_SCHEME=" . ($_SERVER['REQUEST_SCHEME'] ?? 'MISSING') . "\n";
 echo "GATEWAY_INTERFACE=" . ($_SERVER['GATEWAY_INTERFACE'] ?? 'MISSING') . "\n";
 echo "DOCUMENT_ROOT=" . ($_SERVER['DOCUMENT_ROOT'] ?? 'MISSING') . "\n";
 echo "SCRIPT_FILENAME=" . ($_SERVER['SCRIPT_FILENAME'] ?? 'MISSING') . "\n";

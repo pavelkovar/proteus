@@ -14,7 +14,7 @@
 use crate::logging;
 use std::cell::UnsafeCell;
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
@@ -735,6 +735,7 @@ pub struct Channel {
     pub request: RequestRing,
     pub response: ResponseRing,
     pub peer_death: PeerDeath,
+    pub client_gone: AtomicBool,
 }
 
 impl Channel {
@@ -743,6 +744,7 @@ impl Channel {
             RequestRing::init_in_place(std::ptr::addr_of_mut!((*ptr).request));
             ResponseRing::init_in_place(std::ptr::addr_of_mut!((*ptr).response));
             PeerDeath::init_in_place(std::ptr::addr_of_mut!((*ptr).peer_death));
+            std::ptr::addr_of_mut!((*ptr).client_gone).write(AtomicBool::new(false));
         }
     }
 
