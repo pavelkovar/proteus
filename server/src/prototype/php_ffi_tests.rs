@@ -108,12 +108,17 @@ fn chunk_trampoline_drops_an_unrecognized_kind_rather_than_treating_it_as_end() 
             PhpChunk::End => "end",
         });
     };
-    let mut cb_ref: &mut dyn FnMut(PhpChunk) = &mut closure;
-    let user_data = &mut cb_ref as *mut _ as *mut c_void;
+    let client_gone = std::sync::atomic::AtomicBool::new(false);
+    let mut ctx = ChunkCtx {
+        on_chunk: &mut closure,
+        client_gone: &client_gone,
+    };
+    let user_data = &mut ctx as *mut _ as *mut c_void;
 
     unsafe {
         chunk_trampoline(99, 0, std::ptr::null(), 0, user_data);
     }
+    drop(ctx);
 
     assert!(
         seen.is_empty(),
