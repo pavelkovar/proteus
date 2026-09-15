@@ -9,6 +9,7 @@ fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
         control: Mutex::new(control_sock),
         control_rt: tokio::runtime::Handle::current(),
         idle: IdleStack::new(4),
+        worker_returned: Notify::new(),
         semaphore: Arc::new(Semaphore::new(1)),
         max_workers: 1,
         request_timeout: Duration::from_secs(30),
@@ -261,7 +262,7 @@ fn unused_link() -> std::os::fd::OwnedFd {
         None,
         nix::sys::socket::SockFlag::empty(),
     )
-        .expect("socketpair");
+    .expect("socketpair");
     a
 }
 
@@ -546,5 +547,41 @@ async fn replacing_a_prototype_already_reaped_by_the_sweep_never_signals_it() {
     let pid = Pid::from_raw(squatter_pid);
     let _ = kill(pid, Signal::SIGKILL);
     let _ = waitpid(pid, None);
+    reap_tracked_prototype(&pool);
+}
+
+/// At `processes.max` a caller already holds a permit, so a worker is owed to
+/// it and only a return can deliver one. Waiting for that return rather than
+/// polling for it is the difference between microseconds and a timer tick.
+#[tokio::test]
+async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+
+    // Every slot spoken for, so `spawn_worker` can only answer "pool full".
+    let parked = idle_worker(&pool, 4242, false);
+    let held: Vec<u32> = std::iter::from_fn(|| pool.idle.claim_slot()).collect();
+
+    let waiter = {
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move { pool.get_worker().await.map(|w| w.pid) })
+    };
+    // Long enough that the waiter is parked on the notify, not still on its
+    // first pop.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished(), "nothing to hand out yet");
+
+    pool.return_worker(parked);
+
+    let got = tokio::time::timeout(Duration::from_millis(250), waiter)
+        .await
+        .expect("a returned worker must reach the waiter, not leave it to time out")
+        .unwrap()
+        .expect("the returned worker is the one it gets");
+    assert_eq!(got, 4242);
+
+    for slot in held {
+        pool.idle.release_slot(slot);
+    }
+    pool.retire(4242, Retired::IdleTimeout);
     reap_tracked_prototype(&pool);
 }

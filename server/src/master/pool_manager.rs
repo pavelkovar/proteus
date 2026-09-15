@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio_seqpacket::UnixSeqpacket;
 
 /// A spilled request body, held open after being unlinked: the worker gets
@@ -49,6 +49,9 @@ pub struct PoolManager {
     /// Nothing may inspect a parked worker from the far end, which is what
     /// lets this stay lock-free: retirement is the worker's own decision.
     idle: IdleStack<PooledWorker>,
+    /// Raised whenever a worker is parked, so a caller waiting at
+    /// `processes.max` hears about it rather than polling for it.
+    worker_returned: Notify,
     /// Caps in-flight requests. `Arc` so a permit can outlive the dispatch
     /// that took it, as far as the response's own task.
     semaphore: Arc<Semaphore>,
@@ -426,6 +429,7 @@ impl PoolManager {
             control: Mutex::new(control),
             control_rt: tokio::runtime::Handle::current(),
             idle: IdleStack::new(cfg.php.processes.max),
+            worker_returned: Notify::new(),
             semaphore: Arc::new(Semaphore::new(cfg.php.processes.max)),
             max_workers: cfg.php.processes.max,
             request_timeout: Duration::from_secs(cfg.php.limits.timeout),
@@ -731,12 +735,15 @@ impl PoolManager {
     /// An idle worker, or a freshly spawned one.
     async fn get_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
         // A caller holding a permit with the pool at `processes.max` is owed a
-        // worker that is merely busy or mid-return, so this polls for one
+        // worker that is merely busy or mid-return, so this waits for one
         // rather than failing the request.
-        const POOL_FULL_ATTEMPTS: u32 = 1000;
-        const POOL_FULL_BACKOFF: Duration = Duration::from_millis(1);
+        const POOL_FULL_WAIT: Duration = Duration::from_secs(1);
+        let deadline = tokio::time::Instant::now() + POOL_FULL_WAIT;
 
-        for _ in 0..POOL_FULL_ATTEMPTS {
+        loop {
+            let returned = self.worker_returned.notified();
+            tokio::pin!(returned);
+
             // A worker can retire itself while still parked here.
             while let Some(worker) = self.idle.pop() {
                 if !worker.channel.worker_has_exited() {
@@ -745,17 +752,18 @@ impl PoolManager {
                 self.retire(worker.pid, Retired::IdleTimeout);
             }
             match self.spawn_worker().await {
-                Err(e) if is_pool_full(&e) => {
-                    tokio::time::sleep(POOL_FULL_BACKOFF).await;
-                }
+                Err(e) if is_pool_full(&e) => {}
                 other => return other,
             }
+            if tokio::time::timeout_at(deadline, returned).await.is_err() {
+                return Err(pool_full_error());
+            }
         }
-        Err(pool_full_error())
     }
 
     fn return_worker(&self, worker: PooledWorker) {
         self.idle.push(worker);
+        self.worker_returned.notify_one();
     }
 
     pub fn status_json(&self) -> serde_json::Value {

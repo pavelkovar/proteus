@@ -273,7 +273,7 @@ impl WorkerChannel {
             encoded,
             req_space_efd,
         )
-            .await
+        .await
     }
 
     /// The next frame if the worker has already published one. `None` means
@@ -352,10 +352,10 @@ impl WorkerChannel {
     /// back-to-back would otherwise pay a round-trip of TTFB.
     fn absorb(&mut self, raw: Option<ResponseFrame<'static>>) -> std::io::Result<Absorbed> {
         let Some(ResponseFrame::Headers {
-                     status,
-                     headers,
-                     more,
-                 }) = raw
+            status,
+            headers,
+            more,
+        }) = raw
         else {
             let displaced = raw.map(|frame| match frame {
                 ResponseFrame::Body(chunk) => WorkerEvent::Body(Bytes::from(chunk.into_owned())),
