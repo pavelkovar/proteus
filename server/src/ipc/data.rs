@@ -286,8 +286,8 @@ pub async fn write_request_to_ring(
 /// Worker side, blocking. `Ok(None)` means the peer is gone.
 ///
 /// Sitting idle past `deadline` yields `Retire`, making retirement the
-/// worker's own decision - master never has to inspect its idle pool from
-/// the far end, so that pool can stay a lock-free stack.
+/// worker's own decision - master never has to time a worker it cannot see
+/// the inside of.
 pub fn read_command_from_ring<'a>(
     ring: &shm::RequestRing,
     peer: &shm::PeerDeath,

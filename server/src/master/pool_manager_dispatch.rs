@@ -17,8 +17,8 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Owns a worker between check-out and the hand-off to its completion task,
-/// so cancellation in between releases it instead of losing its `workers`
-/// entry and pool slot for good.
+/// so cancellation in between retires it instead of leaving its `workers`
+/// entry and its seat in the pool held for good.
 struct CheckedOutWorker {
     pool: Arc<PoolManager>,
     worker: Option<PooledWorker>,

@@ -426,9 +426,9 @@ pub struct Processes {
     pub spare: usize,
     /// A worker retires itself after this long with no request; 0 never.
     ///
-    /// Enforced by the worker rather than by master sweeping an idle list,
-    /// which is what lets the idle pool be a lock-free stack. Master keeps
-    /// `spare` topped up, so the pool settles at the floor, not at zero.
+    /// Enforced by the worker rather than by master timing each idle worker,
+    /// neither of which knows both halves on its own. Master keeps `spare`
+    /// topped up, so the pool settles at the floor, not at zero.
     #[serde(default)]
     pub idle_timeout: u64,
     /// How long the prototype may take to answer a spawn request before it

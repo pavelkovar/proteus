@@ -1,16 +1,21 @@
 use super::*;
 
+/// How many workers the fixture pool admits; the lifecycle tests lean on the
+/// seat coming back, so they need room for more than one at a time.
+const TEST_POOL_MAX: usize = 4;
+
 /// Enough real state for the lifecycle tests, which touch only the prototype
-/// handle, the slots and the counters. `prototype_pid` must name a real
-/// killable process, since these tests signal and reap it.
+/// handle, the admission seats and the counters. `prototype_pid` must name a
+/// real killable process, since these tests signal and reap it.
 fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
     let (control_sock, _unused_other_end) = UnixSeqpacket::pair().unwrap();
     PoolManager {
         control: Mutex::new(control_sock),
         control_rt: tokio::runtime::Handle::current(),
-        idle: IdleStack::new(4),
+        idle: StdMutex::new(VecDeque::new()),
         worker_returned: Notify::new(),
         semaphore: Arc::new(Semaphore::new(1)),
+        admission: Arc::new(Semaphore::new(TEST_POOL_MAX)),
         max_workers: 1,
         request_timeout: Duration::from_secs(30),
         queue_timeout: Duration::from_secs(5),
@@ -90,7 +95,7 @@ fn sigkill_actually_terminates_the_process() {
 #[test]
 fn worker_meta_tracks_state_and_request_count_without_the_pool_lock() {
     let pool_started = Instant::now();
-    let meta = WorkerMeta::new(0, pool_started, pool_started);
+    let meta = detached_meta(pool_started);
     assert_eq!(meta.state_str(), "idle");
     assert_eq!(meta.request_count.load(Relaxed), 0);
 
@@ -119,7 +124,7 @@ fn worker_meta_tracks_state_and_request_count_without_the_pool_lock() {
 #[test]
 fn worker_meta_counts_are_exact_under_concurrent_updates() {
     let pool_started = Instant::now();
-    let meta = Arc::new(WorkerMeta::new(0, pool_started, pool_started));
+    let meta = Arc::new(detached_meta(pool_started));
     const THREADS: usize = 8;
     const PER_THREAD: usize = 1000;
 
@@ -281,85 +286,101 @@ fn idle_worker(pool: &PoolManager, pid: u32, retired: bool) -> PooledWorker {
     if retired {
         channel.mark_worker_gone_for_test();
     }
-    let slot = pool.idle.claim_slot().expect("a free slot");
     PooledWorker {
         channel,
         pid,
-        meta: Arc::new(WorkerMeta::new(slot, pool.started_at, pool.started_at)),
+        meta: Arc::new(seated_meta(pool)),
     }
 }
 
-/// The idle stack is LIFO, so a worker pushed straight back is the next one
-/// popped. A sweep that does that only ever sees the top of the stack, and a
-/// worker that retired underneath it is reported idle forever.
-#[tokio::test]
-async fn a_retired_worker_below_the_top_of_the_idle_stack_is_still_reaped() {
-    let pool = make_test_pool_manager(spawn_sleeper());
+/// A `WorkerMeta` holding one of `pool`'s admission seats, as a real spawn
+/// gives it.
+fn seated_meta(pool: &PoolManager) -> WorkerMeta {
+    WorkerMeta::new(
+        Arc::clone(&pool.admission)
+            .try_acquire_owned()
+            .expect("the fixture pool has a free seat"),
+        pool.started_at,
+        pool.started_at,
+    )
+}
 
-    // Pushed first, so it ends up at the bottom; the two live ones cover it.
-    for (pid, retired) in [(101, true), (102, false), (103, false)] {
-        let worker = idle_worker(&pool, pid, retired);
-        pool.idle.push(worker);
+/// For the tests that exercise `WorkerMeta` on its own, with no pool behind it.
+fn detached_meta(pool_started: Instant) -> WorkerMeta {
+    let seats = Arc::new(Semaphore::new(1));
+    WorkerMeta::new(
+        seats.try_acquire_owned().expect("a fresh semaphore"),
+        pool_started,
+        pool_started,
+    )
+}
+
+/// A worker that retired itself must be found wherever it is parked. Dispatch
+/// only ever sees the back, so anything the sweep fails to rotate past is
+/// reported idle forever.
+#[tokio::test]
+async fn a_retired_worker_is_reaped_from_any_position() {
+    for position in 0..3 {
+        let pool = make_test_pool_manager(spawn_sleeper());
+        for (offset, pid) in [101u32, 102, 103].into_iter().enumerate() {
+            let worker = idle_worker(&pool, pid, offset == position);
+            pool.idle.lock().unwrap().push_back(worker);
+        }
+
+        pool.sweep_idle_workers().await;
+
+        let left: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
+        assert_eq!(
+            left.len(),
+            2,
+            "the retired worker at position {position} was never looked at"
+        );
+        assert!(!left.contains(&(101 + position as u32)));
+        assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 1);
+        reap_tracked_prototype(&pool);
     }
-    assert_eq!(pool.idle.len(), 3);
+}
+
+/// A full rotation has to leave the survivors as it found them, or every
+/// sweep would reshuffle which worker dispatch reaches first.
+#[tokio::test]
+async fn a_sweep_leaves_the_order_it_found() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    for pid in [201u32, 202, 203, 204] {
+        let worker = idle_worker(&pool, pid, false);
+        pool.idle.lock().unwrap().push_back(worker);
+    }
 
     pool.sweep_idle_workers().await;
 
-    assert_eq!(
-        pool.idle.len(),
-        2,
-        "the retired worker under the live ones was never looked at"
-    );
-    assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 1);
+    let after: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
+    assert_eq!(after, vec![201, 202, 203, 204]);
     reap_tracked_prototype(&pool);
 }
 
 /// Workers are tracked by pid, and the OS reuses pids. An entry displaced by
-/// a new worker takes its slot with it unless the slot is handed back, and the
+/// a new worker under the same pid must give its seat up with it, or the
 /// pool's ceiling drops by one for good every time that happens.
 #[tokio::test]
-async fn reusing_a_pid_that_was_never_reaped_gives_its_slot_back() {
+async fn reusing_a_pid_that_was_never_reaped_gives_its_seat_back() {
     let pool = make_test_pool_manager(spawn_sleeper());
-    let free_at_rest = pool.idle.claim_slot().map(|s| {
-        pool.idle.release_slot(s);
-        s
-    });
-    assert!(
-        free_at_rest.is_some(),
-        "the fixture must start with a free slot"
-    );
+    assert_eq!(pool.admission.available_permits(), TEST_POOL_MAX);
 
-    // A worker that died without anyone noticing: its entry is still tracked
-    // and its slot is out of circulation.
+    // A worker that died without anyone noticing: still tracked, still seated.
     const PID: u32 = 4242;
-    let stale_slot = pool.idle.claim_slot().expect("a free slot");
-    pool.track_worker(
-        PID,
-        Arc::new(WorkerMeta::new(
-            stale_slot,
-            pool.started_at,
-            pool.started_at,
-        )),
-    );
+    pool.track_worker(PID, Arc::new(seated_meta(&pool)));
+    assert_eq!(pool.admission.available_permits(), TEST_POOL_MAX - 1);
 
     // The same pid comes back on a fresh worker, through the path a real
     // spawn takes.
-    let new_slot = pool.idle.claim_slot().expect("a second free slot");
-    pool.track_worker(
-        PID,
-        Arc::new(WorkerMeta::new(new_slot, pool.started_at, pool.started_at)),
-    );
+    pool.track_worker(PID, Arc::new(seated_meta(&pool)));
 
-    // Both slots must be reachable again once the new worker gives its own up.
-    pool.idle.release_slot(new_slot);
-    let mut reclaimed = Vec::new();
-    while let Some(s) = pool.idle.claim_slot() {
-        reclaimed.push(s);
-    }
-    assert!(
-        reclaimed.contains(&stale_slot),
-        "the displaced entry's slot never came back: {reclaimed:?}"
+    assert_eq!(
+        pool.admission.available_permits(),
+        TEST_POOL_MAX - 1,
+        "the displaced entry kept its seat, so the pool is one worker poorer"
     );
+    assert_eq!(pool.counters.workers_reaped_dead.load(Relaxed), 1);
     reap_tracked_prototype(&pool);
 }
 
@@ -376,20 +397,15 @@ async fn became_a_zombie(pid: i32) -> bool {
     false
 }
 
-/// A live worker the pool accounts for, holding a slot as a real one does.
-fn tracked_worker(pool: &PoolManager, pid: u32) -> u32 {
-    let slot = pool.idle.claim_slot().expect("a free slot");
-    pool.track_worker(
-        pid,
-        Arc::new(WorkerMeta::new(slot, pool.started_at, pool.started_at)),
-    );
-    slot
+/// A live worker the pool accounts for, holding a seat as a real one does.
+fn tracked_worker(pool: &PoolManager, pid: u32) {
+    pool.track_worker(pid, Arc::new(seated_meta(pool)));
 }
 
-/// Every retirement path gives the slot back. Leaking one lowers the pool's
+/// Every retirement path gives the seat back. Leaking one lowers the pool's
 /// real ceiling for good, and the reason it left must not change that.
 #[tokio::test]
-async fn every_retirement_reason_returns_the_slot() {
+async fn every_retirement_reason_returns_the_seat() {
     let pool = make_test_pool_manager(spawn_sleeper());
 
     for why in [
@@ -402,15 +418,14 @@ async fn every_retirement_reason_returns_the_slot() {
     ] {
         // Out of range, so the kill variants fail harmlessly with ESRCH.
         const NO_REAL_WORKER_PID: u32 = 999_999_999;
-        let slot = tracked_worker(&pool, NO_REAL_WORKER_PID);
+        tracked_worker(&pool, NO_REAL_WORKER_PID);
         pool.retire(NO_REAL_WORKER_PID, why);
         assert_eq!(
-            pool.idle.claim_slot(),
-            Some(slot),
-            "retiring for {:?} kept the slot",
+            pool.admission.available_permits(),
+            TEST_POOL_MAX,
+            "retiring for {:?} kept the seat",
             why.as_str()
         );
-        pool.idle.release_slot(slot);
         assert!(
             !pool
                 .workers
@@ -440,7 +455,7 @@ async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
         (Retired::Unavailable, true),
     ] {
         let worker_pid = spawn_sleeper();
-        let slot = tracked_worker(&pool, worker_pid);
+        tracked_worker(&pool, worker_pid);
 
         pool.retire(worker_pid, why);
 
@@ -453,7 +468,6 @@ async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
         let pid = Pid::from_raw(worker_pid as i32);
         let _ = kill(pid, Signal::SIGKILL);
         let _ = waitpid(pid, None);
-        pool.idle.release_slot(slot);
     }
     reap_tracked_prototype(&pool);
 }
@@ -484,9 +498,8 @@ async fn each_reason_counts_under_its_own_name() {
         // Nothing moves: the caller accounts for this one.
         (Retired::Unavailable, [1, 1, 1, 1, 1]),
     ] {
-        let slot = tracked_worker(&pool, NO_REAL_WORKER_PID);
+        tracked_worker(&pool, NO_REAL_WORKER_PID);
         pool.retire(NO_REAL_WORKER_PID, why);
-        pool.idle.release_slot(slot);
         assert_eq!(counters(&pool), expected, "after {:?}", why.as_str());
     }
     reap_tracked_prototype(&pool);
@@ -557,9 +570,10 @@ async fn replacing_a_prototype_already_reaped_by_the_sweep_never_signals_it() {
 async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
     let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
 
-    // Every slot spoken for, so `spawn_worker` can only answer "pool full".
+    // Every seat spoken for, so `spawn_worker` can only answer "pool full".
     let parked = idle_worker(&pool, 4242, false);
-    let held: Vec<u32> = std::iter::from_fn(|| pool.idle.claim_slot()).collect();
+    let _held: Vec<_> =
+        std::iter::from_fn(|| Arc::clone(&pool.admission).try_acquire_owned().ok()).collect();
 
     let waiter = {
         let pool = Arc::clone(&pool);
@@ -579,9 +593,6 @@ async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
         .expect("the returned worker is the one it gets");
     assert_eq!(got, 4242);
 
-    for slot in held {
-        pool.idle.release_slot(slot);
-    }
     pool.retire(4242, Retired::IdleTimeout);
     reap_tracked_prototype(&pool);
 }

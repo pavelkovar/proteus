@@ -6,7 +6,6 @@
 //! knows on its own both how long a worker has been idle and whether the
 //! pool can afford to lose it.
 
-use super::idle_stack::{IdleStack, Slotted};
 use super::prototype_launch;
 use super::worker_channel::WorkerChannel;
 use crate::config::Config;
@@ -18,11 +17,11 @@ use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_seqpacket::UnixSeqpacket;
 
 /// A spilled request body, held open after being unlinked: the worker gets
@@ -46,15 +45,19 @@ pub struct PoolManager {
     /// Where the control socket is registered. Everything that polls it has
     /// to run here, whatever runtime a request happens to arrive on.
     control_rt: tokio::runtime::Handle,
-    /// Nothing may inspect a parked worker from the far end, which is what
-    /// lets this stay lock-free: retirement is the worker's own decision.
-    idle: IdleStack<PooledWorker>,
+    /// Newest at the back, so dispatch takes the warmest and the sweep walks
+    /// from the coldest.
+    idle: StdMutex<VecDeque<PooledWorker>>,
     /// Raised whenever a worker is parked, so a caller waiting at
     /// `processes.max` hears about it rather than polling for it.
     worker_returned: Notify,
     /// Caps in-flight requests. `Arc` so a permit can outlive the dispatch
     /// that took it, as far as the response's own task.
     semaphore: Arc<Semaphore>,
+    /// Caps how many workers exist. Taken before the fork and held by the
+    /// worker's `WorkerMeta` until it is gone, so every exit frees a seat
+    /// without anyone having to remember to.
+    admission: Arc<Semaphore>,
     max_workers: usize,
     request_timeout: Duration,
     queue_timeout: Duration,
@@ -115,12 +118,6 @@ pub(crate) struct PooledWorker {
     pub(crate) meta: Arc<WorkerMeta>,
 }
 
-impl Slotted for PooledWorker {
-    fn slot(&self) -> u32 {
-        self.meta.slot
-    }
-}
-
 const STATE_IDLE: u8 = 0;
 const STATE_BUSY: u8 = 1;
 
@@ -131,9 +128,9 @@ const STATE_BUSY: u8 = 1;
 /// `last_active_ms` rather than an `Instant`, there being no atomic
 /// `Instant` and no consumer needing sub-second resolution.
 pub(crate) struct WorkerMeta {
-    /// Claimed at spawn and held until death, so parking and unparking touch
-    /// only the idle head.
-    pub(crate) slot: u32,
+    /// The worker's seat in the pool, given up when this is dropped - which
+    /// is once neither `workers` nor any `PooledWorker` holds it any more.
+    _admission: OwnedSemaphorePermit,
     state: std::sync::atomic::AtomicU8,
     request_count: std::sync::atomic::AtomicU32,
     started_at: Instant,
@@ -141,9 +138,9 @@ pub(crate) struct WorkerMeta {
 }
 
 impl WorkerMeta {
-    fn new(slot: u32, now: Instant, pool_started: Instant) -> Self {
+    fn new(admission: OwnedSemaphorePermit, now: Instant, pool_started: Instant) -> Self {
         WorkerMeta {
-            slot,
+            _admission: admission,
             state: std::sync::atomic::AtomicU8::new(STATE_IDLE),
             request_count: std::sync::atomic::AtomicU32::new(0),
             started_at: now,
@@ -342,36 +339,6 @@ fn is_pool_full(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::WouldBlock
 }
 
-/// Holds a claimed slot until its worker reaches `workers`. Any failure in
-/// between would otherwise retire the slot for good, lowering the pool's
-/// ceiling by one each time.
-struct SlotGuard<'a> {
-    idle: &'a IdleStack<PooledWorker>,
-    slot: Option<u32>,
-}
-
-impl<'a> SlotGuard<'a> {
-    fn new(idle: &'a IdleStack<PooledWorker>, slot: u32) -> Self {
-        SlotGuard {
-            idle,
-            slot: Some(slot),
-        }
-    }
-
-    /// Gives up ownership; the caller is now responsible for the slot.
-    fn keep(mut self) -> u32 {
-        self.slot.take().expect("a guard is kept at most once")
-    }
-}
-
-impl Drop for SlotGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            self.idle.release_slot(slot);
-        }
-    }
-}
-
 /// How long one sweep may spend returning ring pages. A swept worker is
 /// unavailable for the length of a `spawn_blocking` hop, and nothing here is
 /// urgent: whatever is still due is due again a tick later.
@@ -428,9 +395,10 @@ impl PoolManager {
         PoolManager {
             control: Mutex::new(control),
             control_rt: tokio::runtime::Handle::current(),
-            idle: IdleStack::new(cfg.php.processes.max),
+            idle: StdMutex::new(VecDeque::with_capacity(cfg.php.processes.max)),
             worker_returned: Notify::new(),
             semaphore: Arc::new(Semaphore::new(cfg.php.processes.max)),
+            admission: Arc::new(Semaphore::new(cfg.php.processes.max)),
             max_workers: cfg.php.processes.max,
             request_timeout: Duration::from_secs(cfg.php.limits.timeout),
             queue_timeout: Duration::from_secs(cfg.php.queue.timeout),
@@ -496,25 +464,19 @@ impl PoolManager {
     /// Retires the workers that timed themselves out and returns ring pages
     /// the rest have consumed.
     ///
-    /// Each worker is held aside rather than pushed straight back, since a
-    /// LIFO stack would hand the same one out again. Being off the stack is
-    /// also the exclusion `Ring::reclaim_if_due` needs.
+    /// Taking each worker out for the length of its check is what gives
+    /// `Ring::reclaim_if_due` the exclusion it needs.
     async fn sweep_idle_workers(&self) {
-        // Nothing between here and the pushes below awaits, so the pool is
-        // short only for as long as the pops take.
-        let ceiling = self.idle.len();
-        let mut held = Vec::with_capacity(ceiling);
-        for _ in 0..ceiling {
-            let Some(entry) = self.idle.pop() else {
-                break;
-            };
-            held.push(entry);
-        }
-
+        // Rotating front to back: taking exactly as many as were parked leaves
+        // the survivors in the order they started, and only one worker is out
+        // of the pool at a time rather than all of them.
+        let rounds = self.idle.lock().unwrap().len();
         let deadline = Instant::now() + RECLAIM_BUDGET;
         let mut reclaimed = 0usize;
-        // Reversed, so the warmest ends up back on top.
-        for worker in held.into_iter().rev() {
+        for _ in 0..rounds {
+            let Some(worker) = self.idle.lock().unwrap().pop_front() else {
+                break;
+            };
             if worker.channel.worker_has_exited() {
                 self.retire(worker.pid, Retired::IdleTimeout);
                 continue;
@@ -526,6 +488,8 @@ impl PoolManager {
                 let _ = tokio::task::spawn_blocking(move || mapped.reclaim_if_due()).await;
                 reclaimed += 1;
             }
+            // Not a bare push: a caller parked at the ceiling is owed the
+            // wakeup, and a sweep is as much a return as a dispatch's is.
             self.return_worker(worker);
         }
         if reclaimed > 0 {
@@ -555,11 +519,11 @@ impl PoolManager {
                 self.try_respawn_prototype().await;
             }
             self.sweep_idle_workers().await;
-            // Bounded by the total worker count, not the idle count: these
-            // spawns hold no semaphore permit, so topping up while others are
-            // busy would push the pool past the slot array sized for
-            // `processes.max`.
-            while self.idle.len() < spare && self.workers.lock().unwrap().len() < self.max_workers {
+            // Seats rather than the worker map: a spawn holds its seat from
+            // before the fork, so this cannot start one the pool has no room
+            // for while another is still in flight.
+            while self.idle.lock().unwrap().len() < spare && self.admission.available_permits() > 0
+            {
                 match self.spawn_worker().await {
                     Ok(worker) => self.return_worker(worker),
                     Err(e) => {
@@ -627,13 +591,12 @@ impl PoolManager {
     }
 
     async fn spawn_worker_once(&self) -> std::io::Result<PooledWorker> {
-        // Claimed before the fork: this is the only atomic admission gate.
-        // `workers.len() < max_workers` is a check-then-act that two spawn
-        // paths can pass at once, leaving the loser a process to kill.
-        let Some(slot) = self.idle.claim_slot() else {
+        // The only atomic admission gate: `workers.len() < max_workers` is a
+        // check-then-act two spawns can pass at once. Dropped on any early
+        // return below, so a failed spawn does not cost a seat for good.
+        let Ok(admission) = Arc::clone(&self.admission).try_acquire_owned() else {
             return Err(pool_full_error());
         };
-        let slot = SlotGuard::new(&self.idle, slot);
 
         let control = self.control.lock().await;
         let request =
@@ -670,41 +633,35 @@ impl PoolManager {
         })?;
 
         self.counters.workers_spawned.fetch_add(1, Relaxed);
-        // Past every fallible step, so the slot now belongs to a worker that
+        // Past every fallible step, so the seat now belongs to a worker that
         // `workers` will account for.
-        let meta = Arc::new(WorkerMeta::new(
-            slot.keep(),
-            Instant::now(),
-            self.started_at,
-        ));
+        let meta = Arc::new(WorkerMeta::new(admission, Instant::now(), self.started_at));
         self.track_worker(pid, Arc::clone(&meta));
         logging::debug!(r#type = "controller", pid, "spawned worker");
         Ok(PooledWorker { channel, pid, meta })
     }
 
-    /// Takes the slot back from any entry this displaces: the OS reuses pids,
-    /// and a worker whose pid came round again before it was reaped would
-    /// otherwise take its slot out of circulation for good.
+    /// Drops any entry this displaces, giving up its seat with it: the OS
+    /// reuses pids, and a worker whose pid came round again before it was
+    /// reaped would otherwise hold a seat for good.
     fn track_worker(&self, pid: u32, meta: Arc<WorkerMeta>) {
         // Bound first: as the scrutinee of an `if let`, the guard would live
         // for the whole arm and put the log call under the map lock.
         let displaced = self.workers.lock().unwrap().insert(pid, meta);
-        if let Some(stale) = displaced {
+        if displaced.is_some() {
             // Gone for certain: the kernel does not hand out a live pid.
             logging::warn!(
                 r#type = "controller",
                 pid,
                 "reusing the pid of a worker that was never reaped"
             );
-            self.idle.release_slot(stale.slot);
             self.counters.workers_reaped_dead.fetch_add(1, Relaxed);
         }
     }
 
-    /// The one way a worker leaves the pool.
-    ///
-    /// It must already be out of the idle stack: releasing the slot of one
-    /// still linked there hands that slot out twice.
+    /// The one way a worker leaves the pool. Its seat comes back when the
+    /// last reference to its `WorkerMeta` goes, which is why a caller still
+    /// holding the `PooledWorker` need not do anything else.
     pub(crate) fn retire(&self, pid: u32, why: Retired) {
         let counter = match why {
             Retired::IdleTimeout => Some(&self.counters.recycled_idle_timeout),
@@ -727,9 +684,7 @@ impl PoolManager {
                 "retiring worker"
             );
         }
-        if let Some(meta) = self.workers.lock().unwrap().remove(&pid) {
-            self.idle.release_slot(meta.slot);
-        }
+        self.workers.lock().unwrap().remove(&pid);
     }
 
     /// An idle worker, or a freshly spawned one.
@@ -745,7 +700,7 @@ impl PoolManager {
             tokio::pin!(returned);
 
             // A worker can retire itself while still parked here.
-            while let Some(worker) = self.idle.pop() {
+            while let Some(worker) = self.take_idle() {
                 if !worker.channel.worker_has_exited() {
                     return Ok(worker);
                 }
@@ -761,13 +716,20 @@ impl PoolManager {
         }
     }
 
+    /// The warmest parked worker: its heap and OPcache are the least cold,
+    /// and leaving the rest alone is what lets each reach its own idle
+    /// timeout instead of being cycled evenly.
+    fn take_idle(&self) -> Option<PooledWorker> {
+        self.idle.lock().unwrap().pop_back()
+    }
+
     fn return_worker(&self, worker: PooledWorker) {
-        self.idle.push(worker);
+        self.idle.lock().unwrap().push_back(worker);
         self.worker_returned.notify_one();
     }
 
     pub fn status_json(&self) -> serde_json::Value {
-        let idle_count = self.idle.len();
+        let idle_count = self.idle.lock().unwrap().len();
         let busy = self.max_workers - self.semaphore.available_permits();
         let prototype_pid = self.prototype_child.lock().unwrap().pid();
 

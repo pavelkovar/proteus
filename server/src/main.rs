@@ -21,7 +21,7 @@ pub(crate) const APP_NAME: &str = "proteus";
 
 /// Bounds how long a dead prototype goes unnoticed while the pool still has
 /// spares to serve every request, and how long a worker that exited on its
-/// own holds its pool slot.
+/// own keeps its seat in the pool.
 const POOL_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Per-thread heaps, avoiding the lock contention glibc's malloc sees under
@@ -123,6 +123,7 @@ async fn run_master(config: Config) {
             allowed.into_iter().map(Some).collect()
         }
     };
+
 
     // Raced against accept(), so it bounds how long the accept loops run
     // rather than guaranteeing nothing more is taken. The drain that follows

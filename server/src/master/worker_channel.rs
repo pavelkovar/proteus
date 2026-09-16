@@ -437,7 +437,7 @@ impl WorkerChannel {
     }
 
     /// Reclaiming through this is safe only while the worker is out of the
-    /// idle stack - see `Ring::reclaim_if_due`.
+    /// idle pool - see `Ring::reclaim_if_due`.
     pub fn mapping(&self) -> Arc<shm::MappedChannel> {
         Arc::clone(&self.mapped)
     }
