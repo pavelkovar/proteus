@@ -274,10 +274,8 @@ pub(crate) async fn dispatch_action(
 
                 // Only a cached miss or directory is actionable; a File
                 // verdict still needs the real open below.
-                if matches!(
-                    state.fs_cache.get(&candidate),
-                    Some(FsKind::Dir) | Some(FsKind::Missing)
-                ) {
+                let cached = state.fs_cache.get(&candidate);
+                if matches!(cached, Some(FsKind::Dir) | Some(FsKind::Missing)) {
                     match fallback {
                         Some(next) => {
                             current = next;
@@ -310,7 +308,9 @@ pub(crate) async fn dispatch_action(
                     Ok((file, meta)) => (Some((file, meta)), FsKind::File),
                     Err(_) => (None, FsKind::Missing),
                 };
-                state.fs_cache.put(candidate.clone(), kind);
+                if cached != Some(kind) {
+                    state.fs_cache.put(candidate.clone(), kind);
+                }
                 match opened {
                     Some((file, meta)) => {
                         return DispatchResult::new(

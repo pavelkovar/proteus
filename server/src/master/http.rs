@@ -1,7 +1,6 @@
 //! HTTP entry point: connection accept and drain, request handling, client
 //! IP resolution, access log.
 
-mod bounded_map;
 mod compression;
 mod conditional;
 mod fs_cache;

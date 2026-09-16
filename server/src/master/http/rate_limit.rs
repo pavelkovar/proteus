@@ -2,19 +2,18 @@
 //! target crawlers without touching ordinary visitors. Keyed on an opaque
 //! `ClientIdentity`, so where that identity came from is not decided here.
 //!
-//! A repeat check against an already-tracked client never takes an exclusive
-//! lock: `DashMap` gives that only its own per-shard lock, and the bucket
-//! itself is one `AtomicU64` updated via `compare_exchange`.
+//! Tracking is a bounded cache, so a client can be evicted and return with a
+//! fresh burst. What keeps that from being a bypass is the eviction policy
+//! being scan-resistant: one-shot addresses cannot displace a repeat offender.
 
-use super::bounded_map::BoundedMap;
 use super::proxy::ClientIdentity;
 use crate::config::MatchPattern;
 use crate::logging;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-/// An internal bound, not a config knob - same protection `fs_cache`'s
-/// `max_entries` gives its own map, but nothing an operator needs to tune.
+/// An internal bound, not a config knob: nothing an operator needs to tune.
 const MAX_TRACKED_IPS: usize = 64 * 1024;
 
 /// Bits given to the token count within the packed `AtomicU64`; the rest
@@ -46,7 +45,6 @@ impl Bucket {
         Bucket(AtomicU64::new(pack(now_secs, capacity)))
     }
 
-    /// Lock-free: no mutex is touched, only this one atomic word.
     fn try_consume(&self, now_secs: u64, capacity: u32, period_secs: u64) -> bool {
         let mut current = self.0.load(Relaxed);
         loop {
@@ -77,24 +75,16 @@ impl Bucket {
             }
         }
     }
-
-    /// Idle and holding nothing worth keeping - safe to sweep. Applies the
-    /// same lazy refill as `try_consume`, or a bucket untouched since it
-    /// last emptied would never look full, no matter how idle it's been.
-    fn is_full(&self, now_secs: u64, capacity: u32, period_secs: u64) -> bool {
-        let (last_secs, tokens) = unpack(self.0.load(Relaxed));
-        let elapsed = now_secs.saturating_sub(last_secs);
-        refilled(tokens, elapsed, capacity, period_secs) >= capacity as u64
-    }
 }
 
 pub(crate) struct RateLimiter {
-    map: BoundedMap<ClientIdentity, Bucket>,
+    /// `Arc` because the cache yields a clone of the value, and every holder
+    /// has to reach the same word.
+    map: quick_cache::sync::Cache<ClientIdentity, Arc<Bucket>>,
     epoch: Instant,
     capacity: u32,
     period_secs: u64,
     user_agent: Vec<MatchPattern>,
-    max_tracked: usize,
 }
 
 impl RateLimiter {
@@ -102,15 +92,15 @@ impl RateLimiter {
         Self::with_shape(requests, period_seconds, user_agent, MAX_TRACKED_IPS)
     }
 
-    /// Real construction path; `new` fixes the tracking cap to the
-    /// production constant, tests exercise a small cap directly so the
-    /// eviction-when-full path is reachable without filling 64K IPs.
+    /// Takes the tracking cap as a parameter so a caller can pick one small
+    /// enough to reach the eviction path.
     fn with_shape(
         requests: u32,
         period_seconds: u64,
         user_agent: Vec<MatchPattern>,
         max_tracked: usize,
     ) -> Self {
+        let max_tracked = max_tracked.max(1);
         // Above this the burst count no longer fits TOKEN_BITS - an encoding
         // limit, not a policy one, so clamped rather than rejected, but
         // logged since the configured value is then not what's enforced.
@@ -124,23 +114,20 @@ impl RateLimiter {
             );
         }
         RateLimiter {
-            map: BoundedMap::new(),
+            map: quick_cache::sync::Cache::new(max_tracked),
             epoch: Instant::now(),
             capacity,
             period_secs: period_seconds,
             user_agent,
-            max_tracked: max_tracked.max(1),
         }
     }
 
-    /// Whether `user_agent` is subject to this limiter at all, checked
-    /// before any shared state is touched - a non-matching request costs
-    /// nothing beyond this.
+    /// Whether `user_agent` is subject to this limiter at all. Touches no
+    /// shared state, so it is safe to gate on before `check`.
     pub(crate) fn should_limit(&self, user_agent: &str) -> bool {
         crate::config::matches_any(&self.user_agent, user_agent)
     }
 
-    /// For the `Retry-After` header on a 429.
     pub(crate) fn period_seconds(&self) -> u64 {
         self.period_secs
     }
@@ -150,25 +137,13 @@ impl RateLimiter {
     /// `should_limit` has already said yes.
     pub(crate) fn check(&self, client: ClientIdentity) -> bool {
         let now_secs = self.epoch.elapsed().as_secs();
-
-        // Fast path: an already-tracked client only ever needs DashMap's own
-        // fine-grained per-shard lock, never one shared with unrelated clients.
-        if let Some(bucket) = self.map.get(&client) {
-            return bucket.try_consume(now_secs, self.capacity, self.period_secs);
-        }
-
-        // Rare path: first sighting of this client (or it was swept below).
-        // Fails open rather than evicting a client actively being limited
-        // if the table is still full even after sweeping idle entries.
-        if !self.map.has_room_for(&client, self.max_tracked, |bucket| {
-            bucket.is_full(now_secs, self.capacity, self.period_secs)
-        }) {
-            return true;
-        }
+        let capacity = self.capacity;
         self.map
-            .entry(client)
-            .or_insert_with(|| Bucket::new(now_secs, self.capacity))
-            .try_consume(now_secs, self.capacity, self.period_secs)
+            .get_or_insert_with(&client, || {
+                Ok::<_, std::convert::Infallible>(Arc::new(Bucket::new(now_secs, capacity)))
+            })
+            .expect("the initialiser cannot fail")
+            .try_consume(now_secs, capacity, self.period_secs)
     }
 }
 

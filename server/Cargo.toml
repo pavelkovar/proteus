@@ -20,7 +20,6 @@ debug = 1
 [dependencies]
 brotli = "9"
 bytes = "1"
-dashmap = "6"
 flate2 = { version = "1", features = ["zlib-rs"] }
 headers = "0.4"
 http-body = "1"
@@ -36,6 +35,7 @@ mimalloc = "0.1.52"
 mime_guess = "2"
 nix = { version = "0.31.3", features = ["event", "fs", "process", "socket", "user", "uio", "signal"] }
 postcard = { version = "1", features = ["alloc"] }
+quick_cache = "0.7"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_bytes = "0.11"

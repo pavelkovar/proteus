@@ -142,60 +142,42 @@ fn should_limit_only_matches_configured_patterns() {
     assert!(!limiter.should_limit("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"));
 }
 
-/// A tracking table full of clients that are all still actively being
-/// limited (none idle/full) has nothing safe to sweep, so a new IP must
-/// fail open rather than evict one of them.
+/// A client arriving at a table that is already full must still be tracked.
+/// Letting it through untracked would disable limiting for every newcomer
+/// for as long as the table stayed full.
 #[test]
-fn a_full_tracking_table_of_active_clients_fails_open_rather_than_evicting_one() {
-    // Room for 2 IPs, so a third forces the sweep-or-fail-open path.
+fn a_client_arriving_at_a_full_table_is_still_tracked() {
     let limiter = RateLimiter::with_shape(1, 3600, Vec::new(), 2);
-
-    let first = ip(10);
-    let second = ip(11);
-    assert!(limiter.check(first));
-    assert!(limiter.check(second));
-    // Both buckets now sit at 0/1 tokens - neither is "full", so neither is
-    // sweep-eligible.
+    assert!(limiter.check(ip(10)));
+    assert!(limiter.check(ip(11)));
 
     let third = ip(12);
+    assert!(limiter.check(third));
     assert!(
-        limiter.check(third),
-        "a full tracking table must fail open rather than block a client it cannot track"
-    );
-
-    // Neither original client was evicted to make room for the fail-open one.
-    assert!(
-        !limiter.check(first),
-        "an actively-limited client must never be evicted to make room"
-    );
-    assert!(
-        !limiter.check(second),
-        "an actively-limited client must never be evicted to make room"
+        !limiter.check(third),
+        "the newcomer must own a real bucket, denying its own very next request"
     );
 }
 
-/// A tracking table with an idle entry must sweep it to make room for a new
-/// IP, which must end up genuinely tracked, not just let through by the
-/// fail-open path - checked by denying that IP's own very next request.
+/// The property that makes eviction safe here: an offender that keeps coming
+/// back must outlive the one-shot addresses of a spray, or rotating source
+/// IPs would reset its bucket for it.
 #[test]
-fn eviction_sweeps_an_idle_entry_to_make_room_for_a_new_ip() {
-    let limiter = RateLimiter::with_shape(1, 1, Vec::new(), 1); // tracking cap = 1
+fn a_spray_of_one_shot_ips_does_not_evict_a_repeat_offender() {
+    const CAP: usize = 64;
+    let limiter = RateLimiter::with_shape(1, 3600, Vec::new(), CAP);
 
-    let first = ip(13);
-    assert!(limiter.check(first)); // fills the table's one slot, tokens now 0/1
+    let offender = ClientIdentity::for_test(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)));
+    assert!(limiter.check(offender), "offender spends its one token");
 
-    // Let it refill back to full capacity - now idle and sweep-eligible.
-    std::thread::sleep(Duration::from_millis(1500));
-
-    let second = ip(14);
-    assert!(
-        limiter.check(second),
-        "the idle entry must be swept to make room for a new IP"
-    );
-    assert!(
-        !limiter.check(second),
-        "second must be a real, tracked bucket (denies its own very next request) - a fail-open pass-through would keep allowing it"
-    );
+    for n in 0..(CAP as u32 * 100) {
+        let spray = ClientIdentity::for_test(IpAddr::V4(Ipv4Addr::from(0x0A00_0000 + n)));
+        limiter.check(spray);
+        assert!(
+            !limiter.check(offender),
+            "the offender was evicted and handed a fresh burst after {n} spray addresses"
+        );
+    }
 }
 
 /// Many threads hammering the same IP concurrently must never let more

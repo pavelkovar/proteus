@@ -565,7 +565,7 @@ pub struct FsCacheConfig {
     /// TTL for a cached verdict; 0 disables the cache.
     #[serde(default = "default_fs_cache_ttl_ms")]
     pub ttl_ms: u64,
-    /// Once full, further paths go uncached rather than evicting.
+    /// Paths kept at once; once full, admitting one evicts the coldest.
     #[serde(default = "default_fs_cache_max_entries")]
     pub max_entries: usize,
 }
