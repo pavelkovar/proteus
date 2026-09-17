@@ -82,7 +82,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [ "x86_64", "arm64" ]
-        php: [ "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5" ]
+        php: [ "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5", "8.6" ]
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -90,9 +90,17 @@ jobs:
       - name: Install PHP
         run: |
           dnf -y install https://rpms.remirepo.net/enterprise/remi-release-8.rpm epel-release
-          dnf -y module enable php:remi-${{ matrix.php }}
-          dnf -y install php-cli php-devel php-embedded php-opcache php-pecl-apcu gcc-toolset-15
-          
+
+          if [ "${{ matrix.php }}" = "8.6" ]; then
+            dnf -y install php86-php-cli php86-php-devel php86-php-embedded gcc-toolset-15
+            echo "PHP_CONFIG=/opt/remi/php86/root/usr/bin/php-config" >> $GITHUB_ENV
+            echo "LDFLAGS=-L/opt/remi/php86/root/usr/lib64" >> $GITHUB_ENV
+            echo "LD_LIBRARY_PATH=/opt/remi/php86/root/usr/lib64" >> $GITHUB_ENV
+          else
+            dnf -y module enable php:remi-${{ matrix.php }}
+            dnf -y install php-cli php-devel php-embedded php-opcache php-pecl-apcu gcc-toolset-15
+          fi
+
           echo "/opt/rh/gcc-toolset-15/root/usr/bin" >> $GITHUB_PATH
           echo "CC=/opt/rh/gcc-toolset-15/root/usr/bin/gcc" >> $GITHUB_ENV
           echo "CXX=/opt/rh/gcc-toolset-15/root/usr/bin/g++" >> $GITHUB_ENV

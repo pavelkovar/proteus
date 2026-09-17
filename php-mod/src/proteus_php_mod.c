@@ -1,4 +1,4 @@
-/* PHP embed SAPI module, targeting PHP 7.4-8.5. */
+/* PHP embed SAPI module, targeting PHP 7.4-8.6. */
 
 #include "proteus_php_mod.h"
 
