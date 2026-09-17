@@ -155,11 +155,7 @@ impl PoolManager {
                 // Probably self-retired is not certainly: a worker wedged
                 // rather than parked would otherwise run on untracked.
                 self.retire(pid, Retired::Unavailable);
-                Err(AttemptError::WorkerUnavailable(
-                    e,
-                    permit,
-                    body_cleanup,
-                ))
+                Err(AttemptError::WorkerUnavailable(e, permit, body_cleanup))
             }
         }
     }
@@ -174,7 +170,10 @@ impl PoolManager {
         permit: OwnedSemaphorePermit,
         body_cleanup: Option<TempBodyFile>,
     ) -> Result<DispatchOutcome, (std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>)> {
-        match self.try_dispatch_to(worker, req, permit, body_cleanup).await {
+        match self
+            .try_dispatch_to(worker, req, permit, body_cleanup)
+            .await
+        {
             Ok(started) => Ok(DispatchOutcome::Ok(started)),
             Err(AttemptError::RequestTooLarge(_permit)) => {
                 self.counters.requests_too_large.fetch_add(1, Relaxed);
@@ -495,7 +494,7 @@ impl PoolManager {
                     let _ = body_tx
                         .send(Err(std::io::Error::new(e.kind(), e.to_string())))
                         .await;
-                    logging::warn!(r#type = "controller", pid, error = %e, "response stream read failed");
+                    logging::error!(r#type = "controller", pid, error = %e, "response stream read failed");
                     self.retire(pid, Retired::Failed);
                     return;
                 }
@@ -506,7 +505,7 @@ impl PoolManager {
                             "worker exceeded request_timeout mid-response",
                         )))
                         .await;
-                    logging::warn!(
+                    logging::error!(
                         r#type = "controller",
                         pid,
                         request_timeout = ?self.request_timeout,

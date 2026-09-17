@@ -34,10 +34,7 @@ fn overlapping_requests_stay_busy_until_the_last_one_finishes() {
     conn.request_started();
     conn.request_started();
     conn.request_finished();
-    assert!(
-        conn.idle_for().is_none(),
-        "one request is still in flight"
-    );
+    assert!(conn.idle_for().is_none(), "one request is still in flight");
     conn.request_finished();
     assert!(conn.idle_for().is_some());
 }

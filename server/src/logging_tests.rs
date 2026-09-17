@@ -60,6 +60,18 @@ impl std::io::Write for FailingWriter {
 }
 
 #[test]
+fn set_min_level_changes_what_min_level_reports() {
+    let original = min_level();
+    set_min_level(level::ERROR);
+    assert_eq!(min_level(), level::ERROR);
+
+    set_min_level(level::DEBUG);
+    assert_eq!(min_level(), level::DEBUG);
+
+    set_min_level(original);
+}
+
+#[test]
 fn record_is_flat_json_with_the_fields_in_call_order() {
     let mut line = begin("INFO");
     field_raw(&mut line, "r#type", "controller");

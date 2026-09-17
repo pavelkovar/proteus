@@ -252,3 +252,29 @@ async fn a_parked_worker_exits_when_master_marks_the_peer_dead() {
         .join()
         .expect("a parked worker must notice peer death");
 }
+
+/// A body big enough to spill arrives as `RequestBody::File`, with its fd
+/// following separately over `link`. `spawn_worker` already drops master's
+/// end of `link` before any request is sent, standing in for a master that
+/// died between framing the request and sending its fd - the worker must
+/// give up on the request rather than call into PHP with no body at all.
+#[tokio::test]
+async fn a_file_body_with_no_fd_on_the_link_ends_the_worker_without_calling_php() {
+    let called = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&called);
+    let (master, handle) = spawn_worker(2, move |_client_gone, _emit| {
+        flag.store(true, Ordering::Release);
+    });
+
+    let mut req = empty_request();
+    req.body = RequestBody::File { len: 4 };
+    master.send_request(&req).await;
+
+    handle
+        .join()
+        .expect("the worker must exit rather than hang with no fd ever arriving");
+    assert!(
+        !called.load(Ordering::Acquire),
+        "PHP must never run for a request whose body fd never arrived"
+    );
+}

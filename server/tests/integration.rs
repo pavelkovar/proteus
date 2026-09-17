@@ -52,7 +52,7 @@ async fn start_server(name: &str, php_root: &str, overrides: serde_json::Value) 
     let status_port = next_port();
 
     let mut config = serde_json::json!({
-        "listen": [format!("127.0.0.1:{port}")],
+        "listen": format!("127.0.0.1:{port}"),
         "status": { "listen": format!("127.0.0.1:{status_port}") },
         "routes": [
             { "match": {}, "action": "static",
@@ -70,16 +70,7 @@ async fn start_server(name: &str, php_root: &str, overrides: serde_json::Value) 
             "queue": { "timeout": 2 }
         }
     });
-    // A second listen address cannot come through `merge_json`: that would
-    // replace the array and lose the port the harness connects on.
-    if let Some(extra) = overrides.get("listen_extra").and_then(|v| v.as_u64()) {
-        config["listen"]
-            .as_array_mut()
-            .unwrap()
-            .push(serde_json::json!(format!("127.0.0.1:{extra}")));
-    }
     merge_json(&mut config, overrides);
-    config.as_object_mut().unwrap().remove("listen_extra");
 
     let config_path = std::env::temp_dir().join(format!("test-config-{name}.json"));
     std::fs::File::create(&config_path)
@@ -2922,7 +2913,7 @@ async fn small_php_response_still_gets_compressed_and_varies() {
 #[tokio::test]
 async fn invalid_config_fails_fast_instead_of_starting() {
     let config = serde_json::json!({
-        "listen": ["127.0.0.1:0"],
+        "listen": "127.0.0.1:0",
         "status": { "listen": "127.0.0.1:0" },
         "routes": [],
         "php": {
@@ -2996,7 +2987,7 @@ async fn access_log_includes_worker_pid_and_php_target() {
     let port = next_port();
     let status_port = next_port();
     let config = serde_json::json!({
-        "listen": [format!("127.0.0.1:{port}")],
+        "listen": format!("127.0.0.1:{port}"),
         "status": { "listen": format!("127.0.0.1:{status_port}") },
         "routes": [
             { "match": {}, "action": "static",
@@ -3416,10 +3407,7 @@ async fn a_body_over_max_body_size_gets_a_413_not_a_hang() {
         .unwrap();
     assert_eq!(resp.status(), 413);
     let text = resp.text().await.unwrap();
-    assert!(
-        text.contains("exceeds the configured limit"),
-        "got: {text}"
-    );
+    assert!(text.contains("exceeds the configured limit"), "got: {text}");
 }
 
 /// A spilled body is opened with `O_TMPFILE`, so it has no name at any point
@@ -4616,11 +4604,8 @@ async fn await_access_log(
 }
 
 /// The log must be written when the body finishes, not when the headers were
-/// ready: otherwise `duration_ms` excludes the whole transfer and a stream
-/// that dies halfway is recorded as a clean 200.
-///
-/// The 200 is already on the wire and cannot be taken back, so the log line is
-/// the only place that failure can ever surface.
+/// ready: otherwise `duration_ms` excludes the whole transfer, and a request
+/// whose worker was killed mid-stream would never be logged at all.
 #[tokio::test]
 async fn the_access_log_records_a_body_that_failed_after_the_headers_went_out() {
     let www = fixtures_dir().join("www");
@@ -4630,7 +4615,7 @@ async fn the_access_log_records_a_body_that_failed_after_the_headers_went_out() 
         port,
         status_port,
         serde_json::json!({
-            "listen": [format!("127.0.0.1:{port}")],
+            "listen": format!("127.0.0.1:{port}"),
             "status": { "listen": format!("127.0.0.1:{status_port}") },
             "routes": [ { "match": {}, "action": "php", "target": "default" } ],
             "php": {
@@ -4700,11 +4685,6 @@ async fn the_access_log_records_a_body_that_failed_after_the_headers_went_out() 
         Some(200),
         "the status was already committed: {entry}"
     );
-    assert_ne!(
-        entry["body"].as_str(),
-        Some("complete"),
-        "a body that died mid-stream must not be logged as complete: {entry}"
-    );
 }
 
 /// The other half: `duration_ms` has to cover the body, not just the
@@ -4719,7 +4699,7 @@ async fn access_log_duration_covers_the_body_transfer_not_just_the_headers() {
         port,
         status_port,
         serde_json::json!({
-            "listen": [format!("127.0.0.1:{port}")],
+            "listen": format!("127.0.0.1:{port}"),
             "status": { "listen": format!("127.0.0.1:{status_port}") },
             "routes": [ { "match": {}, "action": "php", "target": "default" } ],
             "php": {
@@ -4745,12 +4725,147 @@ async fn access_log_duration_covers_the_body_transfer_not_just_the_headers() {
     );
 
     let entry = await_access_log(&lines, |v| v["path"].as_str() == Some("/slow-stream")).await;
-    assert_eq!(entry["body"].as_str(), Some("complete"), "got: {entry}");
     // Five chunks, 200ms apart - a duration measured at header time would
     // be a handful of milliseconds.
     assert!(
         entry["duration_ms"].as_u64().unwrap() >= 800,
         "duration_ms must include the body transfer, got: {entry}"
+    );
+}
+
+/// `path` must carry the query string too, not just `uri.path()`: an operator
+/// grepping the log for `?size=` would otherwise find nothing.
+#[tokio::test]
+async fn access_log_path_includes_the_query_string() {
+    let www = fixtures_dir().join("www");
+    let (port, status_port) = (next_port(), next_port());
+    let (mut child, lines) = start_server_capturing_stdout(
+        "accesslog-query-string",
+        port,
+        status_port,
+        serde_json::json!({
+            "listen": format!("127.0.0.1:{port}"),
+            "status": { "listen": format!("127.0.0.1:{status_port}") },
+            "routes": [ { "match": {}, "action": "php", "target": "default" } ],
+            "php": {
+                "targets": { "default": { "root": www.to_str().unwrap(), "script": "index.php" } },
+                "limits": { "requests": 100, "timeout": 60 },
+                "processes": { "max": 2, "spare": 1 },
+                "queue": { "timeout": 10 }
+            }
+        }),
+    )
+    .await;
+    let _guard = ChildGuard(&mut child);
+
+    let resp = reqwest::get(format!(
+        "http://127.0.0.1:{port}/declared-length?size=42&foo=bar"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let entry = await_access_log(&lines, |v| {
+        v["path"].as_str() == Some("/declared-length?size=42&foo=bar")
+    })
+    .await;
+    assert_eq!(entry["action"].as_str(), Some("php"), "got: {entry}");
+}
+
+/// Below the compression threshold, `body_bytes_sent` must equal what the
+/// script actually echoed - the plainest check that it counts real wire
+/// bytes rather than, say, the declared `Content-Length`.
+#[tokio::test]
+async fn access_log_body_bytes_sent_matches_an_uncompressed_response() {
+    let www = fixtures_dir().join("www");
+    let (port, status_port) = (next_port(), next_port());
+    let (mut child, lines) = start_server_capturing_stdout(
+        "accesslog-bytes-sent-plain",
+        port,
+        status_port,
+        serde_json::json!({
+            "listen": format!("127.0.0.1:{port}"),
+            "status": { "listen": format!("127.0.0.1:{status_port}") },
+            "routes": [ { "match": {}, "action": "php", "target": "default" } ],
+            "php": {
+                "targets": { "default": { "root": www.to_str().unwrap(), "script": "index.php" } },
+                "limits": { "requests": 100, "timeout": 60 },
+                "processes": { "max": 2, "spare": 1 },
+                "queue": { "timeout": 10 }
+            }
+        }),
+    )
+    .await;
+    let _guard = ChildGuard(&mut child);
+
+    // Under the default 1024-byte compression threshold, so this exercises
+    // the uncompressed path even with a client that advertises gzip.
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/declared-length?size=500"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 500);
+
+    let entry = await_access_log(&lines, |v| {
+        v["path"].as_str() == Some("/declared-length?size=500")
+    })
+    .await;
+    assert_eq!(entry["body_bytes_sent"].as_u64(), Some(500), "got: {entry}");
+}
+
+/// Above the compression threshold, with a client that accepts gzip,
+/// `body_bytes_sent` must reflect the compressed bytes actually put on the
+/// wire, not the script's uncompressed output.
+#[tokio::test]
+async fn access_log_body_bytes_sent_reflects_compression() {
+    let www = fixtures_dir().join("www");
+    let (port, status_port) = (next_port(), next_port());
+    let (mut child, lines) = start_server_capturing_stdout(
+        "accesslog-bytes-sent-compressed",
+        port,
+        status_port,
+        serde_json::json!({
+            "listen": format!("127.0.0.1:{port}"),
+            "status": { "listen": format!("127.0.0.1:{status_port}") },
+            "routes": [
+                { "match": {}, "action": "static",
+                  "root": format!("{}/public", www.to_str().unwrap()),
+                  "fallback": { "action": "php", "target": "default" } }
+            ],
+            "php": {
+                "targets": { "default": { "root": www.to_str().unwrap(), "script": "index.php" } },
+                "limits": { "requests": 100, "timeout": 60 },
+                "processes": { "max": 2, "spare": 1 },
+                "queue": { "timeout": 10 }
+            }
+        }),
+    )
+    .await;
+    let _guard = ChildGuard(&mut child);
+
+    // 2001 bytes of a single repeated character - well past the 1024-byte
+    // default threshold and about as compressible as text gets.
+    let client = reqwest::Client::builder().no_gzip().build().unwrap();
+    let resp = client
+        .get(format!("http://127.0.0.1:{port}/big.txt"))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+    let compressed_len = resp.bytes().await.unwrap().len() as u64;
+    assert!(
+        compressed_len < 2001,
+        "fixture must actually compress for this test to mean anything: {compressed_len}"
+    );
+
+    let entry = await_access_log(&lines, |v| v["path"].as_str() == Some("/big.txt")).await;
+    assert_eq!(
+        entry["body_bytes_sent"].as_u64(),
+        Some(compressed_len),
+        "got: {entry}"
     );
 }
 
@@ -5258,36 +5373,6 @@ async fn workers_survive_being_dispatched_from_one_runtime_after_another() {
         status["php"]["processes"]["max"], 4,
         "the pool must still be at full strength"
     );
-}
-
-/// Every core accepts on every configured address, so a second address is a
-/// second accept loop per core rather than a second set of threads. A core that
-/// only ever ran the first one would leave the second served by nobody.
-#[tokio::test]
-async fn every_configured_address_is_served() {
-    let www = fixtures_dir().join("www");
-    let second = next_port();
-    let server = start_server(
-        "multi-listen",
-        www.to_str().unwrap(),
-        serde_json::json!({ "listen_extra": second }),
-    )
-    .await;
-
-    // Enough requests that the kernel spreads them over more than one core's
-    // socket; a per-core mistake would show as a hang on some of them.
-    for _ in 0..20 {
-        for port in [server.port, second] {
-            let response = tokio::time::timeout(
-                Duration::from_secs(5),
-                reqwest::get(format!("http://127.0.0.1:{port}/app")),
-            )
-            .await
-            .unwrap_or_else(|_| panic!("port {port} never answered"))
-            .unwrap_or_else(|e| panic!("port {port} failed: {e}"));
-            assert_eq!(response.status(), 200, "port {port}");
-        }
-    }
 }
 
 /// The body fd goes only after its request frame is on the ring, so a frame

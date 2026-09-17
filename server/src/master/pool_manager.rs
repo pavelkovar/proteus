@@ -5,21 +5,26 @@
 //! period, and master holds the `spare` floor - neither alone knows both
 //! how long a worker has been idle and whether the pool can afford to lose it.
 
-use worker_channel::WorkerChannel;
+mod dispatch;
+mod prototype;
+mod worker_channel;
 
 use crate::config::Config;
 use crate::ipc::control;
 use crate::logging;
 use crate::prototype::ProtoConfig;
 use crate::utils::gauge::Gauge;
+pub(crate) use dispatch::{BodyStream, DispatchOutcome};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
+use prototype::Handle;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_seqpacket::UnixSeqpacket;
+use worker_channel::WorkerChannel;
 
 /// A spilled request body, held open after being unlinked: the worker gets
 /// this fd, and closing it is what frees the space. Must outlive the response,
@@ -218,8 +223,10 @@ impl Retired {
 /// Logs rather than panics on delivery failure; ESRCH on an already-dead pid
 /// is the expected case.
 pub(crate) fn sigkill(pid: u32, context: &str) {
-    logging::debug!(r#type = "controller", pid, context, "sending SIGKILL");
-    if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+    logging::warn!(r#type = "controller", pid, context, "sending SIGKILL");
+    if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
+        && e != nix::errno::Errno::ESRCH
+    {
         logging::warn!(r#type = "controller", pid, error = %e, "signal delivery failed");
     }
 }
@@ -281,12 +288,12 @@ impl PoolManager {
                 idle_timeout_seconds: cfg.php.processes.idle_timeout,
                 options: cfg.php.options.clone(),
                 environment: cfg.php.environment.clone(),
+                log_level: cfg.log_level.as_level(),
             },
             drop_to,
             no_new_privs: cfg.php.no_new_privs,
         };
-        let (control, prototype_pid) =
-            prototype::spawn(&spec).expect("failed to spawn prototype");
+        let (control, prototype_pid) = prototype::spawn(&spec).expect("failed to spawn prototype");
         logging::info!(
             r#type = "controller",
             pid = prototype_pid,
@@ -685,12 +692,6 @@ impl PoolManager {
         })
     }
 }
-
-mod dispatch;
-mod prototype;
-mod worker_channel;
-pub(crate) use dispatch::{BodyStream, DispatchOutcome};
-use prototype::Handle;
 
 #[cfg(test)]
 #[path = "pool_manager_tests.rs"]

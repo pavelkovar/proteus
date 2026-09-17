@@ -11,26 +11,6 @@ use hyper::{Method, StatusCode};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// How a response body ended, for the access log.
-#[derive(Clone, Copy)]
-pub(super) enum BodyOutcome {
-    Complete,
-
-    Failed,
-    /// Dropped before the last frame: the client went away.
-    Aborted,
-}
-
-impl BodyOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            BodyOutcome::Complete => "complete",
-            BodyOutcome::Failed => "error",
-            BodyOutcome::Aborted => "aborted",
-        }
-    }
-}
-
 /// Captured while the request is in scope, emitted once the body finishes.
 /// Holds the raw `Uri` since a log records what the client actually sent.
 pub(super) struct PendingAccessLog {
@@ -46,31 +26,31 @@ pub(super) struct PendingAccessLog {
 
 impl PendingAccessLog {
     /// 0 for anything that never reached a PHP worker; a real pid is never 0.
-    fn emit(&self, body: BodyOutcome) {
+    fn emit(&self, bytes_sent: u64) {
         logging::info!(
             r#type = "access_log",
             client_ip = %self.client_ip,
             method = %self.method,
-            path = self.uri.path(),
+            path = self.uri.path_and_query().map_or("", |pq| pq.as_str()),
             status = self.status.as_u16(),
             duration_ms = self.start.elapsed().as_millis() as u64,
             worker_pid = self.worker_pid,
             action = self.action,
             php_target = self.php_target.as_deref().unwrap_or(""),
-            body = body.as_str(),
+            body_bytes_sent = bytes_sent,
         );
     }
 }
 
 /// Holds the in-flight guard until the body is fully streamed, so shutdown
 /// can't truncate a live response. Also owns the access-log line, emitted
-/// from `Drop` so a stream dying halfway isn't logged as a clean 200.
+/// from `Drop` so a stream dying halfway is still logged.
 pub(super) struct GuardedBody {
     pub(super) inner: ResponseBody,
     pub(super) _guard: InFlightGuard,
     pub(super) _conn: ConnBusyGuard,
     pub(super) log: Option<PendingAccessLog>,
-    pub(super) outcome: BodyOutcome,
+    pub(super) bytes_sent: u64,
 }
 
 impl http_body::Body for GuardedBody {
@@ -82,10 +62,10 @@ impl http_body::Body for GuardedBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
         let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        match &polled {
-            std::task::Poll::Ready(None) => self.outcome = BodyOutcome::Complete,
-            std::task::Poll::Ready(Some(Err(_))) => self.outcome = BodyOutcome::Failed,
-            _ => {}
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled
+            && let Some(data) = frame.data_ref()
+        {
+            self.bytes_sent += data.len() as u64;
         }
         polled
     }
@@ -102,7 +82,7 @@ impl http_body::Body for GuardedBody {
 impl Drop for GuardedBody {
     fn drop(&mut self) {
         if let Some(log) = self.log.take() {
-            log.emit(self.outcome);
+            log.emit(self.bytes_sent);
         }
     }
 }

@@ -4,7 +4,7 @@ use super::*;
 fn parses_a_full_config() {
     let json = r#"
     {
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "routes": [
         { "match": { "uri": ["/uploads/*"] }, "action": "static", "root": "/var/www/uploads" },
         { "match": {}, "action": "static", "root": "/var/www/public",
@@ -20,7 +20,7 @@ fn parses_a_full_config() {
       }
     }"#;
     let cfg: Config = serde_json::from_str(json).expect("should parse");
-    assert_eq!(cfg.listen, vec!["0.0.0.0:8080"]);
+    assert_eq!(cfg.listen, "0.0.0.0:8080");
     assert_eq!(cfg.routes.len(), 2);
     assert_eq!(
         cfg.routes[1].action,
@@ -41,7 +41,7 @@ fn parses_a_full_config() {
 fn queue_and_shutdown_default_when_entirely_omitted() {
     let json = r#"
     {
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "php": {
         "user": "phpapp",
         "group": "phpapp",
@@ -59,7 +59,7 @@ fn queue_and_shutdown_default_when_entirely_omitted() {
 fn queue_and_shutdown_respect_explicit_values() {
     let json = r#"
     {
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "php": {
         "user": "phpapp",
         "group": "phpapp",
@@ -79,7 +79,7 @@ fn queue_and_shutdown_respect_explicit_values() {
 fn max_body_size_respects_an_explicit_value() {
     let json = r#"
     {
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "max_body_size": 1048576,
       "php": {
         "user": "phpapp",
@@ -97,7 +97,7 @@ fn max_body_size_respects_an_explicit_value() {
 fn trusted_proxies_defaults_to_empty_and_parses_cidrs() {
     let json = r#"
     {
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "php": {
         "user": "phpapp",
         "group": "phpapp",
@@ -110,8 +110,8 @@ fn trusted_proxies_defaults_to_empty_and_parses_cidrs() {
     assert!(cfg.trusted_proxies.is_empty());
 
     let json_with_proxies = json.replace(
-        r#""listen": ["0.0.0.0:8080"],"#,
-        r#""listen": ["0.0.0.0:8080"], "trusted_proxies": ["10.0.0.0/8", "192.168.1.1"],"#,
+        r#""listen": "0.0.0.0:8080","#,
+        r#""listen": "0.0.0.0:8080", "trusted_proxies": ["10.0.0.0/8", "192.168.1.1"],"#,
     );
     let cfg: Config = serde_json::from_str(&json_with_proxies).expect("should parse");
     assert_eq!(cfg.trusted_proxies.len(), 2);
@@ -125,7 +125,7 @@ fn rejects_an_invalid_cidr_in_trusted_proxies() {
     // that silently matches everything or nothing at request time.
     let json = r#"
     {
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "trusted_proxies": ["not-a-cidr"],
       "php": {
         "user": "phpapp",
@@ -144,7 +144,7 @@ fn rejects_an_invalid_cidr_in_trusted_proxies() {
 
 #[test]
 fn rejects_missing_required_field() {
-    let json = r#"{ "listen": ["0.0.0.0:8080"], "php": {} }"#;
+    let json = r#"{ "listen": "0.0.0.0:8080", "php": {} }"#;
     let result: Result<Config, _> = serde_json::from_str(json);
     assert!(result.is_err(), "php.user/group/limits/... are required");
 }
@@ -162,7 +162,7 @@ fn rejects_php_route_with_no_target() {
 fn base_config_json(routes: &str, targets: &str) -> String {
     format!(
         r#"{{
-          "listen": ["0.0.0.0:8080"],
+          "listen": "0.0.0.0:8080",
           "routes": [{routes}],
           "php": {{
             "user": "phpapp",
@@ -505,7 +505,7 @@ fn validate_rejects_an_out_of_range_return_status() {
 fn config_json(php_extra: &str, top_level_extra: &str) -> String {
     format!(
         r#"{{
-          "listen": ["0.0.0.0:8080"],
+          "listen": "0.0.0.0:8080",
           {top_level_extra}
           "php": {{
             {php_extra}
@@ -612,21 +612,20 @@ fn substitute_env_does_not_recursively_expand_a_substituted_value() {
 
 #[test]
 fn substitute_env_leaves_a_bare_dollar_sign_untouched() {
-    let result =
-        substitute_env("$HOME and $PATH stay literal").expect("no placeholder to fail on");
+    let result = substitute_env("$HOME and $PATH stay literal").expect("no placeholder to fail on");
     assert_eq!(result, "$HOME and $PATH stay literal");
 }
 
 #[test]
 fn parse_leaves_text_without_placeholders_untouched() {
     let cfg = parse(&minimal_config_json("")).expect("should parse");
-    assert_eq!(cfg.listen, vec!["0.0.0.0:8080"]);
+    assert_eq!(cfg.listen, "0.0.0.0:8080");
 }
 
 #[test]
 fn parse_does_not_mistake_uri_regex_syntax_for_a_placeholder() {
     let json = r#"{
-      "listen": ["0.0.0.0:8080"],
+      "listen": "0.0.0.0:8080",
       "routes": [
         { "match": { "uri": ["~\\.php$"] }, "action": "return", "status": 403 }
       ],
@@ -650,6 +649,23 @@ fn parse_errors_still_report_a_line_and_column() {
     assert!(
         err.contains("line") && err.contains("column"),
         "unexpected error (no location?): {err}"
+    );
+}
+
+/// A spare floor above the pool's own ceiling could never be satisfied.
+#[test]
+fn validate_rejects_spare_exceeding_max() {
+    let json = minimal_config_json("").replace(
+        r#""processes": { "max": 20, "spare": 4 }"#,
+        r#""processes": { "max": 4, "spare": 20 }"#,
+    );
+    let cfg = parse(&json).expect("should parse");
+    let errors = validate(&cfg);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("spare") && e.contains("max")),
+        "expected a spare-exceeds-max error, got: {errors:?}"
     );
 }
 
@@ -684,6 +700,46 @@ fn connection_timeouts_default_when_the_whole_block_is_absent() {
         validate(&cfg).is_empty(),
         "the defaults must themselves be valid"
     );
+}
+
+/// Absent, this must default to `Info`, matching `logging::MIN_LEVEL`'s own
+/// compile-time default - an operator who never sets it must see the same
+/// verbosity as before this field existed.
+#[test]
+fn log_level_defaults_to_info_when_absent() {
+    let cfg = parse(&minimal_config_json("")).expect("should parse");
+    assert_eq!(cfg.log_level, LogLevel::Info);
+    assert_eq!(cfg.log_level.as_level(), crate::logging::level::INFO);
+}
+
+/// Each named level must reach the matching numeric ordinal the logging
+/// macros compare against, or a config asking for `"warn"` could silently
+/// run at some other verbosity.
+#[test]
+fn log_level_parses_every_named_value() {
+    for (name, level, ordinal) in [
+        ("debug", LogLevel::Debug, crate::logging::level::DEBUG),
+        ("info", LogLevel::Info, crate::logging::level::INFO),
+        ("warn", LogLevel::Warn, crate::logging::level::WARN),
+        ("error", LogLevel::Error, crate::logging::level::ERROR),
+    ] {
+        let json = config_json("", &format!(r#""log_level": "{name}","#));
+        let cfg = parse(&json).unwrap_or_else(|e| panic!("{name} should parse: {e}"));
+        assert_eq!(cfg.log_level, level, "got the wrong variant for {name:?}");
+        assert_eq!(
+            cfg.log_level.as_level(),
+            ordinal,
+            "wrong ordinal for {name:?}"
+        );
+    }
+}
+
+/// An unrecognised level must fail to parse rather than silently fall back to
+/// a default - a typo in config should never pass as "just use info".
+#[test]
+fn log_level_rejects_an_unknown_value() {
+    let json = config_json("", r#""log_level": "verbose","#);
+    assert!(parse(&json).is_err(), "an unknown log level must not parse");
 }
 
 /// Omitted, it must land on the generous default: a short one makes a cold

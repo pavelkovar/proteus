@@ -1,5 +1,3 @@
-//! Control plane (this module) and data plane (`data`).
-
 pub mod control;
 pub mod data;
 pub mod shm;

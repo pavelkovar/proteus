@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::io::Write as _;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::time::Duration;
 
@@ -18,8 +18,17 @@ pub(crate) mod level {
     pub(crate) const ERROR: u8 = 40;
 }
 
+static MIN_LEVEL: AtomicU8 = AtomicU8::new(level::INFO);
+
 #[doc(hidden)]
-pub(crate) const MIN_LEVEL: u8 = level::INFO;
+pub(crate) fn set_min_level(level: u8) {
+    MIN_LEVEL.store(level, Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub(crate) fn min_level() -> u8 {
+    MIN_LEVEL.load(Ordering::Relaxed)
+}
 
 const MAX_BATCH: usize = 4096;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
@@ -232,7 +241,7 @@ pub(crate) fn finish_bare(mut out: Vec<u8>) {
 
 macro_rules! log_line {
     ($ordinal:expr, $level:literal; $($rest:tt)*) => {{
-        if $ordinal >= $crate::logging::MIN_LEVEL {
+        if $ordinal >= $crate::logging::min_level() {
             let mut line = $crate::logging::begin($level);
             $crate::logging::log_line!(@field line; $($rest)*)
         }

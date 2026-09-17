@@ -11,17 +11,14 @@ mod range;
 mod rate_limit;
 mod response;
 mod routing;
-mod shutdown;
 
-use access_log::{BodyOutcome, GuardedBody, PendingAccessLog};
+use access_log::{GuardedBody, PendingAccessLog};
 use conditional::*;
 use connection::{ConnBusyGuard, ConnState, ConnTimeouts, wait_until_idle};
 use proxy::*;
 use rate_limit::RateLimiter;
 use response::*;
 use routing::*;
-pub use shutdown::Shutdown;
-use shutdown::wait_for_shutdown_signal;
 
 use crate::config::{Config, RouteActionConfig};
 use crate::logging;
@@ -103,7 +100,6 @@ impl Ending {
         action: &'static str,
         worker_pid: u32,
         php_target: Option<Arc<str>>,
-        outcome: BodyOutcome,
     ) -> Handled {
         let log = PendingAccessLog {
             client_ip: self.client_ip,
@@ -121,16 +117,16 @@ impl Ending {
                 _guard: self.in_flight,
                 _conn: self.conn_busy,
                 log: Some(log),
-                outcome,
+                bytes_sent: 0,
             }
             .boxed()
         }))
     }
 
     /// A refusal `handle` built itself, so no worker and no target were
-    /// involved and the body is already complete.
+    /// involved.
     fn reject(self, resp: Response<ResponseBody>, action: &'static str) -> Handled {
-        self.finish(resp, action, 0, None, BodyOutcome::Complete)
+        self.finish(resp, action, 0, None)
     }
 
     /// The plain-text case, where nothing but the status and the message vary.
@@ -306,15 +302,7 @@ async fn handle(
             headers,
         } => build_response(status, body, &headers),
     };
-    // `Aborted` until proven otherwise, so a body dropped before its end
-    // records the client hanging up.
-    ending.finish(
-        resp,
-        log_action,
-        worker_pid,
-        php_target,
-        BodyOutcome::Aborted,
-    )
+    ending.finish(resp, log_action, worker_pid, php_target)
 }
 
 /// Holds the connection in the kernel until the request arrives, so a peer
@@ -370,30 +358,19 @@ pub fn reuseport_listener(listen: &str) -> std::io::Result<std::net::TcpListener
     Ok(sock.into())
 }
 
-/// Accepts on this core's own share of every listening address and serves what
-/// it accepts, all on one thread. Distributing connections in user space
-/// instead measured no better and cost a cross-thread handoff.
+/// Accepts on this core's own reuseport share of the listening address and
+/// serves what it accepts, all on one thread. Distributing connections in
+/// user space instead measured no better and cost a cross-thread handoff.
 pub async fn serve_core(
-    listeners: Vec<(std::net::TcpListener, Arc<str>)>,
+    listener: (std::net::TcpListener, Arc<str>),
     state: Arc<AppState>,
     shutdown: Shutdown,
     exit: Shutdown,
     connection_slots: Arc<tokio::sync::Semaphore>,
 ) {
-    let mut accepting = Vec::with_capacity(listeners.len());
-    for (listener, listen_addr) in listeners {
-        accepting.push(tokio::spawn(accept_loop(
-            listener,
-            listen_addr,
-            Arc::clone(&state),
-            shutdown.clone(),
-            Arc::clone(&connection_slots),
-        )));
-    }
-    for task in accepting {
-        let _ = task.await;
-    }
-    // Connections outlive the accept loops: dropping this runtime drops their
+    let (listener, listen_addr) = listener;
+    accept_loop(listener, listen_addr, state, shutdown, connection_slots).await;
+    // Connections outlive the accept loop: dropping this runtime drops their
     // tasks, so it has to stay until master says the drain is over.
     let mut exit = exit;
     exit.wait().await;
@@ -588,6 +565,40 @@ pub async fn serve_control(state: Arc<AppState>, shutdown: tokio::sync::watch::S
             r#type = "controller",
             "all in-flight requests finished, exiting cleanly"
         );
+    }
+}
+
+/// SIGTERM (systemd/docker/k8s graceful stop) or SIGINT (Ctrl-C) - same
+/// drain either way.
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    tokio::select! {
+        _ = sigterm.recv() => logging::info!(r#type = "controller", "received SIGTERM"),
+        _ = sigint.recv() => logging::info!(r#type = "controller", "received SIGINT"),
+    }
+}
+
+/// A latched signal: `notify_waiters` would wake only whoever is already
+/// waiting, and an accept loop that missed it would never return - which master
+/// joins on before it exits.
+#[derive(Clone)]
+pub struct Shutdown(tokio::sync::watch::Receiver<bool>);
+
+impl Shutdown {
+    pub fn channel() -> (tokio::sync::watch::Sender<bool>, Shutdown) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (tx, Shutdown(rx))
+    }
+
+    /// Returns at once if it has already fired.
+    pub async fn wait(&mut self) {
+        while !*self.0.borrow_and_update() {
+            if self.0.changed().await.is_err() {
+                return; // sender gone: nothing left to serve either
+            }
+        }
     }
 }
 

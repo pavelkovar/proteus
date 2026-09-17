@@ -45,7 +45,7 @@ fn substitute_env(text: &str) -> Result<String, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub listen: Vec<String>,
+    pub listen: String,
     #[serde(default)]
     pub routes: Vec<Route>,
     pub php: PhpConfig,
@@ -69,6 +69,29 @@ pub struct Config {
     /// `None` (the default) disables rate limiting entirely.
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    #[serde(default)]
+    pub log_level: LogLevel,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub(crate) fn as_level(self) -> u8 {
+        match self {
+            LogLevel::Debug => crate::logging::level::DEBUG,
+            LogLevel::Info => crate::logging::level::INFO,
+            LogLevel::Warn => crate::logging::level::WARN,
+            LogLevel::Error => crate::logging::level::ERROR,
+        }
+    }
 }
 
 /// Per-client-IP request cap, scoped by `user_agent` so it can target only

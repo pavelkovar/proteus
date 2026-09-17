@@ -36,6 +36,8 @@ pub(crate) struct ProtoConfig {
     pub(crate) options: PhpOptions,
     #[serde(default)]
     pub(crate) environment: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) log_level: u8,
 }
 
 /// Not a privilege check: it makes a manual invocation fail loudly rather
@@ -78,7 +80,9 @@ pub fn run() -> ! {
         idle_timeout_seconds,
         options: proto_options,
         environment: proto_environment,
+        log_level,
     } = proto_config;
+    logging::set_min_level(log_level);
     let idle_timeout =
         (idle_timeout_seconds > 0).then(|| std::time::Duration::from_secs(idle_timeout_seconds));
 
@@ -136,7 +140,7 @@ pub fn run() -> ! {
         };
 
         if cmd != control::SPAWN {
-            logging::warn!(r#type = "prototype", command = ?cmd, "unknown control command");
+            logging::error!(r#type = "prototype", command = ?cmd, "unknown control command");
             continue;
         }
 

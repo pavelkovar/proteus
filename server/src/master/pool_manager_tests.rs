@@ -385,6 +385,35 @@ async fn reusing_a_pid_that_was_never_reaped_gives_its_seat_back() {
     reap_tracked_prototype(&pool);
 }
 
+/// A crash loop must not turn into a fork() storm: a respawn attempt inside
+/// its own backoff window has to bail before ever touching `prototype::spawn`,
+/// not just eventually fail once it gets there.
+#[tokio::test]
+async fn try_respawn_prototype_backs_off_within_its_own_window() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    {
+        let mut backoff = pool.respawn_backoff.lock().await;
+        // Just attempted, 0 prior failures -> a 1s window that this test's
+        // own execution can't outlast.
+        backoff.last_attempt = Some(Instant::now());
+        backoff.consecutive_failures = 0;
+    }
+
+    let respawned = pool.try_respawn_prototype().await;
+
+    assert!(
+        !respawned,
+        "a respawn attempt within the backoff window must be refused"
+    );
+    assert_eq!(pool.counters.crash_loop_backoffs.load(Relaxed), 1);
+    assert_eq!(
+        pool.counters.prototype_respawns.load(Relaxed),
+        0,
+        "the backoff gate must fire before any real spawn is attempted"
+    );
+    reap_tracked_prototype(&pool);
+}
+
 /// Blocks until `pid` is a zombie, or gives up. Nothing in these tests reaps,
 /// so a delivered SIGKILL leaves the corpse visible.
 async fn became_a_zombie(pid: i32) -> bool {

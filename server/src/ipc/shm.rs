@@ -441,7 +441,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         // writer may be filling zeroes live data, while skipping costs only
         // residency. A necessary condition, not a proof - see the safety note.
         if self.write_pos.load(Ordering::Relaxed) != read_pos {
-            logging::warn!(
+            logging::debug!(
                 r#type = "controller",
                 "skipped a ring reclaim: the writer is not idle"
             );
@@ -467,7 +467,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
             })
         };
         if let Err(e) = result {
-            logging::debug!(r#type = "controller", error = %e, "fallocate(FALLOC_FL_PUNCH_HOLE) failed, skipping reclaim");
+            logging::warn!(r#type = "controller", error = %e, "fallocate(FALLOC_FL_PUNCH_HOLE) failed, skipping reclaim");
         }
         // A failed punch costs residency, not correctness, and retrying it
         // would not help.

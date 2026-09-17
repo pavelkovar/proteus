@@ -157,3 +157,32 @@ async fn a_second_headers_run_ends_the_sweep_with_what_it_had() {
         _ => panic!("a second Headers run must not be treated as a normal response"),
     }
 }
+
+/// A frame that isn't valid postcard at all - not merely a well-formed frame
+/// in the wrong place, as the previous test covers, but bytes the decoder
+/// itself rejects. Bytes read before it must still reach the client, exactly
+/// as with any other broken frame.
+#[tokio::test]
+async fn an_undecodable_frame_ends_the_sweep_with_what_it_had() {
+    let (mut channel, worker_side, efd) = channel_pair();
+    write_body(&worker_side, efd, b"before");
+
+    let ring = worker_side.channel();
+    // 3 is not a valid `ResponseFrame` variant tag (0=Headers, 1=Body,
+    // 2=End): postcard must fail decoding it rather than pick one anyway.
+    ring.response
+        .write_frame(&[3], &ring.peer_death, efd)
+        .unwrap();
+
+    match PoolManager::drain_ready(&mut channel) {
+        Drained::Broken { prefix, error } => {
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            let carried: Vec<u8> = prefix.iter().flat_map(|c| c.to_vec()).collect();
+            assert_eq!(
+                carried, b"before",
+                "bytes read before the undecodable frame are lost"
+            );
+        }
+        _ => panic!("an undecodable frame must not be treated as a normal response"),
+    }
+}

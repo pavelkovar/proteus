@@ -73,6 +73,7 @@ fn main() {
         );
     }
 
+    logging::set_min_level(config.log_level.as_level());
     logging::init(true);
     enable_child_subreaper();
 
@@ -137,23 +138,21 @@ async fn run_master(config: Config) {
         tokio::sync::Semaphore::MAX_PERMITS.min(conn_cap)
     }));
 
-    // One runtime per core, each accepting on its own share of every address.
+    // One runtime per core, each accepting its own reuseport share of the
+    // one listening address.
     let (exit_tx, exit) = master::http::Shutdown::channel();
     // All of them before any thread starts: one failing half way through would
     // otherwise leave a process serving on some cores and not others.
-    let mut per_core: Vec<Vec<(std::net::TcpListener, Arc<str>)>> = Vec::with_capacity(cpus.len());
+    let listen_addr: Arc<str> = Arc::from(state.config.listen.as_str());
+    let mut per_core = Vec::with_capacity(cpus.len());
     for _ in &cpus {
-        let mut listeners = Vec::with_capacity(state.config.listen.len());
-        for listen in &state.config.listen {
-            let socket = master::http::reuseport_listener(listen)
-                .unwrap_or_else(|e| panic!("cannot listen on {listen}: {e}"));
-            listeners.push((socket, Arc::from(listen.as_str())));
-        }
-        per_core.push(listeners);
+        let socket = master::http::reuseport_listener(&state.config.listen)
+            .unwrap_or_else(|e| panic!("cannot listen on {}: {e}", state.config.listen));
+        per_core.push((socket, Arc::clone(&listen_addr)));
     }
 
     let mut threads = Vec::with_capacity(cpus.len());
-    for (cpu, listeners) in cpus.iter().copied().zip(per_core) {
+    for (cpu, listener) in cpus.iter().copied().zip(per_core) {
         let state = Arc::clone(&state);
         let shutdown = shutdown.clone();
         let exit = exit.clone();
@@ -167,7 +166,7 @@ async fn run_master(config: Config) {
                 .build()
                 .expect("failed to build a serving runtime");
             rt.block_on(master::http::serve_core(
-                listeners,
+                listener,
                 state,
                 shutdown,
                 exit,
@@ -175,9 +174,7 @@ async fn run_master(config: Config) {
             ));
         }));
     }
-    for listen in &state.config.listen {
-        logging::info!(r#type = "controller", %listen, cores = cpus.len(), "listening");
-    }
+    logging::info!(r#type = "controller", listen = %state.config.listen, cores = cpus.len(), "listening");
 
     master::http::serve_control(state, shutdown_tx).await;
 
