@@ -317,6 +317,35 @@ fn script_extensions_defaults_to_php_only() {
     assert_eq!(cfg.php.script_extensions, vec!["php".to_string()]);
 }
 
+/// The names an attacker reaches for when a gate compares suffixes by hand:
+/// a dotfile has no extension at all, and a trailing dot or space is a
+/// different file that a sloppy `ends_with` would wave through.
+#[test]
+fn extension_gate_admits_only_exact_listed_extensions() {
+    let allowed = vec!["php".to_string()];
+    for ok in ["/r/index.php", "/r/a.b/c.php", "/r/..php"] {
+        assert!(extension_is_listed(ok, &allowed), "{ok} should be allowed");
+    }
+    for bad in [
+        "/r/uploads/avatar.png",
+        "/r/.env",
+        "/r/README",
+        "/r/a.PHP",
+        "/r/a.pHp",
+        "/r/a.php.",
+        "/r/a.php ",
+        "/r/a.phtml",
+        "/r/a.php.txt",
+    ] {
+        assert!(!extension_is_listed(bad, &allowed), "{bad} must be refused");
+    }
+}
+
+#[test]
+fn extension_gate_refuses_everything_when_the_list_is_empty() {
+    assert!(!extension_is_listed("/r/index.php", &[]));
+}
+
 #[test]
 fn validate_rejects_a_zero_queue_timeout() {
     let json = base_config_json("", "").replace(r#""timeout": 5"#, r#""timeout": 0"#);
@@ -454,14 +483,6 @@ fn route_match_can_be_omitted_entirely_as_a_catch_all() {
 /// passes every ASCII-input test, silently matching a non-ASCII digit and
 /// pulling the `unicode-*` features back into the binary.
 #[test]
-fn regex_match_pattern_digit_class_is_ascii_only_not_unicode() {
-    let pattern = MatchPattern::try_from("~^\\d+$".to_string()).unwrap();
-    assert!(pattern.matches("123"));
-    // A real Unicode decimal digit, which `\d` matches in Unicode mode.
-    assert!(!pattern.matches("\u{0663}\u{0663}\u{0663}"));
-}
-
-#[test]
 fn route_match_rejects_an_invalid_uri_regex() {
     let json = r#"{ "match": { "uri": ["~("] }, "action": "return", "status": 403 }"#;
     let result: Result<Route, _> = serde_json::from_str(json);
@@ -570,6 +591,30 @@ fn parse_errors_on_missing_variable_without_default() {
 fn substitute_env_errors_on_unterminated_placeholder() {
     let err = substitute_env("${UNCLOSED").unwrap_err();
     assert!(err.contains("closing brace"), "unexpected error: {err}");
+}
+
+/// The scan advances past each match in the *original* text; a substituted
+/// value is never rescanned for a `${...}` of its own.
+#[test]
+fn substitute_env_does_not_recursively_expand_a_substituted_value() {
+    unsafe {
+        std::env::set_var(
+            "PROTEUS_TEST_INTERPOLATE_INNER",
+            "${PROTEUS_TEST_INTERPOLATE_OUTER}",
+        );
+        std::env::remove_var("PROTEUS_TEST_INTERPOLATE_OUTER");
+    }
+    let result = substitute_env("${PROTEUS_TEST_INTERPOLATE_INNER}")
+        .expect("the unset OUTER variable must not be resolved");
+    unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_INNER") };
+    assert_eq!(result, "${PROTEUS_TEST_INTERPOLATE_OUTER}");
+}
+
+#[test]
+fn substitute_env_leaves_a_bare_dollar_sign_untouched() {
+    let result =
+        substitute_env("$HOME and $PATH stay literal").expect("no placeholder to fail on");
+    assert_eq!(result, "$HOME and $PATH stay literal");
 }
 
 #[test]

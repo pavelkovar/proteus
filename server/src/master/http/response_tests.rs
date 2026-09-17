@@ -60,3 +60,33 @@ fn a_header_with_an_invalid_byte_is_dropped_rather_than_panicking() {
         "a header queued after the bad one must still survive"
     );
 }
+
+/// Framing always comes from the real body: forwarding a script's own
+/// `Content-Length` desyncs the client, or a reused connection's next
+/// response, the moment the two disagree.
+#[test]
+fn framing_headers_from_a_php_script_are_never_forwarded() {
+    let mut headers = HeaderBlob::default();
+    headers.push("Content-Length", "999999");
+    headers.push("Transfer-Encoding", "chunked");
+    headers.push("Connection", "keep-alive");
+    headers.push("X-Custom", "kept");
+    let resp = build_response(StatusCode::OK, b"hello".to_vec(), &headers);
+    assert!(
+        resp.headers().get("content-length").is_none(),
+        "a script-set Content-Length must never reach the client"
+    );
+    assert!(
+        resp.headers().get("transfer-encoding").is_none(),
+        "a script-set Transfer-Encoding must never reach the client"
+    );
+    assert!(
+        resp.headers().get("connection").is_none(),
+        "a script-set Connection must never reach the client"
+    );
+    assert_eq!(
+        resp.headers().get("x-custom").unwrap(),
+        "kept",
+        "non-framing headers must still pass through untouched"
+    );
+}

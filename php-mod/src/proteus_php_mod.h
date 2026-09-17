@@ -27,11 +27,9 @@ int proteus_php_mod_init(
     const char *const *user_entries, size_t user_count
 );
 
-/* The response streams through this rather than being buffered. Fired in
- * order per request: one HEADERS, any number of BODY, exactly one END -
- * early if the script called fastcgi_finish_request(), after which it keeps
- * running in the same call. `status` is meaningful only for HEADERS, and
- * `data` is borrowed for the duration of the call. */
+/* Streams through this, fired in order per request: one HEADERS, any BODY,
+ * exactly one END - early if the script called fastcgi_finish_request(),
+ * which then keeps running. `data` is borrowed for the call's duration. */
 typedef enum {
     PROTEUS_PHP_MOD_CHUNK_HEADERS = 1,
     PROTEUS_PHP_MOD_CHUNK_BODY = 2,

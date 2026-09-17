@@ -1,21 +1,18 @@
 //! Prototype lifecycle and the worker pool: how the pool stays populated,
 //! not what happens to one request.
 //!
-//! Retirement is deliberately split across both processes: a worker times
-//! its own idle period, and master holds the `spare` floor, because neither
-//! knows on its own both how long a worker has been idle and whether the
-//! pool can afford to lose it.
+//! Retirement is split across both processes: a worker times its own idle
+//! period, and master holds the `spare` floor - neither alone knows both
+//! how long a worker has been idle and whether the pool can afford to lose it.
 
-use super::prototype_launch;
-use super::worker_channel::WorkerChannel;
+use worker_channel::WorkerChannel;
+
 use crate::config::Config;
-use crate::gauge::Gauge;
 use crate::ipc::control;
 use crate::logging;
 use crate::prototype::ProtoConfig;
-use nix::errno::Errno;
+use crate::utils::gauge::Gauge;
 use nix::sys::signal::{Signal, kill};
-use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -72,8 +69,8 @@ pub struct PoolManager {
     /// `php.targets` names, kept sorted for a stable `/status`.
     target_names: Vec<String>,
     pub(crate) counters: Counters,
-    prototype_child: StdMutex<PrototypeHandle>,
-    prototype_spec: prototype_launch::PrototypeSpec,
+    prototype_child: StdMutex<Handle>,
+    prototype_spec: prototype::Spec,
     /// tokio mutex: the guard is held across an `.await`.
     respawn_backoff: Mutex<RespawnBackoff>,
     /// Presence doubles as "still one of ours". Off the request path, which
@@ -169,76 +166,6 @@ impl WorkerMeta {
     }
 }
 
-/// The prototype's pid and everything that may be done to it.
-///
-/// A pid rather than a `std::process::Child`: master reaps through
-/// `waitpid(-1)`, which a `Child::wait` would race for the status.
-///
-/// An unreaped pid cannot be recycled, so signalling it stays safe until
-/// something reaps it - which is what `reaped` tracks.
-struct PrototypeHandle {
-    pid: u32,
-    reaped: bool,
-}
-
-impl PrototypeHandle {
-    fn new(pid: u32) -> Self {
-        PrototypeHandle { pid, reaped: false }
-    }
-
-    fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// `None` once reaped: the only safe answer to what may be signalled.
-    fn live_pid(&self) -> Option<u32> {
-        (!self.reaped).then_some(self.pid)
-    }
-
-    /// Records a reaped child, reporting whether it was the prototype.
-    fn note_exit(&mut self, pid: u32, status: WaitStatus) -> bool {
-        if self.reaped || pid != self.pid {
-            return false;
-        }
-        self.reaped = true;
-        log_prototype_death(pid, status);
-        true
-    }
-
-    /// Its workers need no separate kill: they follow via `PR_SET_PDEATHSIG`.
-    fn kill(&self, context: &str) {
-        if let Some(pid) = self.live_pid() {
-            sigkill(pid, context);
-        }
-    }
-
-    /// Kills and reaps whatever it replaces: not every respawn follows a
-    /// death, and forgetting a wedged prototype's pid leaves it orphaned with
-    /// its whole PHP heap, tracked by nothing.
-    ///
-    /// Reaps before killing, so a death that already happened keeps the status
-    /// that explains it instead of reporting SIGKILL.
-    fn replace(&mut self, new_pid: u32) {
-        if let Some(pid) = self.live_pid() {
-            match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
-                Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
-                    log_prototype_death(pid, status);
-                }
-                // Reaped by something else, so the pid may name an unrelated
-                // process by now.
-                Err(Errno::ECHILD) => {}
-                // A failed wait included: an unkilled prototype is the one
-                // outcome that leaks a PHP heap.
-                _ => {
-                    sigkill(pid, "replacing a prototype that is still running");
-                    let _ = waitpid(Pid::from_raw(pid as i32), None);
-                }
-            }
-        }
-        *self = PrototypeHandle::new(new_pid);
-    }
-}
-
 /// Exponential: a bad php-mod path or config will not fix itself by being
 /// retried faster.
 fn respawn_backoff_delay(consecutive_failures: u32) -> Duration {
@@ -297,29 +224,6 @@ pub(crate) fn sigkill(pid: u32, context: &str) {
     }
 }
 
-fn log_prototype_death(pid: u32, status: WaitStatus) {
-    match status {
-        WaitStatus::Exited(_, code) => {
-            logging::error!(
-                r#type = "controller",
-                pid,
-                exit_code = code,
-                "prototype exited"
-            )
-        }
-        WaitStatus::Signaled(_, signal, core_dumped) => logging::error!(
-            r#type = "controller",
-            pid,
-            signal = signal.as_str(),
-            core_dumped,
-            "prototype was killed by a signal"
-        ),
-        other => {
-            logging::error!(r#type = "controller", pid, status = ?other, "prototype stopped")
-        }
-    }
-}
-
 /// Installed where the dynamic linker already looks, so a bare `dlopen()`
 /// finds it; `PROTEUS_PHP_MOD_PATH` overrides with an absolute path.
 fn resolve_php_mod_path() -> String {
@@ -370,7 +274,7 @@ impl PoolManager {
             )
         });
 
-        let spec = prototype_launch::PrototypeSpec {
+        let spec = prototype::Spec {
             config: ProtoConfig {
                 php_mod_path: resolve_php_mod_path(),
                 max_requests: cfg.php.limits.requests,
@@ -382,7 +286,7 @@ impl PoolManager {
             no_new_privs: cfg.php.no_new_privs,
         };
         let (control, prototype_pid) =
-            prototype_launch::spawn(&spec).expect("failed to spawn prototype");
+            prototype::spawn(&spec).expect("failed to spawn prototype");
         logging::info!(
             r#type = "controller",
             pid = prototype_pid,
@@ -412,7 +316,7 @@ impl PoolManager {
                 names
             },
             counters: Counters::default(),
-            prototype_child: StdMutex::new(PrototypeHandle::new(prototype_pid)),
+            prototype_child: StdMutex::new(Handle::new(prototype_pid)),
             prototype_spec: spec,
             respawn_backoff: Mutex::new(RespawnBackoff::default()),
             workers: StdMutex::new(HashMap::new()),
@@ -440,9 +344,9 @@ impl PoolManager {
         );
         // fork()+exec() blocks, and this one runs while the pool is live.
         let spec = self.prototype_spec.clone();
-        let spawn_result = tokio::task::spawn_blocking(move || prototype_launch::spawn(&spec))
+        let spawn_result = tokio::task::spawn_blocking(move || prototype::spawn(&spec))
             .await
-            .expect("prototype_launch::spawn blocking task panicked");
+            .expect("prototype::spawn blocking task panicked");
         match spawn_result {
             Ok((new_control, new_pid)) => {
                 *self.control.lock().await = new_control;
@@ -782,9 +686,11 @@ impl PoolManager {
     }
 }
 
-#[path = "pool_manager_dispatch.rs"]
 mod dispatch;
+mod prototype;
+mod worker_channel;
 pub(crate) use dispatch::{BodyStream, DispatchOutcome};
+use prototype::Handle;
 
 #[cfg(test)]
 #[path = "pool_manager_tests.rs"]

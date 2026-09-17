@@ -7,7 +7,7 @@ pub mod php_ffi;
 use crate::config::PhpOptions;
 use crate::ipc::{CONFIG_FD, CONTROL_FD, control, shm};
 use crate::logging;
-use crate::proctitle;
+use crate::utils::proctitle;
 use crate::worker;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, getsockopt, socketpair, sockopt};
 use nix::unistd::{ForkResult, fork};

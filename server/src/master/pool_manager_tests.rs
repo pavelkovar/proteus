@@ -1,4 +1,5 @@
 use super::*;
+use nix::sys::wait::{WaitStatus, waitpid};
 
 /// How many workers the fixture pool admits; the lifecycle tests lean on the
 /// seat coming back, so they need room for more than one at a time.
@@ -25,8 +26,8 @@ fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
         started_at: Instant::now(),
         target_names: Vec::new(),
         counters: Counters::default(),
-        prototype_child: StdMutex::new(PrototypeHandle::new(prototype_pid)),
-        prototype_spec: prototype_launch::PrototypeSpec {
+        prototype_child: StdMutex::new(Handle::new(prototype_pid)),
+        prototype_spec: prototype::Spec {
             config: ProtoConfig::default(),
             drop_to: None,
             no_new_privs: true,
@@ -274,7 +275,7 @@ fn unused_link() -> std::os::fd::OwnedFd {
 fn idle_worker(pool: &PoolManager, pid: u32, retired: bool) -> PooledWorker {
     let (fd, _worker_side) = crate::ipc::shm::create_channel().unwrap();
     let mapped = crate::ipc::shm::map_existing_channel(fd).unwrap();
-    let channel = crate::master::worker_channel::WorkerChannel::for_test(
+    let channel = crate::master::pool_manager::worker_channel::WorkerChannel::for_test(
         pid,
         Arc::new(mapped),
         crate::ipc::shm::NotifyEfds {

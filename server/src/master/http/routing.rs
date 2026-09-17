@@ -2,13 +2,13 @@
 //! and PHP target resolution.
 
 use super::AppState;
-use super::fs_cache::{FsCache, FsKind};
 use super::php_dispatch::{build_php_request, dispatch_php};
 use super::proxy::ClientIdentity;
 use crate::config::{Config, RouteActionConfig, extension_is_listed};
 use crate::ipc::data::HeaderBlob;
 use crate::logging;
 use crate::master::pool_manager::BodyStream;
+use crate::utils::fs_cache::{FsCache, FsKind};
 use hyper::body::Incoming;
 use hyper::{Request, StatusCode};
 use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
@@ -131,9 +131,8 @@ pub(crate) enum PathDecodeError {
     /// A `%` not followed by two hex digits.
     Malformed,
     /// Decoding these would let a client invent path segments after routing
-    /// and traversal checks had run on a different shape of path. Rejecting
-    /// beats leaving them encoded, which gives PHP a `PATH_INFO` disagreeing
-    /// with the file actually opened.
+    /// and traversal checks already ran on a different path shape. Rejected,
+    /// not left encoded, which would desync PHP's `PATH_INFO` from the file.
     EncodedSeparator,
     /// Would truncate any C string built from it downstream.
     Nul,
@@ -411,8 +410,7 @@ pub(crate) async fn stat_kind(fs_cache: &FsCache, path: &std::path::Path) -> FsK
 
 /// URL maps to a `.php` under `root`, with `index` appended for
 /// directory-style requests and trailing segments becoming PATH_INFO. Serves
-/// `index` directly rather than redirecting a directory to its trailing
-/// slash.
+/// `index` directly, not via a redirect to its trailing slash.
 async fn resolve_index_target(
     fs_cache: &FsCache,
     root: &str,
@@ -501,3 +499,7 @@ async fn resolve_script(state: &AppState, name: &str, url_path: &str) -> Option<
     // cannot forget a check it does not perform itself.
     resolved.filter(|r| extension_is_listed(&r.script_path, allowed))
 }
+
+#[cfg(test)]
+#[path = "routing_tests.rs"]
+mod tests;

@@ -58,10 +58,9 @@ fn buffered_body(bytes: Vec<u8>) -> ResponseBody {
         .boxed()
 }
 
-/// Message-framing headers are master's alone to set. A script-set
-/// Content-Length that disagrees with the real body does not merely corrupt
-/// this response - it desyncs whatever the client reads next off a reused
-/// connection.
+/// Message-framing headers are master's alone to set: a script-set
+/// Content-Length that disagrees with the real body desyncs whatever the
+/// client reads next off a reused connection, not just this response.
 fn is_framing_header(name: &str) -> bool {
     name.eq_ignore_ascii_case("content-length")
         || name.eq_ignore_ascii_case("transfer-encoding")
@@ -71,12 +70,9 @@ fn is_framing_header(name: &str) -> bool {
 /// Appends rather than inserting, so repeated names such as `Set-Cookie`
 /// all survive.
 ///
-/// A script can put arbitrary bytes into a header via `header()`, which only
-/// rejects embedded CR/LF - not, say, other control characters that are
-/// still invalid HTTP grammar. `builder.header()` would silently poison every
-/// header queued after a bad one until `.body()` surfaces one accumulated
-/// error, so a name/value that cannot become valid HTTP is dropped here
-/// instead, individually, before it ever reaches the builder.
+/// PHP's `header()` only rejects embedded CR/LF, not other bytes still
+/// invalid HTTP grammar; `builder.header()` would silently poison every
+/// header queued after a bad one, so invalid ones are dropped here instead.
 fn apply_headers(
     mut builder: hyper::http::response::Builder,
     headers: &HeaderBlob<'_>,
@@ -124,10 +120,9 @@ pub(crate) struct CompressionParams<'a> {
 /// `meta` must come from the same `stat` that opened `file`; an fd stays
 /// valid regardless of what happens to the path afterwards.
 ///
-/// The encoding is decided up front so a 304's ETag matches this
-/// negotiation. `Range` always serves identity bytes, a range being
-/// meaningless against anything but a fixed representation, so a compressed
-/// 200 never advertises `Accept-Ranges`.
+/// The encoding is decided up front so a 304's ETag matches it. `Range` only
+/// makes sense against a fixed representation, so it always serves identity
+/// bytes and a compressed 200 never advertises `Accept-Ranges`.
 ///
 /// A HEAD sends GET's headers but must not build the body: `compressed_body`
 /// starts its blocking-pool task the instant it is called, and hyper would
@@ -247,9 +242,8 @@ pub(crate) async fn build_static_response(
 }
 
 /// The body may still be arriving, so eligibility is decided from
-/// Content-Type alone and every frame is forwarded as it comes. This never
-/// delays headers or early chunks, at the price of occasionally compressing
-/// a response that turns out to be tiny.
+/// Content-Type alone, never delaying headers - at the price of sometimes
+/// compressing a response that turns out to be tiny.
 pub(crate) fn build_php_stream_response(
     status: StatusCode,
     headers: &HeaderBlob<'_>,

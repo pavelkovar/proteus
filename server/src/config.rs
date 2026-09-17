@@ -1,5 +1,6 @@
 //! JSON configuration schema.
 
+use crate::utils::match_pattern::{MatchPattern, matches_any};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,9 +60,8 @@ pub struct Config {
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
     /// CIDRs of the direct TCP peers whose `X-Forwarded-*` is believed; empty
-    /// (the default) believes none of them. An entry grants everything it
-    /// covers the power to name the client identity behind it, so list the
-    /// proxy's own addresses as narrowly as they are known.
+    /// (default) trusts none. An entry lets everything it covers name the
+    /// client identity, so list proxy addresses as narrowly as known.
     #[serde(default)]
     pub trusted_proxies: Vec<ipnetwork::IpNetwork>,
     #[serde(default)]
@@ -87,35 +87,26 @@ pub struct RateLimitConfig {
     pub user_agent: Vec<MatchPattern>,
 }
 
-/// Caps on what one client can tie up before ever reaching a worker.
-///
-/// The `php.queue` and `php.processes` limits bound work already accepted. A
-/// connection commits a task, a socket buffer and, once a body arrives, heap
-/// and then temp space up to `max_body_size` - all before either limit sees it.
+/// Caps on what one client can tie up before ever reaching a worker - the
+/// `php.queue`/`php.processes` limits bound only work already accepted.
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct ConnectionConfig {
     /// Concurrently open connections; 0 disables the cap. Set well above
     /// real sustained use, but low enough that a flood hits a bounded
     /// refusal rather than the process's fd limit or its memory.
-    #[serde(default = "default_max_connections")]
     pub max: usize,
     /// How long a connection may take to send its complete request head. The
     /// slowloris defence: a client dribbling a byte at a time otherwise holds
     /// a slot forever, having sent nothing the server could act on.
-    #[serde(default = "default_header_read_timeout")]
     pub header_read_timeout: u64,
     /// How long a connection may sit with no request in flight; 0 disables.
-    ///
     /// Without this the connection cap becomes its own denial of service, an
-    /// attacker filling every slot with keep-alives that completed one cheap
-    /// request and then went quiet. Set just above the keep-alive most
-    /// clients and load balancers use, so ordinary reuse is never cut off.
-    #[serde(default = "default_connection_idle_timeout")]
+    /// attacker filling every slot with keep-alives gone quiet.
     pub idle_timeout: u64,
     /// How long a request body may stall between reads; 0 disables. Bounds
     /// the gap, never the whole upload, so a slow but honest client still
     /// completes.
-    #[serde(default = "default_body_read_timeout")]
     pub body_read_timeout: u64,
 }
 
@@ -124,29 +115,14 @@ pub struct ConnectionConfig {
 /// outgrow `RLIMIT_NOFILE`, which has to be raised alongside it.
 const MAX_CONNECTIONS_PER_CORE: usize = 512;
 
-fn default_max_connections() -> usize {
-    std::thread::available_parallelism().map_or(1, |n| n.get()) * MAX_CONNECTIONS_PER_CORE
-}
-
-fn default_header_read_timeout() -> u64 {
-    10
-}
-
-fn default_connection_idle_timeout() -> u64 {
-    65
-}
-
-fn default_body_read_timeout() -> u64 {
-    60
-}
-
 impl Default for ConnectionConfig {
     fn default() -> Self {
         ConnectionConfig {
-            max: default_max_connections(),
-            header_read_timeout: default_header_read_timeout(),
-            idle_timeout: default_connection_idle_timeout(),
-            body_read_timeout: default_body_read_timeout(),
+            max: std::thread::available_parallelism().map_or(1, |n| n.get())
+                * MAX_CONNECTIONS_PER_CORE,
+            header_read_timeout: 10,
+            idle_timeout: 65,
+            body_read_timeout: 60,
         }
     }
 }
@@ -213,137 +189,6 @@ impl RouteMatch {
     }
 }
 
-/// Matches if no non-negated pattern exists or one hits, and no negated
-/// pattern hits.
-pub(crate) fn matches_any(patterns: &[MatchPattern], value: &str) -> bool {
-    let mut has_positive = false;
-    let mut positive_matched = false;
-    for pattern in patterns {
-        if let MatchPattern::Not(inner) = pattern {
-            if inner.matches(value) {
-                return false;
-            }
-        } else {
-            has_positive = true;
-            positive_matched = positive_matched || pattern.matches(value);
-        }
-    }
-    !has_positive || positive_matched
-}
-
-/// `~pattern` is a regex, which is linear-time and so safe on hostile input;
-/// anything else is a glob. A leading `!` negates. Compiled once at load.
-#[derive(Debug)]
-pub enum MatchPattern {
-    /// No `*`.
-    Exact(String),
-    /// Matches anything.
-    Any,
-    /// `min_length` lets a short value be rejected in O(1).
-    Glob {
-        leading: bool,
-        trailing: bool,
-        parts: Vec<String>,
-        min_length: usize,
-    },
-    Regex(regex::Regex),
-    Not(Box<MatchPattern>),
-}
-
-impl MatchPattern {
-    pub(crate) fn matches(&self, value: &str) -> bool {
-        match self {
-            MatchPattern::Exact(s) => value == s,
-            MatchPattern::Any => true,
-            MatchPattern::Regex(re) => re.is_match(value),
-            MatchPattern::Not(inner) => !inner.matches(value),
-            MatchPattern::Glob {
-                leading,
-                trailing,
-                parts,
-                min_length,
-            } => {
-                if value.len() < *min_length {
-                    return false;
-                }
-                let last = parts.len() - 1;
-                let mut rest = value;
-                for (i, part) in parts.iter().enumerate() {
-                    if i == 0 && !leading {
-                        match rest.strip_prefix(part.as_str()) {
-                            Some(after) => rest = after,
-                            None => return false,
-                        }
-                    } else if i == last && !trailing {
-                        return rest.ends_with(part.as_str());
-                    } else {
-                        match rest.find(part.as_str()) {
-                            Some(offset) => rest = &rest[offset + part.len()..],
-                            None => return false,
-                        }
-                    }
-                }
-                true
-            }
-        }
-    }
-}
-
-impl TryFrom<String> for MatchPattern {
-    type Error = String;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        // Never matches anything real: a typo, not an intent.
-        if s.is_empty() {
-            return Err("empty match pattern (use \"*\" to match everything)".to_string());
-        }
-        if let Some(rest) = s.strip_prefix('!') {
-            return MatchPattern::try_from(rest.to_string())
-                .map(|p| MatchPattern::Not(Box::new(p)));
-        }
-        if let Some(pattern) = s.strip_prefix('~') {
-            // ASCII-only, which drops the sizeable `unicode-*` features from
-            // the release binary; \d, \w and \s still work.
-            return regex::RegexBuilder::new(pattern)
-                .unicode(false)
-                .build()
-                .map(MatchPattern::Regex)
-                .map_err(|e| format!("invalid match regex {pattern:?}: {e}"));
-        }
-        if !s.contains('*') {
-            return Ok(MatchPattern::Exact(s));
-        }
-        if s.chars().all(|c| c == '*') {
-            return Ok(MatchPattern::Any);
-        }
-        let leading = s.starts_with('*');
-        let trailing = s.ends_with('*');
-        let parts: Vec<String> = s
-            .split('*')
-            .filter(|p| !p.is_empty())
-            .map(String::from)
-            .collect();
-        let min_length = parts.iter().map(String::len).sum();
-        Ok(MatchPattern::Glob {
-            leading,
-            trailing,
-            parts,
-            min_length,
-        })
-    }
-}
-
-impl<'de> Deserialize<'de> for MatchPattern {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        String::deserialize(deserializer)?
-            .try_into()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
     /// Named entrypoints sharing this pool's processes and limits.
@@ -364,8 +209,7 @@ pub struct PhpConfig {
     pub options: PhpOptions,
     /// Extensions a request may execute, as PHP-FPM's
     /// `security.limit_extensions`. Without it an uploaded `.png` holding PHP
-    /// is remote code execution, and any file under a target's root is
-    /// readable through the interpreter that echoes it.
+    /// is remote code execution.
     #[serde(default = "default_script_extensions")]
     pub script_extensions: Vec<String>,
     pub limits: Limits,
@@ -375,9 +219,8 @@ pub struct PhpConfig {
     #[serde(default)]
     pub shutdown: ShutdownConfig,
     /// Refuses privilege gained through `execve`: a setuid binary a script
-    /// shells out to runs as the worker instead. Costs nothing a PHP
-    /// application normally does; the exception is an MTA submission helper
-    /// such as `postdrop`, which `mail()` needs to be setgid.
+    /// shells out to runs as the worker instead. Exception: `mail()` needs
+    /// an MTA submission helper such as `postdrop` to run setgid.
     #[serde(default = "default_true")]
     pub no_new_privs: bool,
 }
@@ -425,17 +268,13 @@ pub struct Processes {
     /// Pre-spawned at startup; idle floor once a worker is claimed.
     pub spare: usize,
     /// A worker retires itself after this long with no request; 0 never.
-    ///
-    /// Enforced by the worker rather than by master timing each idle worker,
-    /// neither of which knows both halves on its own. Master keeps `spare`
-    /// topped up, so the pool settles at the floor, not at zero.
+    /// Enforced by the worker, not master, since master timing each idle
+    /// worker would need state neither side keeps on its own.
     #[serde(default)]
     pub idle_timeout: u64,
     /// How long the prototype may take to answer a spawn request before it
-    /// is treated as wedged. Generous, because the fork is instant but the
-    /// first spawn after a restart waits out the prototype's whole PHP init.
-    /// Its own knob rather than `queue.timeout`, which is sized for how long
-    /// a client should wait.
+    /// is treated as wedged. Its own knob rather than `queue.timeout`, since
+    /// the first spawn after a restart waits out the prototype's PHP init.
     #[serde(default = "default_spawn_timeout")]
     pub spawn_timeout: u64,
 }
@@ -445,146 +284,106 @@ fn default_spawn_timeout() -> u64 {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct QueueConfig {
     /// Requests that may wait for a permit; 0 is unbounded, which under
     /// overload only delays the inevitable 503 while burning memory.
-    #[serde(default = "default_queue_max_depth")]
     pub max_depth: usize,
     /// How long to wait for a permit before a 503.
-    #[serde(default = "default_queue_timeout")]
     pub timeout: u64,
-}
-
-fn default_queue_max_depth() -> usize {
-    512
-}
-
-fn default_queue_timeout() -> u64 {
-    5
 }
 
 impl Default for QueueConfig {
     fn default() -> Self {
         QueueConfig {
-            max_depth: default_queue_max_depth(),
-            timeout: default_queue_timeout(),
+            max_depth: 512,
+            timeout: 5,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct ShutdownConfig {
     /// SIGTERM drain wait: long enough to finish a request, short enough not
     /// to stall a rolling deploy.
-    #[serde(default = "default_shutdown_grace_period_seconds")]
     pub grace_period_seconds: u64,
 }
 
-fn default_shutdown_grace_period_seconds() -> u64 {
-    15
-}
-
-// Not derived: a field-level `serde(default)` fires only when the struct is
-// present and the field missing, not when the whole object is absent.
 impl Default for ShutdownConfig {
     fn default() -> Self {
         ShutdownConfig {
-            grace_period_seconds: default_shutdown_grace_period_seconds(),
+            grace_period_seconds: 15,
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct StatusConfig {
-    /// Defaults to loopback-only.
-    #[serde(default = "default_status_listen")]
     pub listen: String,
 }
 
-fn default_status_listen() -> String {
-    "127.0.0.1:8081".to_string()
-}
-
-// Not derived, for the reason above: an absent object would silently default
-// `listen` to "".
 impl Default for StatusConfig {
     fn default() -> Self {
         StatusConfig {
-            listen: default_status_listen(),
+            listen: "127.0.0.1:8081".to_string(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct CompressionConfig {
-    #[serde(default = "default_min_compress_size")]
     pub min_size_bytes: usize,
     /// Compression allowlist; empty means no restriction. Already-compressed
     /// formats would only burn CPU.
-    #[serde(default = "default_compress_mime_types")]
     pub mime_types: Vec<String>,
 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         CompressionConfig {
-            min_size_bytes: default_min_compress_size(),
-            mime_types: default_compress_mime_types(),
+            min_size_bytes: 1024,
+            mime_types: [
+                "application/javascript",
+                "application/json",
+                "application/rss+xml",
+                "application/vnd.ms-fontobject",
+                "application/x-font-ttf",
+                "application/xml",
+                "font/opentype",
+                "image/svg+xml",
+                "image/x-icon",
+                "text/css",
+                "text/html",
+                "text/javascript",
+                "text/plain",
+                "text/xml",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
         }
     }
 }
 
-fn default_min_compress_size() -> usize {
-    1024
-}
-
-fn default_compress_mime_types() -> Vec<String> {
-    [
-        "application/javascript",
-        "application/json",
-        "application/rss+xml",
-        "application/vnd.ms-fontobject",
-        "application/x-font-ttf",
-        "application/xml",
-        "font/opentype",
-        "image/svg+xml",
-        "image/x-icon",
-        "text/css",
-        "text/html",
-        "text/javascript",
-        "text/plain",
-        "text/xml",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
 #[derive(Debug, Deserialize)]
+#[serde(default)]
 pub struct FsCacheConfig {
     /// TTL for a cached verdict; 0 disables the cache.
-    #[serde(default = "default_fs_cache_ttl_ms")]
     pub ttl_ms: u64,
     /// Paths kept at once; once full, admitting one evicts the coldest.
-    #[serde(default = "default_fs_cache_max_entries")]
     pub max_entries: usize,
 }
 
 impl Default for FsCacheConfig {
     fn default() -> Self {
         FsCacheConfig {
-            ttl_ms: default_fs_cache_ttl_ms(),
-            max_entries: default_fs_cache_max_entries(),
+            ttl_ms: 150,
+            max_entries: 4096,
         }
     }
-}
-
-fn default_fs_cache_ttl_ms() -> u64 {
-    150
-}
-
-fn default_fs_cache_max_entries() -> usize {
-    4096
 }
 
 /// Cross-field checks serde's structural parsing cannot express.

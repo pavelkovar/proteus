@@ -41,10 +41,9 @@ impl Encoding {
     }
 }
 
-/// Which codings a client will accept. Fixed fields rather than a parsed
+/// Which codings a client will accept. Fixed fields, not a parsed
 /// collection, to keep negotiation allocation-free; `None` is "not
-/// mentioned", distinct from an explicit `q=0` because RFC 9110 §12.5.3
-/// lets either override a `*` wildcard.
+/// mentioned", distinct from an explicit `q=0` per RFC 9110 §12.5.3.
 #[derive(Default)]
 struct AcceptedEncodings {
     zstd: Option<bool>,
@@ -147,10 +146,7 @@ pub(crate) fn pick_encoding_when_eligible(
 }
 
 /// The `(body_len, min_size_bytes)` pair to gate a streamed response on.
-///
-/// Without a declared length the minimum-size gate is disabled rather than
-/// buffered for, since finding the size out would cost time-to-first-byte.
-/// `declared_len` is a hint only: never used for framing, so a wrong value
+/// `declared_len` is a hint only, never used for framing: a wrong value
 /// can mis-pick compression but cannot corrupt the response.
 pub(crate) fn stream_size_gate(
     declared_len: Option<usize>,
@@ -186,14 +182,12 @@ const WINDOW_LOG_MAX: u32 = 18;
 /// zstd rejects a `WindowLog` below this.
 const WINDOW_LOG_MIN: u32 = 10;
 
-/// The window to give an encoder for a body of `size_hint` bytes, rounded
-/// up to a power of two - a window wider than the body costs memory and
-/// buys no ratio.
+/// The window to give an encoder for a body of `size_hint` bytes, rounded up
+/// to a power of two - wider than the body costs memory and buys no ratio.
 ///
-/// Safe to drive from an unverified script `Content-Length`, because the
-/// window affects ratio and nothing else. `set_pledged_src_size` is not:
-/// it is a contract, and breaking it fails the encode mid-body, long after
-/// the headers have gone out.
+/// Safe to drive from an unverified script `Content-Length`: the window
+/// affects ratio and nothing else. `set_pledged_src_size` is not - breaking
+/// that contract fails the encode mid-body, after the headers are sent.
 fn window_log_for(size_hint: Option<u64>) -> u32 {
     let Some(len) = size_hint else {
         return WINDOW_LOG_MAX;
@@ -281,12 +275,8 @@ fn poll_next_now<S: Stream<Item = std::io::Result<Bytes>>>(
 }
 
 /// Compresses `source` chunk-by-chunk, holding a blocking-pool thread only
-/// for each encode call.
-///
-/// Do not hoist the loop into one `spawn_blocking` per response: `source`
-/// may itself need the blocking pool, and a slow client would pin the
-/// thread for the length of the download - together enough to starve the
-/// pool for every other user in the process.
+/// for each encode call - not one `spawn_blocking` per response, which could
+/// pin a thread for a slow client's whole download and starve the pool.
 pub(crate) fn compressed_body<S>(
     source: S,
     encoding: Encoding,

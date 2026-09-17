@@ -211,7 +211,7 @@ impl Stream for FileBody {
             } else {
                 // Nothing here can ask whether this read would block, so the
                 // blocking pool would spend a cross-thread round trip on every
-                // chunk, page cache hits included. nginx's is opt-in for this.
+                // chunk, page cache hits included.
                 this.sync_chunks += 1;
                 let result = file.read_at(&mut buf, offset).map(|n| {
                     buf.truncate(n);

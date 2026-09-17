@@ -1,22 +1,25 @@
-//! Master's side of bringing up a prototype: fork+exec, privilege drop, and
-//! the fixed-fd config handoff.
+//! Master's whole view of the prototype process: bringing it up (fork+exec,
+//! privilege drop, the fixed-fd config handoff) and tracking it afterwards
+//! (pid, reap state, kill, respawn).
 
 use crate::ipc::{CONFIG_FD, CONTROL_FD};
+use crate::logging;
 use crate::prototype::{INTERNAL_PROTOTYPE_ARG, ProtoConfig};
+use nix::errno::Errno;
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+use nix::unistd::Pid;
 use std::io::Write;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 use tokio_seqpacket::UnixSeqpacket;
 
-/// Everything one launch needs, so a respawn reproduces the original exactly.
 #[derive(Clone)]
-pub(crate) struct PrototypeSpec {
+pub(crate) struct Spec {
     pub(crate) config: ProtoConfig,
-    /// `None` must skip the `uid`/`gid` calls entirely rather than pass
-    /// master's own identity: `Command::uid` always triggers
-    /// `setgroups(0, NULL)` even for a same-value drop, silently wiping
-    /// supplementary groups a deployment set up on purpose.
+    /// `None` must skip the `uid`/`gid` calls entirely, not pass master's own
+    /// identity: `Command::uid` always triggers `setgroups(0, NULL)`, silently
+    /// wiping supplementary groups even on a same-value drop.
     pub(crate) drop_to: Option<(u32, u32)>,
     pub(crate) no_new_privs: bool,
 }
@@ -37,8 +40,8 @@ unsafe fn relocate_above(
 }
 
 /// Returns master's end of the control channel and the prototype's pid - see
-/// `PrototypeHandle` for why the `Child` is not handed out.
-pub(crate) fn spawn(spec: &PrototypeSpec) -> std::io::Result<(UnixSeqpacket, u32)> {
+/// `Handle` for why the `Child` is not handed out.
+pub(crate) fn spawn(spec: &Spec) -> std::io::Result<(UnixSeqpacket, u32)> {
     let no_new_privs = spec.no_new_privs;
     let (master_end, prototype_end) = UnixSeqpacket::pair()?;
     let prototype_fd = prototype_end.into_raw_fd();
@@ -126,6 +129,99 @@ pub(crate) fn spawn(spec: &PrototypeSpec) -> std::io::Result<(UnixSeqpacket, u32
     Ok((master_end, child.id()))
 }
 
+/// The prototype's pid and everything that may be done to it.
+///
+/// A pid rather than a `std::process::Child`: master reaps through
+/// `waitpid(-1)`, which a `Child::wait` would race for the status.
+///
+/// An unreaped pid cannot be recycled, so signalling it stays safe until
+/// something reaps it - which is what `reaped` tracks.
+pub(super) struct Handle {
+    pid: u32,
+    reaped: bool,
+}
+
+impl Handle {
+    pub(super) fn new(pid: u32) -> Self {
+        Handle { pid, reaped: false }
+    }
+
+    pub(super) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// `None` once reaped: the only safe answer to what may be signalled.
+    pub(super) fn live_pid(&self) -> Option<u32> {
+        (!self.reaped).then_some(self.pid)
+    }
+
+    /// Records a reaped child, reporting whether it was the prototype.
+    pub(super) fn note_exit(&mut self, pid: u32, status: WaitStatus) -> bool {
+        if self.reaped || pid != self.pid {
+            return false;
+        }
+        self.reaped = true;
+        log_prototype_death(pid, status);
+        true
+    }
+
+    /// Its workers need no separate kill: they follow via `PR_SET_PDEATHSIG`.
+    pub(super) fn kill(&self, context: &str) {
+        if let Some(pid) = self.live_pid() {
+            super::sigkill(pid, context);
+        }
+    }
+
+    /// Kills and reaps whatever it replaces: not every respawn follows a
+    /// death, and forgetting a wedged prototype's pid leaves it orphaned with
+    /// its whole PHP heap, tracked by nothing.
+    ///
+    /// Reaps before killing, so a death that already happened keeps the status
+    /// that explains it instead of reporting SIGKILL.
+    pub(super) fn replace(&mut self, new_pid: u32) {
+        if let Some(pid) = self.live_pid() {
+            match waitpid(Pid::from_raw(pid as i32), Some(WaitPidFlag::WNOHANG)) {
+                Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                    log_prototype_death(pid, status);
+                }
+                // Reaped by something else, so the pid may name an unrelated
+                // process by now.
+                Err(Errno::ECHILD) => {}
+                // A failed wait included: an unkilled prototype is the one
+                // outcome that leaks a PHP heap.
+                _ => {
+                    super::sigkill(pid, "replacing a prototype that is still running");
+                    let _ = waitpid(Pid::from_raw(pid as i32), None);
+                }
+            }
+        }
+        *self = Handle::new(new_pid);
+    }
+}
+
+fn log_prototype_death(pid: u32, status: WaitStatus) {
+    match status {
+        WaitStatus::Exited(_, code) => {
+            logging::error!(
+                r#type = "controller",
+                pid,
+                exit_code = code,
+                "prototype exited"
+            )
+        }
+        WaitStatus::Signaled(_, signal, core_dumped) => logging::error!(
+            r#type = "controller",
+            pid,
+            signal = signal.as_str(),
+            core_dumped,
+            "prototype was killed by a signal"
+        ),
+        other => {
+            logging::error!(r#type = "controller", pid, status = ?other, "prototype stopped")
+        }
+    }
+}
+
 #[cfg(test)]
-#[path = "prototype_launch_tests.rs"]
+#[path = "prototype_tests.rs"]
 mod tests;

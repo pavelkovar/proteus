@@ -465,3 +465,7 @@ pub(crate) async fn dispatch_php(
 fn php_error_response(status: StatusCode, body: &'static [u8]) -> DispatchResult {
     DispatchResult::new(ActionBody::plain(status, body), "php", 0)
 }
+
+#[cfg(test)]
+#[path = "php_dispatch_tests.rs"]
+mod tests;

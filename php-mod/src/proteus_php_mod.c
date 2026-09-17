@@ -1,12 +1,4 @@
-/* PHP embed SAPI module. Targets PHP 7.4-8.5.
- *
- * Deliberately not php_embed_init()/php_embed_shutdown(), which bundle SAPI,
- * module and one request together; a worker serves many, so module start-up
- * happens once and each script gets its own request startup/shutdown pair.
- *
- * Mutates named fields on libphp's own php_embed_module rather than building
- * a sapi_module_struct, the field names having been stable since 7.4. Only
- * the genuine signature differences are version-guarded. */
+/* PHP embed SAPI module, targeting PHP 7.4-8.5. */
 
 #include "proteus_php_mod.h"
 
@@ -87,7 +79,6 @@ static void proteus_php_mod_log_json(const char *type, const char *level, const 
     (void) written;
 }
 
-/* PHP's diagnostic channel. The signature is non-const before 8.0. */
 #if PHP_VERSION_ID >= 80000
 static void proteus_php_mod_log_message(const char *message, int syslog_type_int) {
 #else
@@ -103,15 +94,13 @@ typedef struct {
 } proteus_php_mod_capture_t;
 
 /* Headers only; the body streams straight through and is never buffered.
- * Not part of proteus_request_ctx below: buf/cap are kept across requests
- * to amortize allocation (see proteus_php_mod_capture_shrink), only len
- * is per-request. */
+ * Not part of proteus_request_ctx below: buf/cap persist across requests to
+ * amortize allocation, only len is reset per-request. */
 static proteus_php_mod_capture_t g_headers;
 
 /* Everything one PHP request owns, reset in full at the top of every
- * execute_file() call. Still a single static, not a value threaded through
- * the SAPI hooks below: those signatures belong to libphp and carry no
- * user-data parameter. */
+ * execute_file() call. A static, not a threaded value: the SAPI hooks
+ * below belong to libphp and carry no user-data parameter. */
 typedef struct {
     /* body */
     const char *body;
@@ -156,10 +145,9 @@ static int proteus_php_mod_grow(proteus_php_mod_capture_t *c, size_t extra) {
 /* `grow` never shrinks and execute_file only resets `len`, so without this a
  * single huge header set would stay resident for the worker's whole life.
  *
- * Fixed thresholds rather than a high-water heuristic: a set large enough to
- * cross the threshold is already past what any HTTP client will parse, so
- * retaining the buffer optimises for a case that does not recur. Realistic
- * responses stay below it and never reallocate at all. */
+ * Fixed thresholds rather than a high-water heuristic: crossing it already
+ * means a set larger than any real HTTP client parses, so retaining the
+ * buffer optimises for a case that won't recur. */
 #define PROTEUS_PHP_MOD_HEADERS_SHRINK_ABOVE (64 * 1024)
 #define PROTEUS_PHP_MOD_HEADERS_KEEP_CAP     (4 * 1024)
 
@@ -359,8 +347,8 @@ static size_t proteus_php_mod_read_post(char *buffer, size_t count_bytes) {
 #if PHP_VERSION_ID < 80500
 typedef int (*proteus_php_mod_disable_one_fn)(char *name, size_t name_length);
 
-/* Returns 0 if every name in `list` was disabled, -1 if any was not. Still
- * processes the whole list either way, same as the NUL-drop policy below. */
+/* Returns 0 if every name in `list` was disabled, -1 if any was not, but
+ * always processes the whole list rather than stopping at the first failure. */
 static int proteus_php_mod_disable_list(const char *list, proteus_php_mod_disable_one_fn disable_one) {
     if (list == NULL || *list == '\0') {
         return 0;

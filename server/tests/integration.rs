@@ -3394,6 +3394,34 @@ async fn php_receives_a_large_spilled_request_body_correctly() {
     }
 }
 
+/// `max_body_size` is the hard cap, checked while the body is still
+/// streaming in - distinct from `BODY_MEMORY_THRESHOLD`, which only decides
+/// whether it spills to disk.
+#[tokio::test]
+async fn a_body_over_max_body_size_gets_a_413_not_a_hang() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "body-too-large",
+        www.to_str().unwrap(),
+        serde_json::json!({ "max_body_size": 1024 }),
+    )
+    .await;
+
+    let body = vec![0u8; 4096];
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/echo-body", server.port))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let text = resp.text().await.unwrap();
+    assert!(
+        text.contains("exceeds the configured limit"),
+        "got: {text}"
+    );
+}
+
 /// A spilled body is opened with `O_TMPFILE`, so it has no name at any point
 /// and the once-predictable path is never touched. A file a symlink planted
 /// there points at must come back untouched.

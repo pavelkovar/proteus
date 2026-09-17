@@ -266,3 +266,113 @@ fn a_repeated_coding_keeps_its_first_mention() {
 fn an_ineligible_response_never_negotiates() {
     assert_eq!(pick_encoding_when_eligible(false, "zstd, br, gzip"), None);
 }
+
+#[test]
+fn compression_respects_size_threshold() {
+    assert_eq!(
+        pick_encoding(100, "gzip", 1024, "text/plain", &[]),
+        None,
+        "below threshold"
+    );
+    assert_eq!(
+        pick_encoding(2000, "gzip", 1024, "text/plain", &[]),
+        Some(Encoding::Gzip),
+        "above threshold, gzip accepted"
+    );
+    assert_eq!(
+        pick_encoding(2000, "", 1024, "text/plain", &[]),
+        None,
+        "above threshold but no accept-encoding"
+    );
+    assert_eq!(
+        pick_encoding(2000, "br", 1024, "text/plain", &[]),
+        Some(Encoding::Brotli),
+        "client wants brotli"
+    );
+}
+
+#[test]
+fn compression_prefers_zstd_then_brotli_then_gzip() {
+    assert_eq!(
+        pick_encoding(2000, "gzip, br, zstd", 1024, "text/plain", &[]),
+        Some(Encoding::Zstd),
+        "zstd preferred when the client accepts all three"
+    );
+    assert_eq!(
+        pick_encoding(2000, "gzip, br", 1024, "text/plain", &[]),
+        Some(Encoding::Brotli),
+        "brotli preferred over gzip when zstd isn't accepted"
+    );
+    assert_eq!(
+        pick_encoding(2000, "deflate", 1024, "text/plain", &[]),
+        None,
+        "no supported encoding accepted"
+    );
+}
+
+#[test]
+fn compression_respects_weighted_accept_encoding() {
+    // An explicit veto beats our own top preference.
+    assert_eq!(
+        pick_encoding(
+            2000,
+            "zstd;q=0, br;q=0.8, gzip;q=0.5",
+            1024,
+            "text/plain",
+            &[]
+        ),
+        Some(Encoding::Brotli)
+    );
+    // A q value alone does not re-rank against our own priority order;
+    // acceptable is all that is asked of it.
+    assert_eq!(
+        pick_encoding(2000, "zstd;q=0.1, gzip;q=1.0", 1024, "text/plain", &[]),
+        Some(Encoding::Zstd)
+    );
+
+    assert_eq!(
+        pick_encoding(2000, "*;q=1", 1024, "text/plain", &[]),
+        Some(Encoding::Zstd)
+    );
+    // An explicit entry overrides the wildcard in either direction.
+    assert_eq!(
+        pick_encoding(2000, "*;q=1, zstd;q=0", 1024, "text/plain", &[]),
+        Some(Encoding::Brotli),
+        "explicit zstd;q=0 overrides the permissive wildcard"
+    );
+    assert_eq!(
+        pick_encoding(2000, "*;q=0, gzip;q=1", 1024, "text/plain", &[]),
+        Some(Encoding::Gzip),
+        "explicit gzip;q=1 overrides the blanket wildcard veto"
+    );
+    assert_eq!(
+        pick_encoding(2000, "*;q=0", 1024, "text/plain", &[]),
+        None,
+        "wildcard veto with no explicit overrides"
+    );
+}
+
+#[test]
+fn compression_mime_types_allowlist() {
+    let allowed = vec!["text/html".to_string(), "application/json".to_string()];
+    assert_eq!(
+        pick_encoding(2000, "gzip", 1024, "text/html", &allowed),
+        Some(Encoding::Gzip),
+        "text/html is on the allowlist"
+    );
+    assert_eq!(
+        pick_encoding(2000, "gzip", 1024, "image/png", &allowed),
+        None,
+        "image/png is not on the allowlist"
+    );
+    assert_eq!(
+        pick_encoding(2000, "gzip", 1024, "text/html; charset=utf-8", &allowed),
+        Some(Encoding::Gzip),
+        "charset suffix must not defeat the match"
+    );
+    assert_eq!(
+        pick_encoding(2000, "gzip", 1024, "image/png", &[]),
+        Some(Encoding::Gzip),
+        "empty allowlist (the default) means no restriction at all"
+    );
+}

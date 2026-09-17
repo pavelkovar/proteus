@@ -3,20 +3,19 @@
 //! prototype needs arrives over `CONFIG_FD` rather than argv.
 
 mod config;
-mod gauge;
 mod ipc;
 mod logging;
 mod master;
-mod proctitle;
 mod prototype;
+mod utils;
 mod worker;
 
 use config::Config;
-use master::http::{AppState, FsCache};
+use master::http::AppState;
 use master::pool_manager::PoolManager;
 use std::sync::Arc;
+use utils::fs_cache::FsCache;
 
-/// The one source of truth for the name wherever it shows up at runtime.
 pub(crate) const APP_NAME: &str = "proteus";
 
 /// Bounds how long a dead prototype goes unnoticed while the pool still has
@@ -53,7 +52,7 @@ fn main() {
         prototype::run();
     }
 
-    proctitle::set_title(&format!("{APP_NAME}: controller"));
+    utils::proctitle::set_title(&format!("{APP_NAME}: controller"));
 
     let config_path = args
         .get(1)
@@ -108,7 +107,7 @@ async fn run_master(config: Config) {
     // but pinning to invented ids would land threads on CPUs this process may
     // not run on.
     let cpus: Vec<Option<usize>> = {
-        let allowed = master::http::allowed_cpus();
+        let allowed = utils::cpu::allowed_cpus();
         if allowed.is_empty() {
             let n = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -123,7 +122,6 @@ async fn run_master(config: Config) {
             allowed.into_iter().map(Some).collect()
         }
     };
-
 
     // Raced against accept(), so it bounds how long the accept loops run
     // rather than guaranteeing nothing more is taken. The drain that follows
@@ -162,7 +160,7 @@ async fn run_master(config: Config) {
         let connection_slots = Arc::clone(&connection_slots);
         threads.push(std::thread::spawn(move || {
             if let Some(cpu) = cpu {
-                master::http::pin_to_cpu(cpu);
+                utils::cpu::pin_to_cpu(cpu);
             }
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

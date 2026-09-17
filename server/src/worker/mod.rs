@@ -39,10 +39,9 @@ impl ExecuteFile for PhpConn {
     }
 }
 
-/// Last-resort orphan guard. The in-band shutdown path needs someone alive
-/// to set it, so once master and then the prototype exit, a parked worker
-/// would be reparented to init and wait forever on a ring nobody will write
-/// to, holding its whole PHP heap.
+/// Last-resort orphan guard: once master and the prototype both exit, a
+/// parked worker would be reparented to init and wait forever on a ring
+/// nobody will write to, holding its whole PHP heap.
 ///
 /// The `getppid()` recheck closes the fork/prctl race, where the signal
 /// would have been dispatched to the old parent. Best-effort: failing this

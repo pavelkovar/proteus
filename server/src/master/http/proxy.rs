@@ -50,11 +50,9 @@ impl Peer {
 /// Past this a chain is padding, not a deployment.
 const MAX_FORWARDED_HOPS: usize = 32;
 
-/// The real client behind `peer`, from `X-Forwarded-For` only if `peer` is
-/// itself a trusted proxy and `trusted_proxies` is the list it was resolved
-/// against. Every exit but one yields the peer: anything unparseable,
-/// overlong or unvouched-for fails closed rather than being skipped to keep
-/// walking left into client-controlled entries.
+/// The real client behind `peer`, taken from `X-Forwarded-For` only if
+/// `peer` is a trusted proxy. Every exit but one fails closed rather than
+/// skipping an unparseable/overlong/unvouched-for entry to keep walking.
 pub(crate) fn resolve_client_ip(
     peer: Peer,
     headers: &HeaderMap,
@@ -98,9 +96,8 @@ pub(crate) fn ip_is_trusted_proxy(ip: IpAddr, trusted_proxies: &[ipnetwork::IpNe
 }
 
 /// One address, one spelling: a dual-stack listener reports an IPv4 peer as
-/// `::ffff:a.b.c.d`, which an operator's IPv4 CIDR would otherwise silently
-/// fail to match. Not `to_ipv4`, which also unwraps the deprecated
-/// IPv4-compatible form and would turn `::1` into `0.0.0.1`.
+/// `::ffff:a.b.c.d`, silently failing an operator's IPv4 CIDR otherwise.
+/// Not `to_ipv4`, which also turns the deprecated `::1` into `0.0.0.1`.
 fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -173,3 +170,7 @@ pub(crate) fn resolve_https(headers: &HeaderMap, is_trusted_peer: bool) -> bool 
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("https"))
 }
+
+#[cfg(test)]
+#[path = "proxy_tests.rs"]
+mod tests;

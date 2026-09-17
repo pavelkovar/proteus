@@ -12,7 +12,7 @@ fn unused_body_socket() -> std::os::fd::OwnedFd {
     a
 }
 use crate::ipc::{data, shm};
-use crate::master::worker_channel::WorkerChannel;
+use crate::master::pool_manager::worker_channel::WorkerChannel;
 use std::os::fd::AsRawFd;
 
 /// Out of range, so the kill a failed drain may attempt finds nothing.

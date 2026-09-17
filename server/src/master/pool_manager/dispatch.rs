@@ -4,10 +4,10 @@
 //! A child module rather than a sibling, so these `impl PoolManager` methods
 //! still reach private fields.
 
+use super::worker_channel::WorkerEvent;
 use super::{PoolManager, PooledWorker, Retired, TempBodyFile};
 use crate::ipc::data::{HeaderBlob, PhpRequest};
 use crate::logging;
-use crate::master::worker_channel::WorkerEvent;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -57,9 +57,8 @@ pub type BodyStream =
     std::pin::Pin<Box<dyn tokio_stream::Stream<Item = std::io::Result<Bytes>> + Send + Sync>>;
 
 /// Past this a worker is streaming rather than answering, so the rest of its
-/// output belongs on the stream instead of in one buffered reply. One body
-/// frame, which is also the overshoot of a budget checked before each read:
-/// the sweep holds at most two frames however fast the worker refills.
+/// output belongs on the stream, not one buffered reply. Checked before each
+/// read, so the sweep holds at most one frame's overshoot past the budget.
 const MAX_DRAINED_PREFIX_BYTES: usize = crate::worker::COALESCE_FLUSH_THRESHOLD;
 
 /// One buffer for the whole reply, without copying the common case of a
@@ -109,7 +108,7 @@ enum StartAttempt {
 
 /// The worker is already retired by the time one of these is returned,
 /// except where a variant says otherwise.
-enum DispatchAttemptError {
+enum AttemptError {
     WorkerUnavailable(std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>),
     /// The one error no worker could have avoided, so this one is left pooled.
     RequestTooLarge(OwnedSemaphorePermit),
@@ -136,7 +135,7 @@ impl PoolManager {
         req: &Arc<PhpRequest<'static>>,
         permit: OwnedSemaphorePermit,
         body_cleanup: Option<TempBodyFile>,
-    ) -> Result<StreamedResponse, DispatchAttemptError> {
+    ) -> Result<StreamedResponse, AttemptError> {
         let pid = worker.pid;
         // No lock and no lookup: the counters hang off the `Arc` already held.
         worker.meta.mark_busy(Instant::now(), self.started_at);
@@ -147,20 +146,43 @@ impl PoolManager {
             Ok(started) => Ok(started),
             Err(StartAttempt::TimedOut(permit, _body_cleanup)) => {
                 self.retire(pid, Retired::Watchdog);
-                Err(DispatchAttemptError::TimedOut(permit))
+                Err(AttemptError::TimedOut(permit))
             }
             Err(StartAttempt::RequestTooLarge(permit, _body_cleanup)) => {
-                Err(DispatchAttemptError::RequestTooLarge(permit))
+                Err(AttemptError::RequestTooLarge(permit))
             }
             Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)) => {
                 // Probably self-retired is not certainly: a worker wedged
                 // rather than parked would otherwise run on untracked.
                 self.retire(pid, Retired::Unavailable);
-                Err(DispatchAttemptError::WorkerUnavailable(
+                Err(AttemptError::WorkerUnavailable(
                     e,
                     permit,
                     body_cleanup,
                 ))
+            }
+        }
+    }
+
+    /// `try_dispatch_to`, with every terminal `AttemptError` folded
+    /// into the matching `DispatchOutcome`. Only `WorkerUnavailable` is left
+    /// as an error, since that is the one case a caller can retry.
+    async fn try_dispatch_or_retry(
+        self: &Arc<Self>,
+        worker: PooledWorker,
+        req: &Arc<PhpRequest<'static>>,
+        permit: OwnedSemaphorePermit,
+        body_cleanup: Option<TempBodyFile>,
+    ) -> Result<DispatchOutcome, (std::io::Error, OwnedSemaphorePermit, Option<TempBodyFile>)> {
+        match self.try_dispatch_to(worker, req, permit, body_cleanup).await {
+            Ok(started) => Ok(DispatchOutcome::Ok(started)),
+            Err(AttemptError::RequestTooLarge(_permit)) => {
+                self.counters.requests_too_large.fetch_add(1, Relaxed);
+                Ok(DispatchOutcome::RequestTooLarge)
+            }
+            Err(AttemptError::TimedOut(_permit)) => Ok(DispatchOutcome::Timeout),
+            Err(AttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
+                Err((e, permit, body_cleanup))
             }
         }
     }
@@ -204,16 +226,11 @@ impl PoolManager {
         };
         let pid = worker.pid;
         let (permit, body_cleanup) = match self
-            .try_dispatch_to(worker, req, permit, body_cleanup)
+            .try_dispatch_or_retry(worker, req, permit, body_cleanup)
             .await
         {
-            Ok(started) => return DispatchOutcome::Ok(started),
-            Err(DispatchAttemptError::RequestTooLarge(_permit)) => {
-                self.counters.requests_too_large.fetch_add(1, Relaxed);
-                return DispatchOutcome::RequestTooLarge;
-            }
-            Err(DispatchAttemptError::TimedOut(_permit)) => return DispatchOutcome::Timeout,
-            Err(DispatchAttemptError::WorkerUnavailable(e, permit, body_cleanup)) => {
+            Ok(outcome) => return outcome,
+            Err((e, permit, body_cleanup)) => {
                 logging::warn!(
                     r#type = "controller",
                     pid,
@@ -236,19 +253,13 @@ impl PoolManager {
         };
         let pid = worker.pid;
         match self
-            .try_dispatch_to(worker, req, permit, body_cleanup)
+            .try_dispatch_or_retry(worker, req, permit, body_cleanup)
             .await
         {
-            Ok(started) => DispatchOutcome::Ok(started),
-            Err(DispatchAttemptError::RequestTooLarge(_permit)) => {
-                self.counters.requests_too_large.fetch_add(1, Relaxed);
-                DispatchOutcome::RequestTooLarge
-            }
-            Err(DispatchAttemptError::TimedOut(_permit)) => DispatchOutcome::Timeout,
-            Err(DispatchAttemptError::WorkerUnavailable(e, _permit, _body_cleanup)) => self
-                .give_up(&format!(
-                    "freshly spawned worker pid={pid} STILL failed ({e}), giving up"
-                )),
+            Ok(outcome) => outcome,
+            Err((e, _permit, _body_cleanup)) => self.give_up(&format!(
+                "freshly spawned worker pid={pid} STILL failed ({e}), giving up"
+            )),
         }
     }
 
@@ -395,12 +406,10 @@ impl PoolManager {
         }
     }
 
-    /// Takes whatever the worker has already written, without ever waiting:
-    /// a response that is not finished yet must not be delayed for one that
-    /// might be. Bounded because each read frees ring space the worker can
-    /// refill, so an unbounded loop would follow a fast producer instead of
-    /// returning.
-    fn drain_ready(channel: &mut crate::master::worker_channel::WorkerChannel) -> Drained {
+    /// Takes whatever the worker has already written, without ever waiting.
+    /// Bounded because each read frees ring space to refill, so an unbounded
+    /// loop would follow a fast producer instead of returning.
+    fn drain_ready(channel: &mut super::worker_channel::WorkerChannel) -> Drained {
         let mut prefix: Vec<Bytes> = Vec::new();
         let mut drained = 0;
         loop {
@@ -559,5 +568,5 @@ impl PoolManager {
 }
 
 #[cfg(test)]
-#[path = "pool_manager_dispatch_tests.rs"]
+#[path = "dispatch_tests.rs"]
 mod tests;

@@ -2,14 +2,12 @@
 //! prefix + postcard payload, with futex/eventfd standing in for a socket
 //! buffer.
 //!
-//! A ring cannot distinguish a dead peer from a slow one - there is no fd to
-//! see EOF on - so `PeerDeath` carries that signal in from the liveness
-//! socket and wakes everyone parked on either ring.
+//! A ring cannot distinguish a dead peer from a slow one, so `PeerDeath`
+//! carries that signal in from the liveness socket.
 //!
-//! The two sides park differently and the calls are not interchangeable: the
-//! worker has no tokio and parks its thread on a futex word, while master
-//! parks the *task* via `AsyncFd`/eventfd, because blocking a shared tokio
-//! thread would stall every other pooled connection.
+//! The worker parks its thread on a futex word; master parks the task via
+//! `AsyncFd`/eventfd, since blocking a shared tokio thread would stall every
+//! other pooled connection.
 
 use crate::logging;
 use std::cell::UnsafeCell;
@@ -29,10 +27,9 @@ pub const RESPONSE_RING_CAPACITY: usize = 256 * 1024;
 
 const EMPTY: u32 = 0;
 const WAITING: u32 = 1;
-/// Stamped over both state words before waking. Load-bearing: `futex_wait`
-/// sleeps only while the word still reads `WAITING`, so a waiter that
-/// checked `is_dead()` a moment too early gets `EAGAIN` instead of sleeping
-/// through the only wake coming for it. `peer_death` remains the authority.
+/// Stamped over both state words before waking, so a waiter that checked
+/// `is_dead()` a moment too early gets `EAGAIN` from `futex_wait` instead of
+/// sleeping through the only wake coming. `peer_death` remains the authority.
 const DEAD: u32 = 2;
 
 /// Little-endian frame length, ahead of every payload.
@@ -122,8 +119,7 @@ pub fn create_notify_eventfd() -> std::io::Result<OwnedFd> {
         .map_err(std::io::Error::from)
 }
 
-/// Best-effort: a dropped wake is safe because waiters recheck before
-/// parking, not because this cannot fail.
+/// Best-effort: a dropped wake is safe since waiters recheck before parking.
 ///
 /// # Safety
 /// `fd` must stay open for the whole call.
@@ -187,12 +183,9 @@ impl PeerDeath {
 /// lines in pairs and ARM's big cores run a 128B L2 line.
 const CACHE_LINE: usize = 128;
 
-/// `CAPACITY` must be a power of two. The positions never wrap, so free and
-/// available fall out of plain subtraction with no empty-vs-full ambiguity.
-///
-/// The padding keeps the producer-only and consumer-only positions off one
-/// another's cache lines; without it every producer write invalidates the
-/// consumer's cached position and vice versa.
+/// `CAPACITY` must be a power of two, so positions never wrap and free/used
+/// space falls out of plain subtraction. The padding keeps producer-only and
+/// consumer-only fields off each other's cache line, avoiding false sharing.
 #[repr(C, align(128))]
 pub struct Ring<const CAPACITY: usize> {
     write_pos: AtomicU64,
@@ -251,16 +244,12 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         }
     }
 
-    /// Declare-then-recheck. `false` means the condition came true, or the
-    /// peer died, during the window, with the state word already restored.
+    /// Declare-then-recheck. `false` means the condition came true or the
+    /// peer died during the window.
     ///
-    /// The `WAITING` store and the recheck load must both be `SeqCst`.
-    /// `Release`/`Acquire` permits a StoreLoad reorder (the SB litmus test),
-    /// letting this read a stale position before its own store lands - so it
-    /// wakes nobody and then sleeps through the only wake it was going to
-    /// get. Reachable on x86_64, where those orderings are plain `mov`s;
-    /// aarch64's `stlr`/`ldar` forbid the reorder, so no ARM test can
-    /// exercise the bug.
+    /// The `WAITING` store and the recheck load must both be `SeqCst`, or a
+    /// StoreLoad reorder can read a stale position before its own store lands
+    /// and sleep through the only wake coming - reachable on x86_64, not aarch64.
     fn declare_waiting(
         state: &AtomicU32,
         peer: &PeerDeath,
@@ -280,12 +269,9 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         Ok(true)
     }
 
-    /// Parks the calling thread until `ready`, `deadline`, or the peer's
-    /// death; `Ok(false)` means the deadline passed.
-    ///
-    /// No spin first: this waits for the next unit of work, which unlike a
-    /// mutex's critical section may never come. The deadline is rechecked
-    /// around the park, the futex also returning on spurious wakes.
+    /// Parks until `ready`, `deadline`, or the peer's death; `Ok(false)`
+    /// means the deadline passed. No spin first: this waits for the next
+    /// unit of work, which unlike a mutex's critical section may never come.
     fn park_on(
         state: &AtomicU32,
         peer: &PeerDeath,
@@ -397,9 +383,9 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// two notifiers wake one waiter. An unparked word costs no syscall, which
     /// is the steady-state case.
     ///
-    /// `SeqCst` for `declare_waiting`'s reason - this RMW is the other half of
-    /// that total order. Clobbering a `DEAD` word back to `EMPTY` is harmless:
-    /// `peer_death` is the authority and waiters recheck it.
+    /// `SeqCst` for the same reason as `declare_waiting`. Clobbering a `DEAD`
+    /// word back to `EMPTY` is harmless: `peer_death` is the authority and
+    /// waiters recheck it.
     fn notify(state: &AtomicU32, wake: Wake) {
         if state.swap(EMPTY, Ordering::SeqCst) != WAITING {
             return;
@@ -437,13 +423,10 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// is `buf`'s offset within the memfd, not within the ring.
     ///
     /// # Caller's safety burden
-    /// The writer must be provably done with this ring - between responses,
-    /// never mid-write. The instant `read_pos` moves the writer may start
-    /// filling the freed space, and punching it then zeroes live data. An
-    /// earlier version reclaimed per frame and corrupted streamed responses.
-    ///
-    /// The empty-ring check below rejects the obvious violations, but it is a
-    /// snapshot: only the protocol makes this safe.
+    /// The writer must be provably idle: punching space it is still filling
+    /// zeroes live data (an earlier version reclaimed per frame and corrupted
+    /// streamed responses). The empty-ring check below is a snapshot, not a
+    /// proof - only the protocol makes this safe.
     fn reclaim_if_due(&self, fd: &OwnedFd, file_offset: u64) {
         // Relaxed suffices because the position only grows: a stale read
         // punches less than it could, never more. On the request ring this is
@@ -491,11 +474,10 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         self.reclaimed_pos.store(read_pos, Ordering::Relaxed);
     }
 
-    /// Copies without publishing; the caller advances `write_pos` once the
-    /// whole frame is in place.
+    /// Copies without publishing the frame; the caller advances `write_pos`.
     ///
     /// # Safety
-    /// Single-producer only, and the range must be free space already waited for.
+    /// Single-producer only, into space already waited-for.
     unsafe fn copy_at(&self, pos: u64, data: &[u8]) {
         let start = (pos & Self::MASK) as usize;
         let len = data.len();
@@ -511,13 +493,12 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         }
     }
 
-    /// Advances `write_pos` once per frame, so a reader never observes a
-    /// length prefix without the payload behind it.
+    /// Advances `write_pos` once per frame, so a reader never sees a length
+    /// prefix without its payload.
     ///
     /// # Safety
-    /// Single-producer only - concurrent callers would race `write_pos` - and
-    /// `LEN_PREFIX + payload.len()` bytes of space must already have been
-    /// waited for.
+    /// Single-producer only; `LEN_PREFIX + payload.len()` bytes must already
+    /// be waited-for space.
     unsafe fn raw_write_frame(&self, payload: &[u8]) {
         debug_assert!(
             payload.len() <= CAPACITY - LEN_PREFIX,
@@ -533,14 +514,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
             .store(w + (LEN_PREFIX + payload.len()) as u64, Ordering::Release);
     }
 
-    /// Copies out without touching `read_pos`, so the bytes stay available
-    /// to a later consuming read.
+    /// Copies out without advancing `read_pos`, so the bytes stay available
+    /// to a later read.
     ///
     /// # Safety
-    /// `pos..pos + len` must have been published by the writer, which for a
-    /// reader means seen through an acquire load of `write_pos`. `dst` must
-    /// be valid for `len` bytes of writes; every one of them is written, so
-    /// it need not be initialized beforehand.
+    /// `pos..pos+len` must be writer-published (acquire-visible via
+    /// `write_pos`). `dst` needs `len` writable bytes; every one is written,
+    /// so it need not be pre-initialized.
     unsafe fn peek_into(&self, pos: u64, dst: *mut u8, len: usize) {
         let start = (pos & Self::MASK) as usize;
         let base = self.buf.get() as *const u8;
@@ -570,9 +550,8 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         unsafe { self.raw_read_into(out.as_mut_ptr(), out.len()) }
     }
 
-    /// Replaces `scratch` with the next `len` bytes, reusing its allocation.
-    /// Not `resize(len, 0)`, whose zero-fill is overwritten in full on the
-    /// very next line.
+    /// Replaces `scratch` with the next `len` bytes, reusing its allocation
+    /// (not `resize`, whose zero-fill would be wasted).
     ///
     /// # Safety
     /// Single-consumer only, same as `raw_read_into`.
@@ -663,13 +642,11 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         Ok(())
     }
 
-    /// Reads one whole frame if the writer has already published one.
-    /// `Ok(false)` means the ring is empty right now - never end of stream.
-    ///
-    /// Consumes either the whole frame or nothing, so an async caller can be
-    /// cancelled around it without desyncing `read_pos`. Frees space through
-    /// the futex, so the writer must be one that waits on it rather than on
-    /// an eventfd.
+    /// Reads one whole frame if published. `Ok(false)` means the ring is
+    /// empty right now, never end of stream. Consumes the whole frame or
+    /// nothing, so an async caller can be cancelled around it without
+    /// desyncing `read_pos`; wakes the writer via futex, so it must be one
+    /// waiting on it, not an eventfd.
     pub fn try_read_frame(
         &self,
         scratch: &mut Vec<u8>,
@@ -850,13 +827,10 @@ pub fn create_channel() -> std::io::Result<(OwnedFd, MappedChannel)> {
     Ok((fd, MappedChannel { ptr, fd: None }))
 }
 
-/// A worker holds this same descriptor, and only the seal stops it shrinking
-/// the file: master's mapping past the new end would raise SIGBUS on the next
-/// access, killing the process the worker is isolated from.
-///
-/// Not `F_SEAL_WRITE`, which both sides need; `F_SEAL_SEAL` closes the
-/// follow-up of adding one. Hole punching is not a resize, so reclaim still
-/// works.
+/// Only the seal stops a worker shrinking the file; master's mapping past
+/// the new end would SIGBUS on the next access. Not `F_SEAL_WRITE`, which
+/// both sides need; `F_SEAL_SEAL` closes the follow-up of adding one. Hole
+/// punching is not a resize, so reclaim still works.
 fn seal_size(fd: &OwnedFd) -> std::io::Result<()> {
     use nix::fcntl::{FcntlArg, SealFlag, fcntl};
 

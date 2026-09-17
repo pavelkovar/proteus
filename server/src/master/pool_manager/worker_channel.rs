@@ -2,7 +2,6 @@
 //! the caller's own task and park on an eventfd, so no tokio worker thread
 //! ever blocks on a futex.
 
-use super::pool_manager;
 use crate::ipc::control::WorkerReadyFds;
 use crate::ipc::data::{self, PhpRequest, ReadyResponse, ResponseFrame};
 use crate::ipc::shm;
@@ -161,9 +160,8 @@ enum Absorbed {
 }
 
 /// Dropping a `WorkerChannel` means master is giving up on the worker; the
-/// pool never drops one it means to reuse. Without this signal the worker
-/// would park forever in its untimed ring wait, holding its PHP heap and
-/// OPcache mapping resident with nothing left to notice.
+/// pool never drops one it means to reuse. Without this signal it would
+/// park forever in its untimed ring wait, PHP heap and OPcache resident.
 ///
 /// A signal-free wake rather than `SIGKILL`, so the worker exits through its
 /// own shutdown and runs PHP's shutdown functions. Killing unconditionally
@@ -347,9 +345,8 @@ impl WorkerChannel {
     }
 
     /// Joins a run of `Headers` frames back together, forwarding on the run's
-    /// last frame rather than waiting for the next one to imply the run
-    /// ended: a script whose `header()` calls and first output are not
-    /// back-to-back would otherwise pay a round-trip of TTFB.
+    /// last frame rather than waiting for the next one to imply it ended -
+    /// otherwise a script whose output isn't back-to-back pays a TTFB round-trip.
     fn absorb(&mut self, raw: Option<ResponseFrame<'static>>) -> std::io::Result<Absorbed> {
         let Some(ResponseFrame::Headers {
             status,
@@ -380,7 +377,7 @@ impl WorkerChannel {
             // Abandoning the ring is not enough: the worker would park
             // forever in its untimed wait_for_space, whose only other escape
             // is real process death.
-            pool_manager::sigkill(self.pid, "worker sent an oversized run of Headers frames");
+            super::sigkill(self.pid, "worker sent an oversized run of Headers frames");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "worker sent an oversized run of Headers frames",

@@ -1,36 +1,40 @@
 //! HTTP entry point: connection accept and drain, request handling, client
 //! IP resolution, access log.
 
+mod access_log;
 mod compression;
 mod conditional;
-mod fs_cache;
+mod connection;
 mod php_dispatch;
 mod proxy;
 mod range;
 mod rate_limit;
 mod response;
 mod routing;
+mod shutdown;
 
+use access_log::{BodyOutcome, GuardedBody, PendingAccessLog};
 use conditional::*;
-pub(crate) use fs_cache::FsCache;
+use connection::{ConnBusyGuard, ConnState, ConnTimeouts, wait_until_idle};
 use proxy::*;
 use rate_limit::RateLimiter;
 use response::*;
 use routing::*;
+pub use shutdown::Shutdown;
+use shutdown::wait_for_shutdown_signal;
 
 use crate::config::{Config, RouteActionConfig};
-use crate::gauge::{Gauge, GaugeGuard};
 use crate::logging;
 use crate::master::pool_manager::PoolManager;
+use crate::utils::fs_cache::FsCache;
+use crate::utils::gauge::{Gauge, GaugeGuard};
 use bytes::Bytes;
-use http_body::Frame;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -74,131 +78,7 @@ impl AppState {
 /// `handle`.
 type InFlightGuard = GaugeGuard<Arc<Gauge>>;
 
-/// Marks the connection busy for the life of the request, response body
-/// included.
-///
-/// What this protects is keep-alive reuse, not the request: the idle path
-/// shuts down gracefully, so a request slower than `idle_timeout` completes
-/// either way - but without this the connection closes behind it and a
-/// client with more to send has to reconnect.
-struct ConnBusyGuard(Arc<ConnState>);
-
-impl ConnBusyGuard {
-    fn new(conn: Arc<ConnState>) -> Self {
-        conn.request_started();
-        ConnBusyGuard(conn)
-    }
-}
-
-impl Drop for ConnBusyGuard {
-    fn drop(&mut self) {
-        self.0.request_finished();
-    }
-}
-
 type ResponseBody = BoxBody<Bytes, std::io::Error>;
-
-/// How a response body ended, for the access log.
-#[derive(Clone, Copy)]
-enum BodyOutcome {
-    Complete,
-
-    Failed,
-    /// Dropped before the last frame: the client went away.
-    Aborted,
-}
-
-impl BodyOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            BodyOutcome::Complete => "complete",
-            BodyOutcome::Failed => "error",
-            BodyOutcome::Aborted => "aborted",
-        }
-    }
-}
-
-/// Captured while the request is in scope, emitted once the body finishes.
-///
-/// Holds the raw `Uri`, both because a log records what the client actually
-/// sent and because it is refcounted and already cloned.
-struct PendingAccessLog {
-    client_ip: ClientIdentity,
-    method: Method,
-    uri: hyper::Uri,
-    status: StatusCode,
-    start: Instant,
-    action: &'static str,
-    worker_pid: u32,
-    php_target: Option<Arc<str>>,
-}
-
-impl PendingAccessLog {
-    /// 0 for anything that never reached a PHP worker; a real pid is never 0.
-    fn emit(&self, body: BodyOutcome) {
-        logging::info!(
-            r#type = "access_log",
-            client_ip = %self.client_ip,
-            method = %self.method,
-            path = self.uri.path(),
-            status = self.status.as_u16(),
-            duration_ms = self.start.elapsed().as_millis() as u64,
-            worker_pid = self.worker_pid,
-            action = self.action,
-            php_target = self.php_target.as_deref().unwrap_or(""),
-            body = body.as_str(),
-        );
-    }
-}
-
-/// Holds the in-flight guard until the body is fully streamed, without which
-/// the shutdown drain could exit and truncate a live response.
-///
-/// It also owns the access-log line, emitted from `Drop` so that
-/// `duration_ms` covers the body transfer and a stream that dies halfway is
-/// not recorded as a clean 200. No explicit call site could catch the client
-/// hanging up mid-body.
-struct GuardedBody {
-    inner: ResponseBody,
-    _guard: InFlightGuard,
-    _conn: ConnBusyGuard,
-    log: Option<PendingAccessLog>,
-    outcome: BodyOutcome,
-}
-
-impl http_body::Body for GuardedBody {
-    type Data = Bytes;
-    type Error = std::io::Error;
-
-    fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::io::Error>>> {
-        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
-        match &polled {
-            std::task::Poll::Ready(None) => self.outcome = BodyOutcome::Complete,
-            std::task::Poll::Ready(Some(Err(_))) => self.outcome = BodyOutcome::Failed,
-            _ => {}
-        }
-        polled
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl Drop for GuardedBody {
-    fn drop(&mut self) {
-        if let Some(log) = self.log.take() {
-            log.emit(self.outcome);
-        }
-    }
-}
 
 /// Everything the end of a request needs, whichever of `handle`'s exits it
 /// takes: the guards that must outlive the response, and the log fields known
@@ -437,73 +317,9 @@ async fn handle(
     )
 }
 
-/// Lets an idle keep-alive connection be closed without disturbing one
-/// merely waiting on a slow PHP request.
-///
-/// Wall-clock silence cannot tell those apart, since a socket sees no
-/// traffic for as long as a script runs. Idle is therefore defined as no
-/// request in flight plus time since the last one finished.
-struct ConnState {
-    in_flight: AtomicU64,
-    /// Starts at accept time, so a client that connects and sends nothing is
-    /// idle from the outset.
-    last_finished_ms: AtomicU64,
-    epoch: Instant,
-}
-
-impl ConnState {
-    fn new() -> Self {
-        ConnState {
-            in_flight: AtomicU64::new(0),
-            last_finished_ms: AtomicU64::new(0),
-            epoch: Instant::now(),
-        }
-    }
-
-    fn request_started(&self) {
-        self.in_flight.fetch_add(1, Relaxed);
-    }
-
-    /// Not a `Gauge`, because the order here is load-bearing: decrementing
-    /// first would let `idle_for` pair a zero count with the *previous*
-    /// request's stamp and close a connection that just went idle.
-    fn request_finished(&self) {
-        self.last_finished_ms
-            .store(self.epoch.elapsed().as_millis() as u64, Relaxed);
-        self.in_flight.fetch_sub(1, Relaxed);
-    }
-
-    fn idle_for(&self) -> Option<std::time::Duration> {
-        if self.in_flight.load(Relaxed) > 0 {
-            return None;
-        }
-        let since = self.epoch.elapsed().as_millis() as u64 - self.last_finished_ms.load(Relaxed);
-        Some(std::time::Duration::from_millis(since))
-    }
-}
-
-/// Closes the connection once it has been idle past `idle_timeout`.
-///
-/// Sleeps to the exact moment the deadline could first be reached rather
-/// than ticking towards it, so a quiet connection wakes once and a busy one
-/// wakes about once per request. Polling instead would cost every open
-/// connection a wakeup per interval forever, just to observe no change.
-async fn wait_until_idle(conn: &ConnState, idle_timeout: std::time::Duration) {
-    loop {
-        match conn.idle_for() {
-            // In flight, so the earliest it can go idle is a full timeout away.
-            None => tokio::time::sleep(idle_timeout).await,
-            Some(idle) if idle >= idle_timeout => return,
-            // Quiet but not long enough; sleep out the exact remainder.
-            Some(idle) => tokio::time::sleep(idle_timeout - idle).await,
-        }
-    }
-}
-
 /// Holds the connection in the kernel until the request arrives, so a peer
-/// that only completes the handshake costs no accept, task or connection
-/// slot. One second: a longer hold blinds `header_read_timeout`, which
-/// cannot see how long the kernel already waited.
+/// that only completes the handshake costs no accept or connection slot.
+/// One second: longer would blind `header_read_timeout` to the wait.
 fn set_defer_accept_or_log(listener: &TcpListener, listen: &str) {
     use std::os::fd::AsRawFd;
     let secs: libc::c_int = 1;
@@ -532,118 +348,6 @@ fn set_defer_accept_or_log(listener: &TcpListener, listen: &str) {
 fn set_nodelay_or_log(stream: &TcpStream) {
     if let Err(e) = stream.set_nodelay(true) {
         logging::warn!(r#type = "controller", error = %e, "set_nodelay failed");
-    }
-}
-
-/// Deliberately a separate listener from public traffic.
-async fn serve_status(listen: String, state: Arc<AppState>) {
-    let header_read_timeout =
-        std::time::Duration::from_secs(state.config.connection.header_read_timeout);
-    let listener = TcpListener::bind(&listen)
-        .await
-        .expect("status bind failed");
-    logging::info!(r#type = "controller", %listen, "status endpoint listening");
-    loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                logging::warn!(r#type = "controller", error = %e, "status accept failed");
-                continue;
-            }
-        };
-        let state = state.clone();
-        tokio::spawn(async move {
-            set_nodelay_or_log(&stream);
-            let io = TokioIo::new(stream);
-            let service = hyper::service::service_fn(move |_req: Request<Incoming>| {
-                let state = state.clone();
-                async move {
-                    let body = state.pool.status_json().to_string();
-                    Ok::<_, std::convert::Infallible>(
-                        Response::builder()
-                            .header(hyper::header::CONTENT_TYPE, "application/json")
-                            .body(Full::new(Bytes::from(body)))
-                            .unwrap(),
-                    )
-                }
-            });
-            let _ = hyper::server::conn::http1::Builder::new()
-                .max_buf_size(MAX_REQUEST_HEAD)
-                .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(header_read_timeout)
-                .serve_connection(io, service)
-                .await;
-        });
-    }
-}
-
-/// SIGTERM (systemd/docker/k8s graceful stop) or SIGINT (Ctrl-C) - same
-/// drain either way.
-async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-    tokio::select! {
-        _ = sigterm.recv() => logging::info!(r#type = "controller", "received SIGTERM"),
-        _ = sigint.recv() => logging::info!(r#type = "controller", "received SIGINT"),
-    }
-}
-
-/// A latched signal: `notify_waiters` would wake only whoever is already
-/// waiting, and an accept loop that missed it would never return - which master
-/// joins on before it exits.
-#[derive(Clone)]
-pub struct Shutdown(tokio::sync::watch::Receiver<bool>);
-
-impl Shutdown {
-    pub fn channel() -> (tokio::sync::watch::Sender<bool>, Shutdown) {
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        (tx, Shutdown(rx))
-    }
-
-    /// Returns at once if it has already fired.
-    pub async fn wait(&mut self) {
-        while !*self.0.borrow_and_update() {
-            if self.0.changed().await.is_err() {
-                return; // sender gone: nothing left to serve either
-            }
-        }
-    }
-}
-
-/// The CPUs this process may actually run on - identities, not the count
-/// `available_parallelism` gives: under a cpuset of `{4,5,6,7}` pinning to
-/// `0..4` would miss all four. Empty means the mask could not be read.
-pub fn allowed_cpus() -> Vec<usize> {
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) != 0 {
-            return Vec::new();
-        }
-        (0..libc::CPU_SETSIZE as usize)
-            .filter(|&cpu| libc::CPU_ISSET(cpu, &set))
-            .collect()
-    }
-}
-
-/// Pins the calling thread to one CPU, keeping its connections' state on one
-/// core instead of following the thread around. Best-effort: a cpuset that
-/// refuses is a reason to serve unpinned, not to refuse to serve.
-pub fn pin_to_cpu(cpu: usize) {
-    if cpu >= libc::CPU_SETSIZE as usize {
-        return; // CPU_SET would index past the mask
-    }
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) != 0 {
-            logging::debug!(
-                r#type = "controller",
-                cpu,
-                error = %std::io::Error::last_os_error(),
-                "could not pin a serving thread to its CPU"
-            );
-        }
     }
 }
 
@@ -759,24 +463,6 @@ const _: () = assert!(
     "a request at the head cap must fit one ring frame, paths and body included"
 );
 
-/// Read once per accept rather than per request.
-#[derive(Clone, Copy)]
-struct ConnTimeouts {
-    header_read: std::time::Duration,
-    idle: std::time::Duration,
-}
-
-impl ConnTimeouts {
-    fn from(state: &AppState) -> Self {
-        ConnTimeouts {
-            header_read: std::time::Duration::from_secs(
-                state.config.connection.header_read_timeout,
-            ),
-            idle: std::time::Duration::from_secs(state.config.connection.idle_timeout),
-        }
-    }
-}
-
 async fn serve_one_connection(
     stream: TcpStream,
     peer: std::net::SocketAddr,
@@ -804,7 +490,6 @@ async fn serve_one_connection(
     };
     let mut connection = std::pin::pin!(
         hyper::server::conn::http1::Builder::new()
-            // The ring is what bounds it: it holds the head twice.
             .max_buf_size(MAX_REQUEST_HEAD)
             // hyper is runtime-agnostic: without a timer installed, any timeout
             // it is asked to honour panics the connection task rather than
@@ -828,6 +513,48 @@ async fn serve_one_connection(
     };
     if let Err(err) = result {
         logging::debug!(r#type = "controller", %peer, error = %err, "connection error");
+    }
+}
+
+/// Deliberately a separate listener from public traffic.
+async fn serve_status(listen: String, state: Arc<AppState>) {
+    let header_read_timeout =
+        std::time::Duration::from_secs(state.config.connection.header_read_timeout);
+    let listener = TcpListener::bind(&listen)
+        .await
+        .expect("status bind failed");
+    logging::info!(r#type = "controller", %listen, "status endpoint listening");
+    loop {
+        let (stream, _peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                logging::warn!(r#type = "controller", error = %e, "status accept failed");
+                continue;
+            }
+        };
+        let state = state.clone();
+        tokio::spawn(async move {
+            set_nodelay_or_log(&stream);
+            let io = TokioIo::new(stream);
+            let service = hyper::service::service_fn(move |_req: Request<Incoming>| {
+                let state = state.clone();
+                async move {
+                    let body = state.pool.status_json().to_string();
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .header(hyper::header::CONTENT_TYPE, "application/json")
+                            .body(Full::new(Bytes::from(body)))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .max_buf_size(MAX_REQUEST_HEAD)
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(header_read_timeout)
+                .serve_connection(io, service)
+                .await;
+        });
     }
 }
 

@@ -4,12 +4,9 @@
 use headers::HeaderMapExt as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Extracted once, before the request is consumed.
-///
-/// Typed values rather than raw strings, because the `headers` crate already
-/// gets the comma-separated `If-None-Match` list and weak/strong comparison
-/// right (RFC 9110 §8.8.3.2/§13.1.5). `range` stays raw, only ever being a
-/// single range here.
+/// Extracted once, before the request is consumed. Typed values rather than
+/// raw strings, since the `headers` crate already gets comma-separated
+/// `If-None-Match` and weak/strong comparison right (RFC 9110 §8.8.3.2/§13.1.5).
 #[derive(Default)]
 pub(crate) struct ConditionalHeaders {
     pub(crate) if_none_match: Option<headers::IfNoneMatch>,
@@ -33,12 +30,8 @@ impl ConditionalHeaders {
 }
 
 /// From metadata alone: no content hashing, no I/O beyond the `stat` already
-/// done.
-///
-/// Nanosecond rather than whole-second precision, because RFC 9110 §13.1.5
-/// requires strong comparison for `If-Range`: a same-second overwrite of a
-/// same-length file would keep the old etag valid and let a resumed download
-/// splice two file versions.
+/// done. Nanosecond precision, since RFC 9110 §13.1.5's strong comparison for
+/// `If-Range` needs it: whole seconds could splice two file versions.
 pub(crate) fn make_etag(modified: Option<SystemTime>, len: u64) -> Option<String> {
     let modified = modified?.duration_since(UNIX_EPOCH).ok()?;
     Some(format!(
@@ -49,13 +42,8 @@ pub(crate) fn make_etag(modified: Option<SystemTime>, len: u64) -> Option<String
     ))
 }
 
-/// Marks the same tag weak once a response is no longer the exact bytes the
-/// ETag was computed for, which is enough to stop it satisfying `If-Range`
-/// and splicing two representations into one resumed download.
-///
-/// It does not encode *which* encoding the tag came from, so it cannot
-/// prevent a cache serving a false 304 across encodings - `Vary` is what
-/// does that. This is defence-in-depth for `If-Range` alone.
+/// Weak enough to fail `If-Range`'s strong comparison, so a resumed
+/// download can't splice two representations together.
 pub(crate) fn weaken_etag(etag: &str) -> String {
     format!("W/{etag}")
 }

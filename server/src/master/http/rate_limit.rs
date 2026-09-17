@@ -7,8 +7,8 @@
 //! being scan-resistant: one-shot addresses cannot displace a repeat offender.
 
 use super::proxy::ClientIdentity;
-use crate::config::MatchPattern;
 use crate::logging;
+use crate::utils::match_pattern::MatchPattern;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
@@ -125,7 +125,7 @@ impl RateLimiter {
     /// Whether `user_agent` is subject to this limiter at all. Touches no
     /// shared state, so it is safe to gate on before `check`.
     pub(crate) fn should_limit(&self, user_agent: &str) -> bool {
-        crate::config::matches_any(&self.user_agent, user_agent)
+        crate::utils::match_pattern::matches_any(&self.user_agent, user_agent)
     }
 
     pub(crate) fn period_seconds(&self) -> u64 {

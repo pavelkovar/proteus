@@ -11,10 +11,9 @@ use std::os::fd::{OwnedFd, RawFd};
 use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
 
-/// A large body streams to an unlinked temp file whose fd is passed over the
-/// worker's body socket; only its length crosses the ring.
-/// `len` travels with it because PHP needs CONTENT_LENGTH before
-/// `read_post()`, and stat()ing the file would leave a TOCTOU gap.
+/// A large body streams to an unlinked temp file whose fd crosses over the
+/// worker's body socket; `len` travels with it because PHP needs
+/// CONTENT_LENGTH before `read_post()`, and stat()ing it would TOCTOU.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum RequestBody<'a> {
     Inline(#[serde(borrow, with = "serde_bytes")] Cow<'a, [u8]>),
@@ -65,10 +64,9 @@ pub struct PhpRequest<'a> {
     pub https: bool,
 }
 
-/// Headers as one `name\0value\0…` blob, in both directions. A
-/// `Vec<(String, String)>` would cost two allocations per header each way,
-/// since postcard rebuilds every `String` on decode; neither side needs
-/// owned strings, so postcard moves this as a single `memcpy`.
+/// Headers as one `name\0value\0…` blob, in both directions: postcard
+/// rebuilds every `String` on decode, so a `Vec<(String, String)>` would
+/// cost two allocations per header each way where this moves as one `memcpy`.
 ///
 /// `\0` is a safe separator because hyper rejects NUL in header names and
 /// values, and PHP's `header()` has rejected CR/LF/NUL since 5.1.2. `push`
@@ -187,10 +185,8 @@ impl<'a> From<&'a HeaderBlob<'_>> for HeaderBlobRef<'a> {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ResponseFrame<'a> {
     /// A blob rather than a map, since header names may legitimately repeat.
-    /// An oversized set splits across consecutive frames, with `more` set on
-    /// all but the last so a reader can forward a complete set without
-    /// waiting on the next frame to infer the run ended. `status` repeats and
-    /// is ignored past the first.
+    /// An oversized set splits across frames, `more` set on all but the last,
+    /// so a reader can forward it without waiting for the run to end.
     Headers {
         status: u16,
         #[serde(borrow)]
@@ -207,10 +203,9 @@ pub enum ResponseFrame<'a> {
 }
 
 impl ResponseFrame<'_> {
-    /// The response path's one unavoidable copy: a decoded frame borrows the
-    /// ring scratch that the next read overwrites, and a non-blocking sweep
-    /// collects several frames before handing any of them on. The request
-    /// path needs no equivalent, being consumed before the next read.
+    /// The response path's one unavoidable copy: a decoded frame borrows
+    /// ring scratch the next read overwrites, and a non-blocking sweep
+    /// collects several frames before handing any of them on.
     pub fn into_owned(self) -> ResponseFrame<'static> {
         match self {
             ResponseFrame::Headers {

@@ -446,7 +446,6 @@ fn suppressed_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy")
 }
 
-/// Uppercased, hyphens to underscores, `HTTP_` prefix.
 fn write_header_cgi_key(out: &mut Vec<u8>, name: &str) {
     out.extend_from_slice(b"HTTP_");
     let mut char_buf = [0u8; 4];

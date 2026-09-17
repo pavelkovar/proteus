@@ -3,5 +3,3 @@
 
 pub mod http;
 pub mod pool_manager;
-mod prototype_launch;
-mod worker_channel;
