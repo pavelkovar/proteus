@@ -252,18 +252,6 @@ fn encode_into<'a, T: serde::Serialize + ?Sized>(
     Ok(scratch.as_slice())
 }
 
-/// `Retire` has no sender: it is the worker's own decision, reached through
-/// the idle deadline in `read_command_from_ring`.
-///
-/// The size gap is deliberate. Boxing `Request` to close it would cost a
-/// malloc/free pair per request - the only allocation left on this path -
-/// against one stack move on the worker's own thread.
-#[allow(clippy::large_enum_variant)]
-pub enum WorkerCommand<'a> {
-    Request(PhpRequest<'a>),
-    Retire,
-}
-
 /// One frame, always: the head cap master sets on hyper and this ring are
 /// sized against each other, so no request hyper accepts can need two. One
 /// that still does not fit is refused rather than split.
@@ -278,27 +266,20 @@ pub async fn write_request_to_ring(
         .map_err(ring_err_to_io)
 }
 
-/// Worker side, blocking. `Ok(None)` means the peer is gone.
-///
-/// Sitting idle past `deadline` yields `Retire`, making retirement the
-/// worker's own decision - master never has to time a worker it cannot see
-/// the inside of.
-pub fn read_command_from_ring<'a>(
+/// Worker side, blocking until a request arrives. `Ok(None)` means the peer
+/// is gone - idle timeout is master's call, not this function's; see
+/// `PoolManager::sweep_idle_workers`.
+pub fn read_request_from_ring<'a>(
     ring: &shm::RequestRing,
     peer: &shm::PeerDeath,
     scratch: &'a mut Vec<u8>,
     notify_efd: RawFd,
-    deadline: Option<std::time::Instant>,
-) -> std::io::Result<Option<WorkerCommand<'a>>> {
-    match ring.read_frame_until(scratch, peer, notify_efd, deadline) {
-        Ok(false) => Ok(Some(WorkerCommand::Retire)),
-        // Borrows `scratch`, so the command is valid until the next read. An
+) -> std::io::Result<Option<PhpRequest<'a>>> {
+    match ring.read_frame_until(scratch, peer, notify_efd, None) {
+        // Borrows `scratch`, so the request is valid until the next read. An
         // empty frame here (never written by the current request-ring
-        // producer) falls through to postcard, which errors on it rather
-        // than being silently read as a retire nothing actually sent.
-        Ok(true) => Ok(Some(WorkerCommand::Request(
-            postcard::from_bytes(scratch).map_err(to_io_err)?,
-        ))),
+        // producer) falls through to postcard, which errors on it.
+        Ok(_) => Ok(Some(postcard::from_bytes(scratch).map_err(to_io_err)?)),
         Err(shm::RingError::PeerGone) => Ok(None),
         Err(e) => Err(ring_err_to_io(e)),
     }

@@ -151,7 +151,6 @@ where
             // The real parent, or `die_with_parent`'s recheck sees a
             // mismatch and exits the whole test process on the spot.
             nix::unistd::getppid(),
-            None,
         );
     });
     drop(master_link);

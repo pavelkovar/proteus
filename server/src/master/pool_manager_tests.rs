@@ -20,6 +20,7 @@ fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
         admission: Arc::new(Semaphore::new(TEST_POOL_MAX)),
         max_workers: 1,
         request_timeout: Duration::from_secs(30),
+        idle_timeout: None,
         queue_timeout: Duration::from_secs(5),
         spawn_timeout: Duration::from_secs(30),
         queue_max_depth: 0,
@@ -317,11 +318,11 @@ fn detached_meta(pool_started: Instant) -> WorkerMeta {
     )
 }
 
-/// A worker that retired itself must be found wherever it is parked. Dispatch
-/// only ever sees the back, so anything the sweep fails to rotate past is
-/// reported idle forever.
+/// A worker found already gone (crash, external kill) must be found wherever
+/// it is parked. Dispatch only ever sees the back, so anything the sweep
+/// fails to rotate past is reported idle forever.
 #[tokio::test]
-async fn a_retired_worker_is_reaped_from_any_position() {
+async fn a_vanished_worker_is_reaped_from_any_position() {
     for position in 0..3 {
         let pool = make_test_pool_manager(spawn_sleeper());
         for (offset, pid) in [101u32, 102, 103].into_iter().enumerate() {
@@ -329,16 +330,16 @@ async fn a_retired_worker_is_reaped_from_any_position() {
             pool.idle.lock().unwrap().push_back(worker);
         }
 
-        pool.sweep_idle_workers().await;
+        pool.sweep_idle_workers(3).await;
 
         let left: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
         assert_eq!(
             left.len(),
             2,
-            "the retired worker at position {position} was never looked at"
+            "the vanished worker at position {position} was never looked at"
         );
         assert!(!left.contains(&(101 + position as u32)));
-        assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 1);
+        assert_eq!(pool.counters.workers_vanished_idle.load(Relaxed), 1);
         reap_tracked_prototype(&pool);
     }
 }
@@ -353,10 +354,99 @@ async fn a_sweep_leaves_the_order_it_found() {
         pool.idle.lock().unwrap().push_back(worker);
     }
 
-    pool.sweep_idle_workers().await;
+    pool.sweep_idle_workers(4).await;
 
     let after: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
     assert_eq!(after, vec![201, 202, 203, 204]);
+    reap_tracked_prototype(&pool);
+}
+
+/// Only the coldest workers beyond `spare` are eligible for idle timeout; the
+/// warmest `spare` of them must survive no matter how long they have sat idle.
+///
+/// Real spawned processes, not placeholder pids: `IdleTimeout` now signals
+/// the worker, and a placeholder pid could collide with an unrelated real one.
+#[tokio::test]
+async fn idle_timeout_never_touches_the_spare_floor() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    let pool = PoolManager {
+        idle_timeout: Some(Duration::from_secs(60)),
+        // `idle_worker` stamps `last_active_ms` as "idle since pool start",
+        // so backdating pool start is what makes every worker read as long idle.
+        started_at: Instant::now() - Duration::from_secs(3600),
+        ..pool
+    };
+    let pids: Vec<u32> = (0..4).map(|_| spawn_sleeper()).collect();
+    for &pid in &pids {
+        pool.idle
+            .lock()
+            .unwrap()
+            .push_back(idle_worker(&pool, pid, false));
+    }
+
+    // 4 idle, spare 2: the coldest 2 (front) are excess and over the
+    // timeout, the warmest 2 (back) are the protected floor.
+    pool.sweep_idle_workers(2).await;
+
+    let left: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
+    assert_eq!(left, pids[2..].to_vec(), "only the floor should survive");
+    assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 2);
+    for &pid in &pids[..2] {
+        assert!(
+            became_a_zombie(pid as i32).await,
+            "excess idle worker {pid} should have been killed"
+        );
+    }
+    for &pid in &pids[2..] {
+        let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+        let _ = waitpid(Pid::from_raw(pid as i32), None);
+    }
+    reap_tracked_prototype(&pool);
+}
+
+/// `idle_timeout` disabled (`None`, the default) must never evict anyone,
+/// however long they have sat idle and however far over `spare`. Nothing gets
+/// killed on this path, so placeholder pids are safe here.
+#[tokio::test]
+async fn disabled_idle_timeout_never_evicts_excess_workers() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    let pool = PoolManager {
+        started_at: Instant::now() - Duration::from_secs(3600),
+        ..pool
+    };
+    for pid in [401u32, 402, 403] {
+        let worker = idle_worker(&pool, pid, false);
+        pool.idle.lock().unwrap().push_back(worker);
+    }
+
+    pool.sweep_idle_workers(1).await;
+
+    let left: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
+    assert_eq!(left, vec![401, 402, 403]);
+    assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 0);
+    reap_tracked_prototype(&pool);
+}
+
+/// Exactly at the floor - no excess at all - must evict nobody, however long
+/// they have sat idle. Guards the `>=` boundary in the live floor check.
+#[tokio::test]
+async fn idle_timeout_evicts_nobody_when_idle_count_equals_spare() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    let pool = PoolManager {
+        idle_timeout: Some(Duration::from_secs(60)),
+        started_at: Instant::now() - Duration::from_secs(3600),
+        ..pool
+    };
+    for pid in [501u32, 502] {
+        let worker = idle_worker(&pool, pid, false);
+        pool.idle.lock().unwrap().push_back(worker);
+    }
+
+    pool.sweep_idle_workers(2).await;
+
+    let left: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
+    assert_eq!(left, vec![501, 502]);
+    assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 0);
     reap_tracked_prototype(&pool);
 }
 
@@ -445,6 +535,7 @@ async fn every_retirement_reason_returns_the_seat() {
         Retired::Abandoned,
         Retired::Watchdog,
         Retired::Failed,
+        Retired::Vanished,
         Retired::Unavailable,
     ] {
         // Out of range, so the kill variants fail harmlessly with ESRCH.
@@ -470,19 +561,20 @@ async fn every_retirement_reason_returns_the_seat() {
     reap_tracked_prototype(&pool);
 }
 
-/// A worker that is retiring itself is already on its way out; signalling it
-/// would race a pid master no longer owns. One that is merely unwanted has to
-/// be stopped, or it runs on holding its PHP heap with nothing tracking it.
+/// A worker that already exited on its own (`RequestLimit`, `Abandoned`,
+/// `Vanished`) needs no signal - it's already gone. One still running,
+/// including an `IdleTimeout` worker master decided to evict, must be killed.
 #[tokio::test]
 async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
     let pool = make_test_pool_manager(spawn_sleeper());
 
     for (why, expect_killed) in [
-        (Retired::IdleTimeout, false),
+        (Retired::IdleTimeout, true),
         (Retired::RequestLimit, false),
         (Retired::Abandoned, false),
         (Retired::Watchdog, true),
         (Retired::Failed, true),
+        (Retired::Vanished, false),
         (Retired::Unavailable, true),
     ] {
         let worker_pid = spawn_sleeper();
@@ -517,17 +609,19 @@ async fn each_reason_counts_under_its_own_name() {
             p.counters.workers_abandoned.load(Relaxed),
             p.counters.watchdog_kills.load(Relaxed),
             p.counters.dispatch_failed.load(Relaxed),
+            p.counters.workers_vanished_idle.load(Relaxed),
         ]
     };
 
     for (why, expected) in [
-        (Retired::IdleTimeout, [1, 0, 0, 0, 0]),
-        (Retired::RequestLimit, [1, 1, 0, 0, 0]),
-        (Retired::Abandoned, [1, 1, 1, 0, 0]),
-        (Retired::Watchdog, [1, 1, 1, 1, 0]),
-        (Retired::Failed, [1, 1, 1, 1, 1]),
+        (Retired::IdleTimeout, [1, 0, 0, 0, 0, 0]),
+        (Retired::RequestLimit, [1, 1, 0, 0, 0, 0]),
+        (Retired::Abandoned, [1, 1, 1, 0, 0, 0]),
+        (Retired::Watchdog, [1, 1, 1, 1, 0, 0]),
+        (Retired::Failed, [1, 1, 1, 1, 1, 0]),
+        (Retired::Vanished, [1, 1, 1, 1, 1, 1]),
         // Nothing moves: the caller accounts for this one.
-        (Retired::Unavailable, [1, 1, 1, 1, 1]),
+        (Retired::Unavailable, [1, 1, 1, 1, 1, 1]),
     ] {
         tracked_worker(&pool, NO_REAL_WORKER_PID);
         pool.retire(NO_REAL_WORKER_PID, why);
@@ -624,6 +718,8 @@ async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
         .expect("the returned worker is the one it gets");
     assert_eq!(got, 4242);
 
-    pool.retire(4242, Retired::IdleTimeout);
+    // `Vanished`, not `IdleTimeout`: 4242 is a placeholder pid, not a real
+    // process, and `IdleTimeout` now signals it.
+    pool.retire(4242, Retired::Vanished);
     reap_tracked_prototype(&pool);
 }

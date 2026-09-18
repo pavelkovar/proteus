@@ -166,12 +166,12 @@ async fn run_job(job: &CronJob, identity: &Identity, registry: &Registry) {
     let mut running = match exec::spawn(identity, &job.command) {
         Ok(r) => r,
         Err(e) => {
-            logging::error!(r#type = "cron", line = job.line, error = %e, "failed to spawn job");
+            logging::error!(r#type = "cron", error = %e, "failed to spawn job");
             return;
         }
     };
     lock(registry).insert(job.line, running.pgid);
-    logging::info!(r#type = "cron", line = job.line, command = %job.command, "job started");
+    logging::info!(r#type = "cron", command = %job.command, "job started");
 
     let start = std::time::Instant::now();
     let status = running.child.wait().await;
@@ -181,7 +181,6 @@ async fn run_job(job: &CronJob, identity: &Identity, registry: &Registry) {
     match status {
         Ok(status) => logging::info!(
             r#type = "cron",
-            line = job.line,
             exit_code = status.code(),
             signal = status.signal(),
             duration_ms,
@@ -189,7 +188,6 @@ async fn run_job(job: &CronJob, identity: &Identity, registry: &Registry) {
         ),
         Err(e) => logging::error!(
             r#type = "cron",
-            line = job.line,
             error = %e,
             duration_ms,
             "failed to wait for job"

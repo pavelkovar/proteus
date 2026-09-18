@@ -1,9 +1,9 @@
 //! Prototype lifecycle and the worker pool: how the pool stays populated,
 //! not what happens to one request.
 //!
-//! Retirement is split across both processes: a worker times its own idle
-//! period, and master holds the `spare` floor - neither alone knows both
-//! how long a worker has been idle and whether the pool can afford to lose it.
+//! Master alone decides idle retirement, in `sweep_idle_workers`: it knows
+//! both how long a worker has sat idle (`WorkerMeta`) and whether the pool
+//! can afford to lose it (the `spare` floor) - a worker parked idle just waits.
 
 mod dispatch;
 mod prototype;
@@ -62,6 +62,8 @@ pub struct PoolManager {
     admission: Arc<Semaphore>,
     max_workers: usize,
     request_timeout: Duration,
+    /// `None` disables idle retirement; `sweep_idle_workers` never kills for it.
+    idle_timeout: Option<Duration>,
     queue_timeout: Duration,
     /// Bounds the wait on the prototype. `queue_timeout` covers only
     /// acquiring a permit, so without this a wedged prototype hangs every
@@ -98,9 +100,13 @@ pub(crate) struct Counters {
     workers_spawned: AtomicU64,
     /// Clean retirement, as distinct from `dispatch_failed`.
     recycled_request_limit: AtomicU64,
+    /// Killed by master, unlike `recycled_request_limit` above - the worker
+    /// was not given a chance to exit on its own.
     recycled_idle_timeout: AtomicU64,
     /// Non-zero means something else failed to release a worker.
     workers_reaped_dead: AtomicU64,
+    /// Found already exited while idle - a crash or an external kill.
+    workers_vanished_idle: AtomicU64,
     /// Clients that went away while a worker was checked out.
     workers_abandoned: AtomicU64,
     prototype_respawns: AtomicU64,
@@ -163,6 +169,13 @@ impl WorkerMeta {
             .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
     }
 
+    /// How long since this worker last went idle (or was spawned, if never
+    /// claimed since).
+    fn idle_for(&self, now: Instant, pool_started: Instant) -> Duration {
+        let now_ms = now.duration_since(pool_started).as_millis() as u64;
+        Duration::from_millis(now_ms.saturating_sub(self.last_active_ms.load(Relaxed)))
+    }
+
     fn state_str(&self) -> &'static str {
         match self.state.load(Relaxed) {
             STATE_BUSY => "busy",
@@ -180,7 +193,8 @@ fn respawn_backoff_delay(consecutive_failures: u32) -> Duration {
 /// Why a worker is leaving the pool.
 #[derive(Clone, Copy)]
 pub(crate) enum Retired {
-    /// Retired itself after `processes.idle_timeout`.
+    /// Killed by master for sitting idle past `processes.idle_timeout`,
+    /// beyond what `spare` needs kept warm.
     IdleTimeout,
     /// Retired itself after `limits.requests`.
     RequestLimit,
@@ -190,18 +204,22 @@ pub(crate) enum Retired {
     Watchdog,
     /// Its channel failed mid-response.
     Failed,
+    /// Found already exited while sitting idle - a crash or an external
+    /// kill, not a retirement this server chose.
+    Vanished,
     /// Would not take a request. Uncounted: only the caller knows whether the
     /// retry that follows went on to succeed.
     Unavailable,
 }
 
 impl Retired {
-    /// A worker retiring itself exits on its own; anything else is still
-    /// running and has to be stopped.
+    /// A worker that already exited on its own needs no kill; every other
+    /// reason is still running (or, for `IdleTimeout`, blocked idle) and has
+    /// to be stopped.
     fn needs_kill(self) -> bool {
         matches!(
             self,
-            Retired::Watchdog | Retired::Failed | Retired::Unavailable
+            Retired::IdleTimeout | Retired::Watchdog | Retired::Failed | Retired::Unavailable
         )
     }
 
@@ -212,6 +230,7 @@ impl Retired {
             Retired::Abandoned => "client abandoned the request",
             Retired::Watchdog => "watchdog",
             Retired::Failed => "channel failed",
+            Retired::Vanished => "found already exited while idle",
             Retired::Unavailable => "worker would not take the request",
         }
     }
@@ -276,7 +295,6 @@ impl PoolManager {
             config: ProtoConfig {
                 php_mod_path: resolve_php_mod_path(),
                 max_requests: cfg.php.limits.requests,
-                idle_timeout_seconds: cfg.php.processes.idle_timeout,
                 options: cfg.php.options.clone(),
                 environment: cfg.php.environment.clone(),
                 log_level: cfg.log_level.as_level(),
@@ -303,6 +321,8 @@ impl PoolManager {
             admission: Arc::new(Semaphore::new(cfg.php.processes.max)),
             max_workers: cfg.php.processes.max,
             request_timeout: Duration::from_secs(cfg.php.limits.timeout),
+            idle_timeout: (cfg.php.processes.idle_timeout > 0)
+                .then(|| Duration::from_secs(cfg.php.processes.idle_timeout)),
             queue_timeout: Duration::from_secs(cfg.php.queue.timeout),
             spawn_timeout: Duration::from_secs(cfg.php.processes.spawn_timeout),
             queue_max_depth: cfg.php.queue.max_depth,
@@ -363,16 +383,22 @@ impl PoolManager {
         }
     }
 
-    /// Retires the workers that timed themselves out and returns ring pages
+    /// Retires idle workers past `processes.idle_timeout` beyond what `spare`
+    /// needs kept warm, reaps ones found already gone, and returns ring pages
     /// the rest have consumed.
     ///
     /// Taking each worker out for the length of its check is what gives
     /// `Ring::reclaim_if_due` the exclusion it needs.
-    async fn sweep_idle_workers(&self) {
+    async fn sweep_idle_workers(&self, spare: usize) {
         // Rotating front to back: taking exactly as many as were parked leaves
         // the survivors in the order they started, and only one worker is out
         // of the pool at a time rather than all of them.
+        //
+        // The front holds the coldest workers (see `take_idle`), so a sweep
+        // that only ever pops the front and re-queues survivors at the back
+        // reaches every worker exactly once per full rotation.
         let rounds = self.idle.lock().unwrap().len();
+        let idle_timeout = self.idle_timeout;
         let deadline = Instant::now() + RECLAIM_BUDGET;
         let mut reclaimed = 0usize;
         for _ in 0..rounds {
@@ -380,10 +406,21 @@ impl PoolManager {
                 break;
             };
             if worker.channel.worker_has_exited() {
+                self.retire(worker.pid, Retired::Vanished);
+                continue;
+            }
+            let now = Instant::now();
+            // Re-checked live rather than against a headcount taken before the
+            // loop: a concurrent `take_idle` shrinking the pool mid-sweep must
+            // still leave `spare` behind, not whatever the count was at entry.
+            if let Some(idle_timeout) = idle_timeout
+                && worker.meta.idle_for(now, self.started_at) >= idle_timeout
+                && self.idle.lock().unwrap().len() >= spare
+            {
                 self.retire(worker.pid, Retired::IdleTimeout);
                 continue;
             }
-            if Instant::now() < deadline && worker.channel.reclaim_is_due() {
+            if now < deadline && worker.channel.reclaim_is_due() {
                 let mapped = worker.channel.mapping();
                 // fallocate is not guaranteed cheap and cannot safely overlap
                 // itself, so this is awaited rather than left detached.
@@ -420,7 +457,7 @@ impl PoolManager {
                 );
                 self.try_respawn_prototype().await;
             }
-            self.sweep_idle_workers().await;
+            self.sweep_idle_workers(spare).await;
             // Seats rather than the worker map: a spawn holds its seat from
             // before the fork, so this cannot start one the pool has no room
             // for while another is still in flight.
@@ -571,6 +608,7 @@ impl PoolManager {
             Retired::Abandoned => Some(&self.counters.workers_abandoned),
             Retired::Watchdog => Some(&self.counters.watchdog_kills),
             Retired::Failed => Some(&self.counters.dispatch_failed),
+            Retired::Vanished => Some(&self.counters.workers_vanished_idle),
             Retired::Unavailable => None,
         };
         if let Some(counter) = counter {
@@ -601,12 +639,12 @@ impl PoolManager {
             let returned = self.worker_returned.notified();
             tokio::pin!(returned);
 
-            // A worker can retire itself while still parked here.
+            // A worker can vanish (crash, external kill) while parked here.
             while let Some(worker) = self.take_idle() {
                 if !worker.channel.worker_has_exited() {
                     return Ok(worker);
                 }
-                self.retire(worker.pid, Retired::IdleTimeout);
+                self.retire(worker.pid, Retired::Vanished);
             }
             match self.spawn_worker().await {
                 Err(e) if is_pool_full(&e) => {}
@@ -674,6 +712,7 @@ impl PoolManager {
                     "recycled_request_limit": self.counters.recycled_request_limit.load(Relaxed),
                     "recycled_idle_timeout": self.counters.recycled_idle_timeout.load(Relaxed),
                     "workers_reaped_dead": self.counters.workers_reaped_dead.load(Relaxed),
+                    "workers_vanished_idle": self.counters.workers_vanished_idle.load(Relaxed),
                     "workers_abandoned": self.counters.workers_abandoned.load(Relaxed),
                     "prototype_respawns_total": self.counters.prototype_respawns.load(Relaxed),
                     "crash_loop_backoffs": self.counters.crash_loop_backoffs.load(Relaxed),

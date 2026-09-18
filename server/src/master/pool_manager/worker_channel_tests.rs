@@ -98,20 +98,15 @@ async fn write_request_publishes_the_request_for_the_worker_to_read() {
 
     let channel = h.worker_side.channel();
     let mut scratch = Vec::new();
-    let command = data::read_command_from_ring(
+    let req = data::read_request_from_ring(
         &channel.request,
         &channel.peer_death,
         &mut scratch,
         h.req_space_efd_raw,
-        Some(std::time::Instant::now() + Duration::from_secs(5)),
     )
     .unwrap()
     .unwrap();
-    match command {
-        data::WorkerCommand::Request(req) => assert_eq!(req.script_name, "/x.php"),
-        // What an expired deadline yields, so this is also "nothing arrived".
-        data::WorkerCommand::Retire => panic!("no request reached the ring"),
-    }
+    assert_eq!(req.script_name, "/x.php");
 }
 
 #[tokio::test]
@@ -651,14 +646,8 @@ async fn a_worker_parked_on_the_request_ring_is_released_when_master_drops_the_c
     std::thread::spawn(move || {
         let ch = worker_side.channel();
         let mut scratch = Vec::new();
-        // No deadline: this is about release by peer death, not by timeout.
-        let result = data::read_command_from_ring(
-            &ch.request,
-            &ch.peer_death,
-            &mut scratch,
-            req_space_raw,
-            None,
-        );
+        let result =
+            data::read_request_from_ring(&ch.request, &ch.peer_death, &mut scratch, req_space_raw);
         let _ = done_tx.send(matches!(result, Ok(None)));
     });
 

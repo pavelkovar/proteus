@@ -30,9 +30,6 @@ const ZOMBIE_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 pub(crate) struct ProtoConfig {
     pub(crate) php_mod_path: String,
     pub(crate) max_requests: u32,
-    /// 0 never retires on idle.
-    #[serde(default)]
-    pub(crate) idle_timeout_seconds: u64,
     pub(crate) options: PhpOptions,
     #[serde(default)]
     pub(crate) environment: HashMap<String, String>,
@@ -77,14 +74,11 @@ pub fn run() -> ! {
     let ProtoConfig {
         php_mod_path,
         max_requests,
-        idle_timeout_seconds,
         options: proto_options,
         environment: proto_environment,
         log_level,
     } = proto_config;
     logging::set_min_level(log_level);
-    let idle_timeout =
-        (idle_timeout_seconds > 0).then(|| std::time::Duration::from_secs(idle_timeout_seconds));
 
     logging::info!(
         r#type = "prototype",
@@ -186,7 +180,6 @@ pub fn run() -> ! {
                     max_requests,
                     notify_efds,
                     prototype_pid,
-                    idle_timeout,
                 );
                 std::process::exit(0);
             }

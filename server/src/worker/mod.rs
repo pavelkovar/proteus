@@ -76,7 +76,6 @@ pub(crate) fn run(
     max_requests: u32,
     notify: shm::NotifyEfds,
     prototype_pid: nix::unistd::Pid,
-    idle_timeout: Option<std::time::Duration>,
 ) {
     use std::os::fd::AsRawFd;
     // Before the worker can park on anything untimed.
@@ -97,24 +96,16 @@ pub(crate) fn run(
         // capacity rather than its last peak.
         scratch.shrink();
 
-        let deadline = idle_timeout.map(|timeout| std::time::Instant::now() + timeout);
-        let req = match data::read_command_from_ring(
+        let req = match data::read_request_from_ring(
             &channel.request,
             &channel.peer_death,
             &mut scratch.read,
             req_space_efd_raw,
-            deadline,
         ) {
-            Ok(Some(data::WorkerCommand::Request(req))) => req,
-            Ok(Some(data::WorkerCommand::Retire)) => {
-                // Only reachable while genuinely idle, so there is nothing
-                // to finish first.
-                logging::debug!(r#type = "worker", pid, "idle timeout reached, retiring");
-                break;
-            }
+            Ok(Some(req)) => req,
             Ok(None) => break,
             Err(e) => {
-                logging::warn!(r#type = "worker", pid, error = %e, "read_command_from_ring failed");
+                logging::warn!(r#type = "worker", pid, error = %e, "read_request_from_ring failed");
                 break;
             }
         };

@@ -301,9 +301,8 @@ pub struct Processes {
     pub max: usize,
     /// Pre-spawned at startup; idle floor once a worker is claimed.
     pub spare: usize,
-    /// A worker retires itself after this long with no request; 0 never.
-    /// Enforced by the worker, not master, since master timing each idle
-    /// worker would need state neither side keeps on its own.
+    /// Master kills a worker idle this long, once above the `spare` floor;
+    /// 0 never. The floor itself is never touched, however long it sits idle.
     #[serde(default)]
     pub idle_timeout: u64,
     /// How long the prototype may take to answer a spawn request before it
