@@ -79,6 +79,7 @@ async fn start_server(name: &str, php_root: &str, overrides: serde_json::Value) 
         .unwrap();
 
     let child = Command::new(env!("CARGO_BIN_EXE_proteus"))
+        .arg("--config")
         .arg(&config_path)
         .env("PROTEUS_PHP_MOD_PATH", php_mod_path())
         .stdout(Stdio::inherit())
@@ -2932,6 +2933,7 @@ async fn invalid_config_fails_fast_instead_of_starting() {
 
     let output = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("--config")
             .arg(&config_path)
             .output()
     })
@@ -2948,6 +2950,271 @@ async fn invalid_config_fails_fast_instead_of_starting() {
         stderr.contains("php.processes.spare"),
         "got stderr: {stderr}"
     );
+}
+
+#[tokio::test]
+async fn envsubst_subcommand_expands_stdin_to_stdout() {
+    let output = tokio::task::spawn_blocking(|| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("envsubst")
+            .env("PROTEUS_TEST_ENVSUBST_CLI", "world")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"hello ${PROTEUS_TEST_ENVSUBST_CLI} and ${MISSING:-default}")
+            .unwrap();
+        child.wait_with_output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "hello world and default"
+    );
+}
+
+#[tokio::test]
+async fn envsubst_subcommand_fails_on_missing_variable_without_default() {
+    let output = tokio::task::spawn_blocking(|| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("envsubst")
+            .env_remove("PROTEUS_TEST_ENVSUBST_CLI_MISSING")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"${PROTEUS_TEST_ENVSUBST_CLI_MISSING}")
+            .unwrap();
+        child.wait_with_output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("PROTEUS_TEST_ENVSUBST_CLI_MISSING"),
+        "got stderr: {stderr}"
+    );
+}
+
+/// Kill-on-drop for an owned `Child` a test keeps interacting with after
+/// construction - `ChildGuard` above borrows instead, so once built it can
+/// never be touched again (a `Drop` impl's borrow is live to end of scope).
+struct OwnedChildGuard(Child);
+
+impl Drop for OwnedChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for OwnedChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for OwnedChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+fn write_crontab(name: &str, contents: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("test-crontab-{name}-{}", std::process::id()));
+    std::fs::File::create(&path)
+        .unwrap()
+        .write_all(contents.as_bytes())
+        .unwrap();
+    path
+}
+
+fn spawn_cron(args: &[&str]) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_proteus"))
+        .arg("cron")
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn cron binary")
+}
+
+/// Blocks up to `timeout` for `needle` to appear in `reader`'s remaining
+/// output, one line at a time.
+fn wait_for_line(reader: &mut impl std::io::BufRead, needle: &str, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut line = String::new();
+    while std::time::Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false,
+            Ok(_) if line.contains(needle) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_malformed_cron_crontab_fails_fast_with_the_line_number() {
+    let output = tokio::task::spawn_blocking(|| {
+        let crontab = write_crontab("malformed", "* * * * * echo one\nnot-enough-fields\n");
+        Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("cron")
+            .arg(&crontab)
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("line 2"), "stderr: {stderr}");
+}
+
+#[tokio::test]
+async fn a_missing_cron_crontab_argument_is_a_usage_error() {
+    let output = tokio::task::spawn_blocking(|| {
+        Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("cron")
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(!output.status.success());
+}
+
+#[tokio::test]
+async fn an_unknown_cron_user_fails_fast_before_any_job_runs() {
+    let output = tokio::task::spawn_blocking(|| {
+        let crontab = write_crontab("unknown-user", "* * * * * echo should-never-run\n");
+        Command::new(env!("CARGO_BIN_EXE_proteus"))
+            .arg("cron")
+            .arg("--user")
+            .arg("proteus-test-no-such-user")
+            .arg("--group")
+            .arg("root")
+            .arg(&crontab)
+            .output()
+    })
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("not found"), "stderr: {stderr}");
+}
+
+#[tokio::test]
+async fn cron_sigint_triggers_the_same_graceful_shutdown_as_sigterm() {
+    tokio::task::spawn_blocking(|| {
+        // No job is due for a very long time, so any exit within the grace
+        // period proves SIGINT reached the shutdown path rather than
+        // falling through to the default disposition.
+        let crontab = write_crontab("sigint", "0 0 1 1 * echo never\n");
+        let mut child = OwnedChildGuard(spawn_cron(&[
+            "--shutdown-grace",
+            "1s",
+            crontab.to_str().unwrap(),
+        ]));
+
+        std::thread::sleep(Duration::from_millis(200));
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGINT,
+        )
+        .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(5))
+            .expect("process must exit after SIGINT, not hang");
+        assert!(status.success());
+    })
+    .await
+    .unwrap();
+}
+
+/// The end-to-end path: a job fires on schedule and shutdown kills a
+/// grandchild it backgrounded and left running - the exact scenario
+/// `setsid`+`killpg` exists for (a bare SIGTERM to `sh` alone would miss it).
+#[tokio::test]
+async fn a_due_cron_job_runs_and_shutdown_kills_its_backgrounded_grandchild() {
+    tokio::task::spawn_blocking(|| {
+        let marker = std::env::temp_dir().join(format!("test-cron-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let next_minute = chrono::Local::now() + chrono::Duration::minutes(1);
+        let schedule = format!(
+            "{} {} * * *",
+            next_minute.format("%M"),
+            next_minute.format("%H")
+        );
+        let crontab = write_crontab(
+            "grandchild",
+            &format!(
+                "{schedule} echo cron-job-started; (sleep 5 && touch {}) &\n",
+                marker.display()
+            ),
+        );
+
+        let mut child = OwnedChildGuard(spawn_cron(&[
+            "--shutdown-grace",
+            "1s",
+            crontab.to_str().unwrap(),
+        ]));
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+
+        assert!(
+            wait_for_line(&mut stdout, "cron-job-started", Duration::from_secs(75)),
+            "the job never ran within one minute of its schedule"
+        );
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(5))
+            .expect("shutdown must finish well within the grace period");
+        assert!(status.success());
+
+        assert!(
+            !marker.exists(),
+            "the backgrounded grandchild survived shutdown and finished its sleep"
+        );
+    })
+    .await
+    .unwrap();
 }
 
 /// A direct invocation, which nothing stops a human from attempting, must
@@ -3010,6 +3277,7 @@ async fn access_log_includes_worker_pid_and_php_target() {
         .unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_proteus"))
+        .arg("--config")
         .arg(&config_path)
         .env("PROTEUS_PHP_MOD_PATH", php_mod_path())
         .stdout(Stdio::piped())
@@ -4541,6 +4809,7 @@ async fn start_server_capturing_stdout(
         .unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_proteus"))
+        .arg("--config")
         .arg(&config_path)
         .env("PROTEUS_PHP_MOD_PATH", php_mod_path())
         .stdout(Stdio::piped())

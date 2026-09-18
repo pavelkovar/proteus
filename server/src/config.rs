@@ -1,46 +1,23 @@
 //! JSON configuration schema.
 
+use crate::utils::envsubst;
 use crate::utils::match_pattern::{MatchPattern, matches_any};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Braced form only, so a regex like `~\.php$` in `match.uri` is never
-/// mistaken for a placeholder. Expanding raw text rather than a parsed tree
-/// keeps line and column accurate in parse errors.
+/// A JSON parse error's line/column still points at the real config file.
 pub fn parse(text: &str) -> Result<Config, String> {
-    let substituted = substitute_env(text)?;
+    let substituted = envsubst::substitute(text)?;
     serde_json::from_str(&substituted).map_err(|e| e.to_string())
 }
 
-fn substitute_env(text: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let end = after
-            .find('}')
-            .ok_or_else(|| "unterminated \"${\" in config (missing closing brace)".to_string())?;
-        let body = &after[..end];
-        let (name, default) = match body.split_once(':') {
-            Some((name, default)) => (name, Some(default)),
-            None => (body, None),
-        };
-        let value = match (std::env::var(name), default) {
-            (Ok(v), _) => v,
-            (Err(_), Some(default)) => default.to_string(),
-            (Err(_), None) => {
-                return Err(format!(
-                    "environment variable {name:?} is not set (referenced as \"${{{body}}}\" in config)"
-                ));
-            }
-        };
-        out.push_str(&value);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
+/// Must run after `validate` - a route disabled in this environment still
+/// needs its own config checked now, not only once the condition later
+/// flips true.
+pub fn apply_conditions(cfg: &mut Config) {
+    cfg.routes
+        .retain(|r| r.when.as_ref().is_none_or(Condition::eval));
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,12 +137,46 @@ fn default_max_body_size() -> usize {
 
 #[derive(Debug, Deserialize)]
 pub struct Route {
+    /// `None` always keeps the route. Re-evaluated only if the process
+    /// restarts - there is no live config reload.
+    #[serde(default)]
+    pub when: Option<Condition>,
     /// Absent is a catch-all.
     #[serde(rename = "match", default)]
     pub matcher: RouteMatch,
     /// Flattened, so a `Php` route missing `target` fails to parse outright.
     #[serde(flatten)]
     pub action: RouteActionConfig,
+}
+
+/// Environment-driven predicate deciding whether a route is kept.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Condition {
+    Env {
+        name: String,
+        /// Absent just requires the variable to be set, to any value.
+        #[serde(default)]
+        equals: Option<String>,
+    },
+    All(Vec<Condition>),
+    Any(Vec<Condition>),
+    Not(Box<Condition>),
+}
+
+impl Condition {
+    fn eval(&self) -> bool {
+        match self {
+            Condition::Env { name, equals } => match (std::env::var(name), equals) {
+                (Ok(v), Some(expected)) => &v == expected,
+                (Ok(_), None) => true,
+                (Err(_), _) => false,
+            },
+            Condition::All(cs) => cs.iter().all(Condition::eval),
+            Condition::Any(cs) => cs.iter().any(Condition::eval),
+            Condition::Not(c) => !c.eval(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq)]

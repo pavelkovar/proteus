@@ -1,4 +1,5 @@
 use super::*;
+use nix::sys::signal::kill;
 use nix::sys::wait::{WaitStatus, waitpid};
 
 /// How many workers the fixture pool admits; the lifecycle tests lean on the

@@ -367,7 +367,6 @@ impl PhpConn {
                 &mut out_early_sent,
             )
         };
-        drop(ctx);
 
         if rc != 0 {
             // request_startup() failed, so the callback never fired;

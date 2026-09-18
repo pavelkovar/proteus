@@ -45,6 +45,7 @@ fn test_config(routes: Vec<Route>) -> Config {
 
 fn static_route(prefix: &str, root: &str) -> Route {
     Route {
+        when: None,
         matcher: RouteMatch {
             uri: vec![MatchPattern::try_from(format!("{prefix}*")).unwrap()],
             ..Default::default()
@@ -84,6 +85,7 @@ fn first_matching_route_wins() {
     let cfg = test_config(vec![
         static_route("/uploads/", "/var/www/uploads"),
         Route {
+            when: None,
             matcher: RouteMatch::default(),
             action: RouteActionConfig::Static {
                 root: "/var/www/public".into(),
@@ -121,6 +123,7 @@ fn first_matching_route_wins() {
 fn php_target_is_carried_into_the_decision() {
     let cfg = test_config(vec![
         Route {
+            when: None,
             matcher: RouteMatch {
                 uri: vec![MatchPattern::try_from("/api/*".to_string()).unwrap()],
                 ..Default::default()
@@ -130,6 +133,7 @@ fn php_target_is_carried_into_the_decision() {
             },
         },
         Route {
+            when: None,
             matcher: RouteMatch {
                 uri: vec![MatchPattern::try_from("/legacy/*".to_string()).unwrap()],
                 ..Default::default()
@@ -165,6 +169,7 @@ fn php_target_is_carried_into_the_decision() {
 
 fn uri_route(uri_patterns: &[&str], action: RouteActionConfig) -> Route {
     Route {
+        when: None,
         matcher: RouteMatch {
             uri: uri_patterns
                 .iter()
@@ -258,6 +263,7 @@ fn match_route_treats_a_purely_negative_uri_list_as_p_empty() {
 #[test]
 fn match_route_treats_a_purely_negative_method_list_as_p_empty() {
     let cfg = test_config(vec![Route {
+        when: None,
         matcher: RouteMatch {
             method: vec!["!OPTIONS".to_string().try_into().unwrap()],
             ..Default::default()
@@ -281,6 +287,7 @@ fn match_route_treats_a_purely_negative_method_list_as_p_empty() {
 #[test]
 fn match_route_matches_on_method() {
     let cfg = test_config(vec![Route {
+        when: None,
         matcher: RouteMatch {
             method: vec![
                 "GET".to_string().try_into().unwrap(),
@@ -304,6 +311,7 @@ fn match_route_matches_on_method() {
 #[test]
 fn match_route_ands_uri_and_method() {
     let cfg = test_config(vec![Route {
+        when: None,
         matcher: RouteMatch {
             uri: vec!["/api/*".to_string().try_into().unwrap()],
             method: vec!["POST".to_string().try_into().unwrap()],
@@ -330,6 +338,7 @@ fn match_route_ands_uri_and_method() {
 #[test]
 fn match_route_matches_on_host() {
     let cfg = test_config(vec![Route {
+        when: None,
         matcher: RouteMatch {
             host: vec!["example.test".to_string().try_into().unwrap()],
             ..Default::default()
@@ -354,6 +363,7 @@ fn match_route_matches_on_host() {
 #[test]
 fn match_route_ands_host_with_uri_and_method() {
     let cfg = test_config(vec![Route {
+        when: None,
         matcher: RouteMatch {
             uri: vec!["/api/*".to_string().try_into().unwrap()],
             method: vec!["GET".to_string().try_into().unwrap()],
@@ -376,6 +386,7 @@ fn match_route_ands_host_with_uri_and_method() {
 #[test]
 fn route_matching_cannot_be_dodged_by_encoding_a_character() {
     let cfg = test_config(vec![Route {
+        when: None,
         matcher: RouteMatch {
             uri: vec![MatchPattern::try_from("~\\.php$".to_string()).unwrap()],
             ..Default::default()

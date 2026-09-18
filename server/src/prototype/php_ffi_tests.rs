@@ -118,7 +118,6 @@ fn chunk_trampoline_drops_an_unrecognized_kind_rather_than_treating_it_as_end() 
     unsafe {
         chunk_trampoline(99, 0, std::ptr::null(), 0, user_data);
     }
-    drop(ctx);
 
     assert!(
         seen.is_empty(),

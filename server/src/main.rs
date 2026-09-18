@@ -3,6 +3,7 @@
 //! prototype needs arrives over `CONFIG_FD` rather than argv.
 
 mod config;
+mod cron;
 mod ipc;
 mod logging;
 mod master;
@@ -10,6 +11,7 @@ mod prototype;
 mod utils;
 mod worker;
 
+use clap::{CommandFactory, Parser};
 use config::Config;
 use master::http::AppState;
 use master::pool_manager::PoolManager;
@@ -17,6 +19,38 @@ use std::sync::Arc;
 use utils::fs_cache::FsCache;
 
 pub(crate) const APP_NAME: &str = "proteus";
+
+#[derive(clap::Parser)]
+#[command(arg_required_else_help = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+    /// Path to the JSON config; runs the HTTP+PHP server. Required unless a
+    /// subcommand is given instead.
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Reads stdin, expands $VAR/${VAR} references, and writes the result to stdout.
+    Envsubst,
+    /// Runs the jobs in a crontab file, each on its own schedule, until SIGTERM or SIGINT.
+    Cron {
+        /// User to run jobs as; give together with --group, or omit both to
+        /// inherit this process's own identity.
+        #[arg(long)]
+        user: Option<String>,
+        /// Group to run jobs as; give together with --user, or omit both.
+        #[arg(long)]
+        group: Option<String>,
+        /// How long a running job gets after the shutdown signal before SIGKILL.
+        #[arg(long, default_value = "15s")]
+        shutdown_grace: humantime::Duration,
+        /// Path to the crontab file to run.
+        crontab: std::path::PathBuf,
+    },
+}
 
 /// Bounds how long a dead prototype goes unnoticed while the pool still has
 /// spares to serve every request, and how long a worker that exited on its
@@ -45,22 +79,54 @@ fn enable_child_subreaper() {
 #[cfg(not(target_os = "linux"))]
 fn enable_child_subreaper() {}
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
+/// `proteus envsubst < input > output` - the same `${VAR}` expansion `parse`
+/// runs before JSON, exposed standalone so an entrypoint can template any
+/// file (e.g. a php.ini snippet shared with the PHP CLI) with identical rules.
+fn run_envsubst() -> ! {
+    use std::io::{Read, Write};
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .unwrap_or_else(|e| panic!("reading stdin: {e}"));
+    let output = utils::envsubst::substitute(&input).unwrap_or_else(|e| panic!("{e}"));
+    std::io::stdout()
+        .write_all(output.as_bytes())
+        .unwrap_or_else(|e| panic!("writing stdout: {e}"));
+    std::process::exit(0);
+}
 
-    if args.get(1).map(String::as_str) == Some(prototype::INTERNAL_PROTOTYPE_ARG) {
-        prototype::run();
-    }
+fn run_cron(
+    user: Option<String>,
+    group: Option<String>,
+    shutdown_grace: std::time::Duration,
+    crontab_path: std::path::PathBuf,
+) -> ! {
+    utils::proctitle::set_title(&format!("{APP_NAME}: cron"));
+    logging::init(true);
+    enable_child_subreaper();
 
+    let text = std::fs::read_to_string(&crontab_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", crontab_path.display()));
+    let jobs = cron::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", crontab_path.display()));
+    let identity = cron::Identity::resolve(user.as_deref(), group.as_deref());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(cron::run(jobs, identity, shutdown_grace));
+
+    logging::flush();
+    std::process::exit(0);
+}
+
+fn run_server(config_path: std::path::PathBuf) {
     utils::proctitle::set_title(&format!("{APP_NAME}: controller"));
 
-    let config_path = args
-        .get(1)
-        .unwrap_or_else(|| panic!("usage: {APP_NAME} <config.json>"));
-    let config_text = std::fs::read_to_string(config_path)
-        .unwrap_or_else(|e| panic!("reading {config_path}: {e}"));
-    let config: Config =
-        config::parse(&config_text).unwrap_or_else(|e| panic!("{config_path}: {e}"));
+    let config_text = std::fs::read_to_string(&config_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", config_path.display()));
+    let mut config: Config =
+        config::parse(&config_text).unwrap_or_else(|e| panic!("{}: {e}", config_path.display()));
 
     let validation_errors = config::validate(&config);
     if !validation_errors.is_empty() {
@@ -72,6 +138,7 @@ fn main() {
             validation_errors.len()
         );
     }
+    config::apply_conditions(&mut config);
 
     logging::set_min_level(config.log_level.as_level());
     logging::init(true);
@@ -88,6 +155,36 @@ fn main() {
     rt.block_on(run_master(config));
 
     logging::flush();
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // Raw argv[1] check, ahead of clap: an internal re-exec contract, not a
+    // user-facing subcommand.
+    if args.get(1).map(String::as_str) == Some(prototype::INTERNAL_PROTOTYPE_ARG) {
+        prototype::run();
+    }
+
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Envsubst) => run_envsubst(),
+        Some(Command::Cron {
+            user,
+            group,
+            shutdown_grace,
+            crontab,
+        }) => run_cron(user, group, shutdown_grace.into(), crontab),
+        None => match cli.config {
+            Some(config_path) => run_server(config_path),
+            None => Cli::command()
+                .error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "--config <CONFIG> is required when no subcommand is given",
+                )
+                .exit(),
+        },
+    }
 }
 
 async fn run_master(config: Config) {

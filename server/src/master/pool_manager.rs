@@ -15,7 +15,7 @@ use crate::logging;
 use crate::prototype::ProtoConfig;
 use crate::utils::gauge::Gauge;
 pub(crate) use dispatch::{BodyStream, DispatchOutcome};
-use nix::sys::signal::{Signal, kill};
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use prototype::Handle;
 use std::collections::{HashMap, VecDeque};
@@ -224,8 +224,8 @@ impl Retired {
 /// is the expected case.
 pub(crate) fn sigkill(pid: u32, context: &str) {
     logging::warn!(r#type = "controller", pid, context, "sending SIGKILL");
-    if let Err(e) = kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
-        && e != nix::errno::Errno::ESRCH
+    if let Err(e) =
+        crate::utils::process::kill_tolerating_esrch(Pid::from_raw(pid as i32), Signal::SIGKILL)
     {
         logging::warn!(r#type = "controller", pid, error = %e, "signal delivery failed");
     }
@@ -259,19 +259,10 @@ impl PoolManager {
     pub fn spawn_prototype(cfg: &Config) -> Self {
         // config::validate guarantees these are set together or not at all.
         let drop_to = match (&cfg.php.user, &cfg.php.group) {
-            (Some(user), Some(group)) => {
-                let uid = nix::unistd::User::from_name(user)
-                    .expect("getpwnam failed")
-                    .unwrap_or_else(|| panic!("user {user:?} not found"))
-                    .uid
-                    .as_raw();
-                let gid = nix::unistd::Group::from_name(group)
-                    .expect("getgrnam failed")
-                    .unwrap_or_else(|| panic!("group {group:?} not found"))
-                    .gid
-                    .as_raw();
-                Some((uid, gid))
-            }
+            (Some(user), Some(group)) => Some((
+                crate::utils::process::resolve_user(user).uid.as_raw(),
+                crate::utils::process::resolve_group(group).gid.as_raw(),
+            )),
             _ => None,
         };
         let (uid, gid) = drop_to.unwrap_or_else(|| {

@@ -532,51 +532,6 @@ fn parse_substitutes_a_set_variable_outside_uri() {
 }
 
 #[test]
-fn parse_falls_back_to_default_and_prefers_a_set_value() {
-    unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_B") };
-    let json =
-        minimal_config_json(r#""environment": { "PORT": "${PROTEUS_TEST_INTERPOLATE_B:8080}" },"#);
-    let cfg = parse(&json).expect("should parse");
-    assert_eq!(cfg.php.environment["PORT"], "8080");
-
-    unsafe { std::env::set_var("PROTEUS_TEST_INTERPOLATE_B", "9090") };
-    let cfg = parse(&json).expect("should parse");
-    unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_B") };
-    assert_eq!(cfg.php.environment["PORT"], "9090");
-}
-
-/// The first colon separates name from default, so a default containing one
-/// of its own must survive whole.
-#[test]
-fn parse_default_value_containing_a_colon_survives_whole() {
-    unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_COLON") };
-    let json = minimal_config_json(
-        r#""environment": { "BASE_URL": "${PROTEUS_TEST_INTERPOLATE_COLON:http://localhost:8080}" },"#,
-    );
-    let cfg = parse(&json).expect("should parse");
-    assert_eq!(cfg.php.environment["BASE_URL"], "http://localhost:8080");
-}
-
-/// The scanner must keep advancing past each match rather than stopping at
-/// the first.
-#[test]
-fn parse_substitutes_multiple_placeholders_in_one_value() {
-    unsafe {
-        std::env::set_var("PROTEUS_TEST_INTERPOLATE_HOST", "example.test");
-        std::env::set_var("PROTEUS_TEST_INTERPOLATE_PORT", "9090");
-    }
-    let json = minimal_config_json(
-        r#""environment": { "URL": "http://${PROTEUS_TEST_INTERPOLATE_HOST}:${PROTEUS_TEST_INTERPOLATE_PORT}/" },"#,
-    );
-    let cfg = parse(&json).expect("should parse");
-    unsafe {
-        std::env::remove_var("PROTEUS_TEST_INTERPOLATE_HOST");
-        std::env::remove_var("PROTEUS_TEST_INTERPOLATE_PORT");
-    }
-    assert_eq!(cfg.php.environment["URL"], "http://example.test:9090/");
-}
-
-#[test]
 fn parse_errors_on_missing_variable_without_default() {
     unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_D") };
     let json = minimal_config_json(r#""environment": { "X": "${PROTEUS_TEST_INTERPOLATE_D}" },"#);
@@ -585,35 +540,6 @@ fn parse_errors_on_missing_variable_without_default() {
         err.contains("PROTEUS_TEST_INTERPOLATE_D"),
         "unexpected error: {err}"
     );
-}
-
-#[test]
-fn substitute_env_errors_on_unterminated_placeholder() {
-    let err = substitute_env("${UNCLOSED").unwrap_err();
-    assert!(err.contains("closing brace"), "unexpected error: {err}");
-}
-
-/// The scan advances past each match in the *original* text; a substituted
-/// value is never rescanned for a `${...}` of its own.
-#[test]
-fn substitute_env_does_not_recursively_expand_a_substituted_value() {
-    unsafe {
-        std::env::set_var(
-            "PROTEUS_TEST_INTERPOLATE_INNER",
-            "${PROTEUS_TEST_INTERPOLATE_OUTER}",
-        );
-        std::env::remove_var("PROTEUS_TEST_INTERPOLATE_OUTER");
-    }
-    let result = substitute_env("${PROTEUS_TEST_INTERPOLATE_INNER}")
-        .expect("the unset OUTER variable must not be resolved");
-    unsafe { std::env::remove_var("PROTEUS_TEST_INTERPOLATE_INNER") };
-    assert_eq!(result, "${PROTEUS_TEST_INTERPOLATE_OUTER}");
-}
-
-#[test]
-fn substitute_env_leaves_a_bare_dollar_sign_untouched() {
-    let result = substitute_env("$HOME and $PATH stay literal").expect("no placeholder to fail on");
-    assert_eq!(result, "$HOME and $PATH stay literal");
 }
 
 #[test]
@@ -799,6 +725,149 @@ fn validate_rejects_a_zero_rate_limit_requests() {
     assert!(
         errors.iter().any(|e| e.contains("rate_limit.requests")),
         "expected a rate_limit.requests error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn route_with_no_when_is_always_kept() {
+    let json = base_config_json(r#"{ "match": {}, "action": "return", "status": 403 }"#, "");
+    let mut cfg = parse(&json).expect("should parse");
+    apply_conditions(&mut cfg);
+    assert_eq!(cfg.routes.len(), 1);
+}
+
+/// Sets/clears `env` (name, value), parses a single route gated by
+/// `condition_json`, and asserts the route survives `apply_conditions` iff
+/// `expect_kept`.
+fn assert_route_kept(condition_json: &str, env: &[(&str, Option<&str>)], expect_kept: bool) {
+    for (name, value) in env {
+        match value {
+            Some(v) => unsafe { std::env::set_var(name, v) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+    let json = base_config_json(
+        &format!(
+            r#"{{ "when": {condition_json}, "match": {{}}, "action": "return", "status": 404 }}"#
+        ),
+        "",
+    );
+    let mut cfg = parse(&json).expect("should parse");
+    apply_conditions(&mut cfg);
+    for (name, _) in env {
+        unsafe { std::env::remove_var(name) };
+    }
+    assert_eq!(
+        cfg.routes.len(),
+        expect_kept as usize,
+        "condition {condition_json} with env {env:?}: expected kept={expect_kept}"
+    );
+}
+
+#[test]
+fn route_when_env_equals_keeps_the_route_only_on_a_match() {
+    let condition = r#"{ "env": { "name": "PROTEUS_TEST_WHEN_A", "equals": "true" } }"#;
+    assert_route_kept(condition, &[("PROTEUS_TEST_WHEN_A", None)], false);
+    assert_route_kept(condition, &[("PROTEUS_TEST_WHEN_A", Some("false"))], false);
+    assert_route_kept(condition, &[("PROTEUS_TEST_WHEN_A", Some("true"))], true);
+}
+
+#[test]
+fn route_when_env_without_equals_only_requires_the_variable_to_be_set() {
+    let condition = r#"{ "env": { "name": "PROTEUS_TEST_WHEN_B" } }"#;
+    assert_route_kept(condition, &[("PROTEUS_TEST_WHEN_B", None)], false);
+    assert_route_kept(
+        condition,
+        &[("PROTEUS_TEST_WHEN_B", Some("anything"))],
+        true,
+    );
+}
+
+#[test]
+fn route_when_not_inverts_the_inner_condition() {
+    let condition = r#"{ "not": { "env": { "name": "PROTEUS_TEST_WHEN_C" } } }"#;
+    assert_route_kept(condition, &[("PROTEUS_TEST_WHEN_C", None)], true);
+    assert_route_kept(condition, &[("PROTEUS_TEST_WHEN_C", Some("x"))], false);
+}
+
+#[test]
+fn route_when_all_requires_every_condition() {
+    let condition = r#"{ "all": [
+        { "env": { "name": "PROTEUS_TEST_WHEN_D1", "equals": "1" } },
+        { "env": { "name": "PROTEUS_TEST_WHEN_D2", "equals": "1" } }
+    ] }"#;
+    assert_route_kept(
+        condition,
+        &[
+            ("PROTEUS_TEST_WHEN_D1", Some("1")),
+            ("PROTEUS_TEST_WHEN_D2", None),
+        ],
+        false,
+    );
+    assert_route_kept(
+        condition,
+        &[
+            ("PROTEUS_TEST_WHEN_D1", Some("1")),
+            ("PROTEUS_TEST_WHEN_D2", Some("1")),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn route_when_any_requires_at_least_one_condition() {
+    let condition = r#"{ "any": [
+        { "env": { "name": "PROTEUS_TEST_WHEN_E1", "equals": "1" } },
+        { "env": { "name": "PROTEUS_TEST_WHEN_E2", "equals": "1" } }
+    ] }"#;
+    assert_route_kept(
+        condition,
+        &[
+            ("PROTEUS_TEST_WHEN_E1", None),
+            ("PROTEUS_TEST_WHEN_E2", None),
+        ],
+        false,
+    );
+    assert_route_kept(
+        condition,
+        &[
+            ("PROTEUS_TEST_WHEN_E1", Some("1")),
+            ("PROTEUS_TEST_WHEN_E2", None),
+        ],
+        true,
+    );
+}
+
+#[test]
+fn validate_still_catches_an_error_in_a_route_that_when_will_later_drop() {
+    let json = base_config_json(
+        r#"{ "when": { "env": { "name": "PROTEUS_TEST_WHEN_F" } },
+             "match": {}, "action": "php", "target": "typo" }"#,
+        "",
+    );
+    unsafe { std::env::remove_var("PROTEUS_TEST_WHEN_F") };
+    let cfg = parse(&json).expect("should parse");
+    let errors = validate(&cfg);
+    assert!(
+        errors.iter().any(|e| e.contains("typo")),
+        "expected the disabled route's bad target to still be caught, got: {errors:?}"
+    );
+}
+
+#[test]
+fn apply_conditions_runs_after_validate_would_have_passed() {
+    let json = base_config_json(
+        r#"{ "when": { "env": { "name": "PROTEUS_TEST_WHEN_G" } },
+             "match": {}, "action": "php", "target": "api" }"#,
+        r#""api": { "root": "/var/www/api/public", "script": "index.php" }"#,
+    );
+    unsafe { std::env::remove_var("PROTEUS_TEST_WHEN_G") };
+    let mut cfg = parse(&json).expect("should parse");
+    assert_eq!(validate(&cfg), Vec::<String>::new());
+    apply_conditions(&mut cfg);
+    assert!(
+        cfg.routes.is_empty(),
+        "the condition was false, so the route must not survive"
     );
 }
 
