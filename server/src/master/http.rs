@@ -47,7 +47,7 @@ pub struct AppState {
     /// Decided once at startup, so a request need not scan every route just
     /// to learn whether it has to resolve a Host at all.
     pub uses_host_matching: bool,
-    /// `None` when `rate_limit` is absent from config - the feature is off.
+    /// `None` when `rate_limit` is absent or `enabled: false` - the feature is off.
     rate_limiter: Option<RateLimiter>,
 }
 
@@ -59,6 +59,7 @@ impl AppState {
         let rate_limiter = config
             .rate_limit
             .take()
+            .filter(|rl| rl.enabled)
             .map(|rl| RateLimiter::new(rl.requests, rl.period_seconds, rl.user_agent));
         AppState {
             pool,
@@ -248,6 +249,7 @@ async fn handle(
 
     let compression = CompressionParams {
         accept_encoding,
+        enabled: state.config.compression.enabled,
         min_size_bytes: state.config.compression.min_size_bytes,
         mime_types: &state.config.compression.mime_types,
     };

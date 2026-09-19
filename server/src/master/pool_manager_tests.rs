@@ -19,7 +19,7 @@ fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
         semaphore: Arc::new(Semaphore::new(1)),
         admission: Arc::new(Semaphore::new(TEST_POOL_MAX)),
         max_workers: 1,
-        request_timeout: Duration::from_secs(30),
+        request_timeout: Some(Duration::from_secs(30)),
         idle_timeout: None,
         queue_timeout: Duration::from_secs(5),
         spawn_timeout: Duration::from_secs(30),

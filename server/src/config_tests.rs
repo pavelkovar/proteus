@@ -34,7 +34,25 @@ fn parses_a_full_config() {
     assert_eq!(cfg.php.limits.requests, 500);
     assert_eq!(cfg.status.listen, "127.0.0.1:8081"); // default applied
     assert_eq!(cfg.compression.min_size_bytes, 1024); // default applied
+    assert!(cfg.compression.enabled); // default applied
     assert_eq!(cfg.max_body_size, 64 * 1024 * 1024); // default applied
+}
+
+#[test]
+fn processes_max_and_spare_default_to_one() {
+    let json = r#"
+    {
+      "listen": "0.0.0.0:8080",
+      "php": {
+        "user": "phpapp",
+        "group": "phpapp",
+        "limits": { "requests": 500, "timeout": 30 },
+        "processes": {}
+      }
+    }"#;
+    let cfg: Config = serde_json::from_str(json).expect("should parse");
+    assert_eq!(cfg.php.processes.max, 1);
+    assert_eq!(cfg.php.processes.spare, 1);
 }
 
 #[test]
@@ -186,9 +204,16 @@ fn parses_targets_with_script_and_index() {
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     assert_eq!(cfg.php.targets["api"].root, "/var/www/api/public");
     assert_eq!(cfg.php.targets["api"].script.as_deref(), Some("index.php"));
-    assert_eq!(cfg.php.targets["api"].index, None);
+    assert_eq!(cfg.php.targets["api"].index, "index.php"); // default applied, unused since `script` wins
     assert_eq!(cfg.php.targets["legacy"].script, None);
-    assert_eq!(cfg.php.targets["legacy"].index.as_deref(), Some("main.php"));
+    assert_eq!(cfg.php.targets["legacy"].index, "main.php");
+}
+
+#[test]
+fn target_index_defaults_to_index_php_when_omitted() {
+    let json = base_config_json("", r#""app": { "root": "/var/www" }"#);
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(cfg.php.targets["app"].index, "index.php");
 }
 
 #[test]
@@ -218,25 +243,40 @@ fn validate_rejects_route_target_missing_from_php_targets() {
 }
 
 #[test]
-fn validate_rejects_a_zero_limits_timeout() {
+fn limits_timeout_of_zero_disables_the_watchdog() {
     let json = base_config_json("", "").replace(r#""timeout": 30"#, r#""timeout": 0"#);
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
-    let errors = validate(&cfg);
-    assert!(
-        errors.iter().any(|e| e.contains("php.limits.timeout")),
-        "expected a php.limits.timeout error, got: {errors:?}"
-    );
+    assert_eq!(validate(&cfg), Vec::<String>::new());
 }
 
 #[test]
-fn validate_rejects_a_zero_limits_requests() {
+fn limits_timeout_defaults_to_zero_when_omitted() {
+    let json = base_config_json("", "").replace(r#", "timeout": 30"#, "");
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(cfg.php.limits.timeout, 0);
+}
+
+#[test]
+fn limits_requests_defaults_to_zero_when_omitted() {
+    let json = base_config_json("", "").replace(r#""requests": 500, "#, "");
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(cfg.php.limits.requests, 0);
+}
+
+#[test]
+fn limits_object_can_be_omitted_entirely() {
+    let json = base_config_json("", "")
+        .replace(r#""limits": { "requests": 500, "timeout": 30 },"#, "");
+    let cfg: Config = serde_json::from_str(&json).expect("should parse");
+    assert_eq!(cfg.php.limits.requests, 0);
+    assert_eq!(cfg.php.limits.timeout, 0);
+}
+
+#[test]
+fn limits_requests_of_zero_disables_recycling() {
     let json = base_config_json("", "").replace(r#""requests": 500"#, r#""requests": 0"#);
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
-    let errors = validate(&cfg);
-    assert!(
-        errors.iter().any(|e| e.contains("php.limits.requests")),
-        "expected a php.limits.requests error, got: {errors:?}"
-    );
+    assert_eq!(validate(&cfg), Vec::<String>::new());
 }
 
 /// A `/0` entry hands every client on the Internet the power to set its own
@@ -713,6 +753,21 @@ fn rate_limit_parses_with_and_without_user_agent() {
             .len(),
         2
     );
+}
+
+#[test]
+fn rate_limit_enabled_defaults_to_false() {
+    let cfg = parse(&config_json_with_rate_limit(
+        r#"{ "requests": 100, "period_seconds": 60 }"#,
+    ))
+    .expect("should parse");
+    assert!(!cfg.rate_limit.expect("rate_limit should be Some").enabled);
+
+    let cfg = parse(&config_json_with_rate_limit(
+        r#"{ "enabled": true, "requests": 100, "period_seconds": 60 }"#,
+    ))
+    .expect("should parse");
+    assert!(cfg.rate_limit.expect("rate_limit should be Some").enabled);
 }
 
 #[test]

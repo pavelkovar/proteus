@@ -491,8 +491,14 @@ async fn resolve_script(state: &AppState, name: &str, url_path: &str) -> Option<
     let resolved = match &target.script {
         Some(script) => Some(resolve_script_mode(&target.root, script, url_path)),
         None => {
-            let index = target.index.as_deref().unwrap_or("index.php");
-            resolve_index_target(&state.fs_cache, &target.root, url_path, index, allowed).await
+            resolve_index_target(
+                &state.fs_cache,
+                &target.root,
+                url_path,
+                &target.index,
+                allowed,
+            )
+            .await
         }
     };
     // Past every branch on purpose: a branch resolving a client-named file

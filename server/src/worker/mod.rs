@@ -129,7 +129,8 @@ pub(crate) fn run(
             .store(false, std::sync::atomic::Ordering::Release);
         // Computed before execute_file, because `End` can fire well ahead of
         // its return via fastcgi_finish_request() and must carry this.
-        let retiring = served >= max_requests;
+        // 0 means never: max_requests > 0 guards it from matching at served == 0.
+        let retiring = max_requests > 0 && served >= max_requests;
 
         // Once a write fails every later one fails identically, so this only
         // keeps a large response from logging once per remaining chunk.

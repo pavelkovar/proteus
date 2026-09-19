@@ -797,6 +797,28 @@ async fn a_script_reflected_control_byte_in_a_header_does_not_break_the_response
     assert!(ordinary.text().await.unwrap().starts_with("PHP response"));
 }
 
+/// `enabled` defaults to `false`, so a `rate_limit` block can be staged in
+/// the file - `requests`/`period_seconds` ready - without taking effect.
+#[tokio::test]
+async fn rate_limit_disabled_by_default_even_when_the_section_is_present() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "rate-limit-staged",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "rate_limit": { "requests": 1, "period_seconds": 60 }
+        }),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/", server.port);
+
+    for n in 1..=3 {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "request {n} should not be limited");
+    }
+}
+
 /// `rate_limit.user_agent` is a filter: only requests whose User-Agent
 /// matches get counted or limited at all, everything else is untouched.
 #[tokio::test]
@@ -806,7 +828,7 @@ async fn rate_limit_only_applies_to_matching_user_agents_and_recovers_with_retry
         "rate-limit",
         www.to_str().unwrap(),
         serde_json::json!({
-            "rate_limit": { "requests": 2, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
+            "rate_limit": { "enabled": true, "requests": 2, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
         }),
     )
     .await;
@@ -868,7 +890,7 @@ async fn x_forwarded_for_cannot_buy_extra_rate_limit_budget() {
         "rate-limit-spoof",
         www.to_str().unwrap(),
         serde_json::json!({
-            "rate_limit": { "requests": 3, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
+            "rate_limit": { "enabled": true, "requests": 3, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
         }),
     )
     .await;
@@ -904,7 +926,7 @@ async fn a_trusted_proxy_gets_a_bucket_per_forwarded_client() {
         www.to_str().unwrap(),
         serde_json::json!({
             "trusted_proxies": ["127.0.0.1/32"],
-            "rate_limit": { "requests": 2, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
+            "rate_limit": { "enabled": true, "requests": 2, "period_seconds": 60, "user_agent": ["*GPTBot*"] }
         }),
     )
     .await;
@@ -1791,6 +1813,24 @@ async fn watchdog_kills_hung_worker_and_returns_504() {
     );
 }
 
+/// `timeout: 0` disables the watchdog - a request that would otherwise be killed well
+/// before it finishes must be allowed to run to completion.
+#[tokio::test]
+async fn zero_limits_timeout_disables_the_watchdog() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "notimeout",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "limits": { "timeout": 0 } } }),
+    )
+    .await;
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{}/?delay_ms=2000", server.port))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
 /// The worker dies after it has already streamed real bytes, so the response
 /// is mid-forward rather than still awaiting its first frame. The client must
 /// see the connection end rather than hang, and the pool must still serve
@@ -2005,6 +2045,26 @@ async fn compression_respects_min_size_threshold() {
         .await
         .unwrap();
     assert!(small.headers().get("content-encoding").is_none());
+}
+
+#[tokio::test]
+async fn compression_enabled_false_disables_it_regardless_of_size() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "compression-disabled",
+        www.to_str().unwrap(),
+        serde_json::json!({ "compression": { "enabled": false } }),
+    )
+    .await;
+    let client = reqwest::Client::builder().no_gzip().build().unwrap();
+
+    let big = client
+        .get(format!("http://127.0.0.1:{}/big.txt", server.port))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert!(big.headers().get("content-encoding").is_none());
 }
 
 /// zstd > brotli > gzip priority (explicit product choice), end-to-end -
@@ -2907,6 +2967,33 @@ async fn small_php_response_still_gets_compressed_and_varies() {
     )
     .unwrap();
     assert!(decoded.starts_with("quick-response pid="), "got: {decoded}");
+}
+
+/// `compression.enabled: false` must hold even with no declared length:
+/// `stream_size_gate` deliberately drops the size threshold to 0 for an
+/// unmeasurable body, which must not also defeat a disabled setting.
+#[tokio::test]
+async fn compression_enabled_false_disables_it_even_without_a_declared_length() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "fcgifinish-disabled",
+        www.to_str().unwrap(),
+        serde_json::json!({ "compression": { "enabled": false } }),
+    )
+    .await;
+    let client = reqwest::Client::builder().no_gzip().build().unwrap();
+
+    let resp = client
+        .get(format!(
+            "http://127.0.0.1:{}/fastcgi-finish?marker=novary",
+            server.port
+        ))
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("content-encoding").is_none());
 }
 
 /// `spare > max` must fail at startup with a clear reason rather than

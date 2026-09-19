@@ -238,6 +238,31 @@ async fn the_last_request_announces_retirement_in_its_end_frame() {
         .expect("the worker must exit after its last request");
 }
 
+/// `max_requests: 0` means never recycle - a worker must keep serving well
+/// past what would otherwise be its retirement point.
+#[tokio::test]
+async fn zero_max_requests_never_announces_retirement() {
+    let (master, handle) = spawn_worker(0, |_client_gone, emit| {
+        emit(PhpChunk::Headers {
+            status: 200,
+            headers: HeaderBlob::default(),
+        });
+        emit(PhpChunk::End);
+    });
+
+    let req = empty_request();
+    for n in 0..5 {
+        master.send_request(&req).await;
+        assert!(
+            !master.drain_one_response().await,
+            "request {n} must not announce retirement with max_requests: 0"
+        );
+    }
+
+    master.mapped.channel().mark_peer_dead();
+    handle.join().unwrap();
+}
+
 /// Dropping master's end of the channel is how an abandoned worker is told to
 /// stop; without it a parked one would hold its PHP heap forever.
 #[tokio::test]

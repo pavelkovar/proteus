@@ -113,6 +113,7 @@ pub(crate) fn build_response(
 #[derive(Clone, Copy)]
 pub(crate) struct CompressionParams<'a> {
     pub(crate) accept_encoding: &'a str,
+    pub(crate) enabled: bool,
     pub(crate) min_size_bytes: usize,
     pub(crate) mime_types: &'a [String],
 }
@@ -138,6 +139,7 @@ pub(crate) async fn build_static_response(
 ) -> Response<ResponseBody> {
     let CompressionParams {
         accept_encoding,
+        enabled,
         min_size_bytes,
         mime_types,
     } = compression;
@@ -148,7 +150,8 @@ pub(crate) async fn build_static_response(
     let identity_etag = make_etag(modified, len);
     // Before Accept-Encoding: Vary depends on whether the response could
     // ever vary by encoding, not on what this client happens to accept.
-    let vary = compression_eligible(len as usize, min_size_bytes, content_type, mime_types);
+    let vary =
+        enabled && compression_eligible(len as usize, min_size_bytes, content_type, mime_types);
     // `vary` is the eligibility answer already computed.
     let encoding = pick_encoding_when_eligible(vary, accept_encoding);
     let negotiated_etag = if encoding.is_some() {
@@ -252,6 +255,7 @@ pub(crate) fn build_php_stream_response(
 ) -> Response<ResponseBody> {
     let CompressionParams {
         accept_encoding,
+        enabled,
         min_size_bytes,
         mime_types,
     } = compression;
@@ -261,7 +265,11 @@ pub(crate) fn build_php_stream_response(
     let (body_len, min_size) = stream_size_gate(script.declared_len, min_size_bytes);
     // A body the script already encoded must be left alone: encoding it again
     // yields two `Content-Encoding` headers and bytes no client can decode.
-    let eligible = !script.pre_encoded
+    // `enabled` gates this directly rather than through `min_size_bytes`:
+    // `stream_size_gate` deliberately drops that threshold to 0 when the
+    // length is unknown, which would otherwise defeat a disabled setting.
+    let eligible = enabled
+        && !script.pre_encoded
         && compression_eligible(body_len, min_size, script.content_type, mime_types);
     // Vary is about whether some Accept-Encoding could change this response,
     // not whether this client's did. A script that encoded the body did its

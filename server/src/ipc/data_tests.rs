@@ -760,9 +760,9 @@ fn the_cow_encoding_is_byte_identical_to_the_owned_one() {
     );
 }
 
-/// Nothing in the real system ever writes an empty frame to the request ring
-/// - `write_request_to_ring` always encodes a real `PhpRequest` - but the
-/// ring API doesn't forbid one; proves the reader fails cleanly rather than panicking.
+/// Nothing in the real system ever writes an empty frame to the request
+/// ring - `write_request_to_ring` always encodes a real `PhpRequest` - but
+/// the ring API doesn't forbid one; proves the reader fails cleanly rather than panicking.
 #[test]
 fn read_request_from_ring_treats_an_empty_frame_as_a_decode_error() {
     use std::alloc::{Layout, alloc};

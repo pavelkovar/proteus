@@ -61,7 +61,8 @@ pub struct PoolManager {
     /// without anyone having to remember to.
     admission: Arc<Semaphore>,
     max_workers: usize,
-    request_timeout: Duration,
+    /// `None` disables the watchdog; a request may then run indefinitely.
+    request_timeout: Option<Duration>,
     /// `None` disables idle retirement; `sweep_idle_workers` never kills for it.
     idle_timeout: Option<Duration>,
     queue_timeout: Duration,
@@ -320,7 +321,8 @@ impl PoolManager {
             semaphore: Arc::new(Semaphore::new(cfg.php.processes.max)),
             admission: Arc::new(Semaphore::new(cfg.php.processes.max)),
             max_workers: cfg.php.processes.max,
-            request_timeout: Duration::from_secs(cfg.php.limits.timeout),
+            request_timeout: (cfg.php.limits.timeout > 0)
+                .then(|| Duration::from_secs(cfg.php.limits.timeout)),
             idle_timeout: (cfg.php.processes.idle_timeout > 0)
                 .then(|| Duration::from_secs(cfg.php.processes.idle_timeout)),
             queue_timeout: Duration::from_secs(cfg.php.queue.timeout),

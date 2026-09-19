@@ -13,8 +13,21 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
+use tokio::time::error::Elapsed;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
+
+/// `None` runs `fut` unbounded, wrapped in `Ok` to match
+/// `tokio::time::timeout`'s shape so callers need no separate branch for it.
+async fn with_timeout<F: std::future::Future>(
+    timeout: Option<std::time::Duration>,
+    fut: F,
+) -> Result<F::Output, Elapsed> {
+    match timeout {
+        Some(d) => tokio::time::timeout(d, fut).await,
+        None => Ok(fut.await),
+    }
+}
 
 /// Owns a worker between check-out and the hand-off to its completion task,
 /// so cancellation in between retires it instead of leaving its `workers`
@@ -288,7 +301,7 @@ impl PoolManager {
         // One window covers publishing the request and waiting for the first
         // response frame: a worker that never drains the request ring is as
         // stuck as one that never answers.
-        let first = tokio::time::timeout(self.request_timeout, async {
+        let first = with_timeout(self.request_timeout, async {
             channel.write_request(req).await?;
             // After the frame, never before: a frame that failed to go would
             // otherwise leave this fd queued for the next request to take.
@@ -460,9 +473,7 @@ impl PoolManager {
         // the forwarding, never the worker.
         let mut client_gone = false;
         let retiring = loop {
-            match tokio::time::timeout(self.request_timeout, worker.channel.read_response_frame())
-                .await
-            {
+            match with_timeout(self.request_timeout, worker.channel.read_response_frame()).await {
                 Ok(Ok(WorkerEvent::Body(chunk))) => {
                     if !client_gone && body_tx.send(Ok(chunk)).await.is_err() {
                         logging::debug!(
@@ -538,7 +549,7 @@ impl PoolManager {
             return;
         }
 
-        match tokio::time::timeout(self.request_timeout, worker.channel.read_worker_done()).await {
+        match with_timeout(self.request_timeout, worker.channel.read_worker_done()).await {
             Ok(Ok(())) => {
                 let now = Instant::now();
                 // Past the done marker nothing borrows the scratch, and the

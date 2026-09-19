@@ -75,6 +75,11 @@ impl LogLevel {
 /// known crawlers rather than every visitor.
 #[derive(Debug, Deserialize)]
 pub struct RateLimitConfig {
+    /// The whole object may sit in the file switched off, so it can be
+    /// staged with its `requests`/`period_seconds` ready and flipped on
+    /// without re-adding them.
+    #[serde(default)]
+    pub enabled: bool,
     /// Burst capacity: how many requests one client may fire immediately,
     /// and the ceiling it can never exceed even after refilling.
     pub requests: u32,
@@ -241,11 +246,11 @@ pub struct PhpConfig {
     /// ZEND_INI_SYSTEM (admin) / ZEND_INI_USER (user), applied by php-mod.
     #[serde(default)]
     pub options: PhpOptions,
-    /// Extensions a request may execute, as PHP-FPM's
-    /// `security.limit_extensions`. Without it an uploaded `.png` holding PHP
+    /// Extensions a request may execute. Without it an uploaded `.png` holding PHP
     /// is remote code execution.
     #[serde(default = "default_script_extensions")]
     pub script_extensions: Vec<String>,
+    #[serde(default)]
     pub limits: Limits,
     pub processes: Processes,
     #[serde(default)]
@@ -283,23 +288,32 @@ pub struct Target {
     pub script: Option<String>,
     /// URL maps to a `.php` under `root`, trailing segments becoming
     /// PATH_INFO.
-    #[serde(default)]
-    pub index: Option<String>,
+    #[serde(default = "default_index")]
+    pub index: String,
 }
 
-#[derive(Debug, Deserialize)]
+fn default_index() -> String {
+    "index.php".to_string()
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct Limits {
-    /// Worker self-retires after this many requests.
+    /// Worker self-retires after this many requests; 0 (the default) never.
+    #[serde(default)]
     pub requests: u32,
-    /// Watchdog SIGKILLs a worker exceeding this many seconds on one request.
+    /// Watchdog SIGKILLs a worker exceeding this many seconds on one
+    /// request; 0 (the default) disables it.
+    #[serde(default)]
     pub timeout: u64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Processes {
     /// Concurrently running workers, not the queue-depth cap.
+    #[serde(default = "default_one")]
     pub max: usize,
     /// Pre-spawned at startup; idle floor once a worker is claimed.
+    #[serde(default = "default_one")]
     pub spare: usize,
     /// Master kills a worker idle this long, once above the `spare` floor;
     /// 0 never. The floor itself is never touched, however long it sits idle.
@@ -310,6 +324,10 @@ pub struct Processes {
     /// the first spawn after a restart waits out the prototype's PHP init.
     #[serde(default = "default_spawn_timeout")]
     pub spawn_timeout: u64,
+}
+
+fn default_one() -> usize {
+    1
 }
 
 fn default_spawn_timeout() -> u64 {
@@ -368,6 +386,7 @@ impl Default for StatusConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct CompressionConfig {
+    pub enabled: bool,
     pub min_size_bytes: usize,
     /// Compression allowlist; empty means no restriction. Already-compressed
     /// formats would only burn CPU.
@@ -377,6 +396,7 @@ pub struct CompressionConfig {
 impl Default for CompressionConfig {
     fn default() -> Self {
         CompressionConfig {
+            enabled: true,
             min_size_bytes: 1024,
             mime_types: [
                 "application/javascript",
@@ -430,16 +450,6 @@ pub fn validate(cfg: &Config) -> Vec<String> {
             "php.processes.max",
             cfg.php.processes.max == 0,
             "leave no worker to serve anything",
-        ),
-        (
-            "php.limits.timeout",
-            cfg.php.limits.timeout == 0,
-            "time out every request immediately",
-        ),
-        (
-            "php.limits.requests",
-            cfg.php.limits.requests == 0,
-            "recycle every worker after its first request",
         ),
         (
             "php.queue.timeout",
@@ -499,7 +509,10 @@ pub fn validate(cfg: &Config) -> Vec<String> {
     }
     // Caught here rather than as a puzzling 404 on every request.
     for (name, target) in &cfg.php.targets {
-        for (field, value) in [("script", &target.script), ("index", &target.index)] {
+        for (field, value) in [
+            ("script", target.script.as_deref()),
+            ("index", Some(target.index.as_str())),
+        ] {
             if let Some(value) = value
                 && !extension_is_listed(value, &cfg.php.script_extensions)
             {
