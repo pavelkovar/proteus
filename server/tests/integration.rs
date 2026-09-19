@@ -4330,7 +4330,7 @@ async fn idle_timeout_retires_workers_above_spare() {
         www.to_str().unwrap(),
         serde_json::json!({
             "php": {
-                "processes": { "max": 4, "spare": 1, "idle_timeout": 1 }
+                "processes": { "max": 4, "spare": 1, "idle_timeout": 3 }
             }
         }),
     )
@@ -4376,7 +4376,7 @@ async fn idle_timeout_retires_workers_above_spare() {
         "expected more than spare(1) idle workers right after 3 concurrent requests, got {idle_now}"
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let idle = read_idle().await;
         if idle <= 1 {

@@ -265,8 +265,8 @@ fn limits_requests_defaults_to_zero_when_omitted() {
 
 #[test]
 fn limits_object_can_be_omitted_entirely() {
-    let json = base_config_json("", "")
-        .replace(r#""limits": { "requests": 500, "timeout": 30 },"#, "");
+    let json =
+        base_config_json("", "").replace(r#""limits": { "requests": 500, "timeout": 30 },"#, "");
     let cfg: Config = serde_json::from_str(&json).expect("should parse");
     assert_eq!(cfg.php.limits.requests, 0);
     assert_eq!(cfg.php.limits.timeout, 0);

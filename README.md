@@ -17,6 +17,7 @@ Proteus keeps a pool of persistent PHP worker processes running — no per-reque
 - **Token-bucket rate limiting** and **on-the-fly compression** (gzip, brotli, zstd), negotiated per request.
 - **Range and conditional requests** for static files — `ETag`/`If-None-Match` and byte-range (`Range`/`Content-Range`) support.
 - **A JSON config file** with shell-style `${VAR}` substitution, conditional routes, and a live `/status` metrics endpoint.
+- **Structured JSON logging** — access logs and controller events as JSON lines on stdout, ready for any log pipeline.
 - **A built-in `cron` runner**, so a container doesn't need a separate cron daemon installed.
 
 ## Quick start
