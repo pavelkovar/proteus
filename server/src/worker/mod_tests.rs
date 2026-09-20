@@ -204,9 +204,9 @@ async fn client_gone_is_cleared_before_each_request() {
     handle.join().unwrap();
 }
 
-/// `End` carries `retiring`, and master takes it as "no done marker is
-/// coming". It has to be right at the moment `End` goes out, which after
-/// `fastcgi_finish_request()` is long before the script returns.
+/// `End` carries `retiring`, decided from `served` at the moment `End` goes
+/// out - which after `fastcgi_finish_request()` is long before the script
+/// returns, so it cannot wait for that to know.
 #[tokio::test]
 async fn the_last_request_announces_retirement_in_its_end_frame() {
     let (master, handle) = spawn_worker(2, |_client_gone, emit| {

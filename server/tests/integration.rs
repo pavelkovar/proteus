@@ -1886,9 +1886,6 @@ async fn a_client_that_disconnects_mid_script_leaves_the_pool_at_full_strength()
         status["php"]["counters"]["workers_abandoned"], 1,
         "the disconnect should be accounted for, not silently absorbed: {status}"
     );
-    // The reaper is a backstop for deaths master cannot observe; reaching it
-    // here would mean the release path missed this one.
-    assert_eq!(status["php"]["counters"]["workers_reaped_dead"], 0);
 }
 
 #[tokio::test]
@@ -2110,13 +2107,32 @@ async fn status_endpoint_reports_pool_shape() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let status: serde_json::Value =
-        reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
-            .await
+    // The client sees the response as soon as headers are written; the
+    // worker is only marked idle - and `current_request` cleared - after,
+    // from a separately spawned task. Poll until that settles.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        let status: serde_json::Value =
+            reqwest::get(format!("http://127.0.0.1:{}/", server.status_port))
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        let settled = status["php"]["workers"]
+            .as_array()
             .unwrap()
-            .json()
-            .await
-            .unwrap();
+            .iter()
+            .any(|w| w["request_count"].as_u64() == Some(1) && w["current_request"].is_null());
+        if settled {
+            break status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no served worker settled to an idle, request-count-1 state: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert!(status["php"]["processes"]["max"].as_u64().unwrap() >= 1);
     assert!(status["php"]["counters"]["requests_total"].is_u64());
     assert!(status["uptime_seconds"].is_u64());
@@ -2153,7 +2169,7 @@ async fn status_endpoint_reports_pool_shape() {
     );
     let served = workers
         .iter()
-        .find(|w| w["request_count"].as_u64() == Some(1));
+        .find(|w| w["request_count"].as_u64() == Some(1) && w["current_request"].is_null());
     assert!(
         served.is_some(),
         "expected a worker with request_count == 1, got: {workers:?}"
@@ -2163,6 +2179,83 @@ async fn status_endpoint_reports_pool_shape() {
     assert!(w["state"] == "idle" || w["state"] == "busy");
     assert!(w["started_ago_seconds"].is_u64());
     assert!(w["last_active_ago_seconds"].is_u64());
+}
+
+/// A worker stuck mid-request must be nameable from `/status` - not just
+/// "busy for N seconds", but which request it is stuck on - and that name
+/// must disappear again once the request finishes.
+#[tokio::test]
+async fn status_shows_the_in_flight_request_for_a_busy_worker() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "in-flight-status",
+        www.to_str().unwrap(),
+        // The base config's `limits.timeout: 2` would race the watchdog
+        // against the delay below; this request must have room to finish.
+        serde_json::json!({ "php": { "limits": { "timeout": 10 } } }),
+    )
+    .await;
+
+    let slow = tokio::spawn({
+        let port = server.port;
+        async move {
+            reqwest::get(format!("http://127.0.0.1:{port}/app?delay_ms=2000"))
+                .await
+                .unwrap()
+        }
+    });
+
+    // Polled rather than a fixed sleep, so this cannot flake under a slow or
+    // loaded CI runner; the deadline stays well inside the request's own 2s
+    // delay so a worker that never goes busy still fails loudly.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1800);
+    let (mid_flight, busy_index) = loop {
+        let status = status_json(&server).await;
+        let found = status["php"]["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|w| w["state"] == "busy");
+        if let Some(idx) = found {
+            break (status, idx);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "expected a busy worker mid-request: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let busy = &mid_flight["php"]["workers"][busy_index];
+    assert_eq!(busy["current_request"]["method"], "GET");
+    assert_eq!(busy["current_request"]["uri"], "/app?delay_ms=2000");
+    assert!(
+        busy["current_request"]["script"]
+            .as_str()
+            .unwrap()
+            .ends_with("index.php")
+    );
+
+    assert_eq!(slow.await.unwrap().status(), 200);
+
+    // The client sees the response as soon as headers are written; the
+    // worker is only marked idle after, from a separately spawned task.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let after = status_json(&server).await;
+        let all_idle = after["php"]["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|w| w["current_request"].is_null());
+        if all_idle {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no worker should still show an in-flight request once it finished: {after}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// A live-confirmed traversal: this exact request once returned /etc/passwd.
@@ -3170,6 +3263,18 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
     None
 }
 
+/// `/proc/[pid]/stat`'s process-state character, `None` once `pid` is gone
+/// from `/proc` entirely (already reaped).
+fn process_state(pid: i32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()
+}
+
 #[tokio::test]
 async fn a_malformed_cron_crontab_fails_fast_with_the_line_number() {
     let output = tokio::task::spawn_blocking(|| {
@@ -3285,6 +3390,10 @@ async fn a_due_cron_job_runs_and_shutdown_kills_its_backgrounded_grandchild() {
             wait_for_line(&mut stdout, "cron-job-started", Duration::from_secs(75)),
             "the job never ran within one minute of its schedule"
         );
+        // The wrapper backgrounds and exits within microseconds of that
+        // line, so signalling this fast would race whether it is still
+        // tracked - this margin makes the wrapper reliably gone first.
+        std::thread::sleep(Duration::from_millis(500));
 
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(child.id() as i32),
@@ -3295,9 +3404,110 @@ async fn a_due_cron_job_runs_and_shutdown_kills_its_backgrounded_grandchild() {
             .expect("shutdown must finish well within the grace period");
         assert!(status.success());
 
+        // Checking right away only proves the marker isn't there *yet* - an
+        // orphaned (not killed) grandchild would still land it a few seconds
+        // from now, which is what waiting past that point rules out.
+        std::thread::sleep(Duration::from_secs(6));
         assert!(
             !marker.exists(),
             "the backgrounded grandchild survived shutdown and finished its sleep"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+/// A grandchild that ignores SIGTERM (holding a trap for it) must still be
+/// killed on shutdown: draining each job's own wrapper is not enough - the
+/// escalation to SIGKILL has to actually reach a group that outlives it.
+#[tokio::test]
+async fn a_grandchild_that_ignores_sigterm_is_still_killed_by_the_escalation() {
+    tokio::task::spawn_blocking(|| {
+        let pidfile =
+            std::env::temp_dir().join(format!("test-cron-leaf-pid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let next_minute = chrono::Local::now() + chrono::Duration::minutes(1);
+        let schedule = format!(
+            "{} {} * * *",
+            next_minute.format("%M"),
+            next_minute.format("%H")
+        );
+        // `$!` (not a nested subshell's `$$`) names the backgrounded loop
+        // unambiguously; it inherits the wrapper's just-set SIG_IGN
+        // disposition for SIGTERM across the fork, same as a real ignore.
+        let crontab = write_crontab(
+            "sigterm-ignoring-grandchild",
+            &format!(
+                "{schedule} echo cron-job-started; trap '' TERM; while :; do sleep 1; done & echo $! > {}\n",
+                pidfile.display()
+            ),
+        );
+
+        let mut child = OwnedChildGuard(spawn_cron(&[
+            "--shutdown-grace",
+            "1s",
+            crontab.to_str().unwrap(),
+        ]));
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+
+        assert!(
+            wait_for_line(&mut stdout, "cron-job-started", Duration::from_secs(75)),
+            "the job never ran within one minute of its schedule"
+        );
+
+        let pid_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let leaf_pid: i32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < pid_deadline,
+                "the backgrounded loop never wrote its own pid"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Same margin as the sibling test: makes the wrapper reliably gone
+        // and tracking installed before shutdown signals it.
+        std::thread::sleep(Duration::from_millis(500));
+
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.id() as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(10))
+            .expect("shutdown must finish within the grace period plus its SIGKILL escalation");
+        assert!(status.success());
+
+        // Settling rather than a single check: the escalation's SIGKILL and
+        // this process observing the result are not otherwise synchronized.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut state = process_state(leaf_pid);
+        while std::time::Instant::now() < deadline && !matches!(state, None | Some('Z')) {
+            std::thread::sleep(Duration::from_millis(20));
+            state = process_state(leaf_pid);
+        }
+
+        // Unconditional, before asserting: an infinite loop that ignores
+        // SIGTERM must not leak into the container just because this
+        // assertion is about to fail.
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(leaf_pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(leaf_pid),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG),
+        );
+
+        assert!(
+            matches!(state, None | Some('Z')),
+            "a loop that ignores SIGTERM must still be killed by the shutdown escalation, \
+             pid={leaf_pid}, state={state:?}"
         );
     })
     .await
@@ -5720,10 +5930,6 @@ async fn workers_survive_being_dispatched_from_one_runtime_after_another() {
     assert_eq!(
         status["php"]["counters"]["prototype_respawns_total"], 0,
         "moving workers between runtimes must not look like a sick prototype"
-    );
-    assert_eq!(
-        status["php"]["counters"]["workers_reaped_dead"], 0,
-        "no worker should have died from being dispatched on a different runtime"
     );
     assert_eq!(
         status["php"]["processes"]["max"], 4,

@@ -5,12 +5,12 @@
 //! still reach private fields.
 
 use super::worker_channel::WorkerEvent;
-use super::{PoolManager, PooledWorker, Retired, TempBodyFile};
+use super::{PoolManager, PooledWorker, Retired, TempBodyFile, WorkerRef};
 use crate::ipc::data::{HeaderBlob, PhpRequest};
 use crate::logging;
 use bytes::Bytes;
 use std::sync::Arc;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Instant;
 use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio::time::error::Elapsed;
@@ -32,13 +32,13 @@ async fn with_timeout<F: std::future::Future>(
 /// Owns a worker between check-out and the hand-off to its completion task,
 /// so cancellation in between retires it instead of leaving its `workers`
 /// entry and its seat in the pool held for good.
-struct CheckedOutWorker {
+pub(super) struct CheckedOutWorker {
     pool: Arc<PoolManager>,
     worker: Option<PooledWorker>,
 }
 
 impl CheckedOutWorker {
-    fn new(pool: Arc<PoolManager>, worker: PooledWorker) -> Self {
+    pub(super) fn new(pool: Arc<PoolManager>, worker: PooledWorker) -> Self {
         CheckedOutWorker {
             pool,
             worker: Some(worker),
@@ -59,9 +59,53 @@ impl Drop for CheckedOutWorker {
         let Some(worker) = self.worker.take() else {
             return; // handed off, nothing to clean up
         };
-        // Before the drop, whose channel close is what stops the worker.
-        self.pool.retire(worker.pid, Retired::Abandoned);
+        let who = worker.as_ref();
+        let gone = worker.channel.liveness_flag();
+        // Synchronous and immediate, exactly as before this guard existed:
+        // the seat returns now, and dropping `worker` still signals
+        // `peer_death` right away for one parked on the ring.
+        self.pool.retire(who, Retired::Abandoned);
         drop(worker);
+        // Off this drop, which cannot await: `retire` above already trusts
+        // the worker gone, so this only catches it having lied.
+        tokio::spawn(kill_if_still_running(
+            Arc::clone(&self.pool),
+            who,
+            gone,
+            ABANDONED_KILL_GRACE,
+        ));
+    }
+}
+
+/// How often a still-unconfirmed abandoned worker is re-checked.
+const ABANDONED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Independent of `request_timeout`, which `limits.timeout: 0` disables as a
+/// deliberate policy for how long a request may run - a worker nothing
+/// tracks anymore must still be bounded regardless of that setting.
+const ABANDONED_KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Kills `pid` if `gone` never flips within `grace`: the same "wedged, not
+/// routinely gone" bucket as any other worker that misses a deadline. Holds
+/// no pool seat - `retire(Abandoned)` already returned this one.
+pub(super) async fn kill_if_still_running(
+    pool: Arc<PoolManager>,
+    who: WorkerRef,
+    gone: Arc<AtomicBool>,
+    grace: std::time::Duration,
+) {
+    let deadline = tokio::time::Instant::now() + grace;
+    while !gone.load(Relaxed) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(ABANDONED_POLL_INTERVAL).await;
+    }
+    if !gone.load(Relaxed) {
+        logging::warn!(
+            r#type = "controller",
+            pid = who.pid,
+            grace = ?grace,
+            "abandoned worker never confirmed exit"
+        );
+        pool.retire(who, Retired::Watchdog);
     }
 }
 
@@ -149,16 +193,19 @@ impl PoolManager {
         permit: OwnedSemaphorePermit,
         body_cleanup: Option<TempBodyFile>,
     ) -> Result<StreamedResponse, AttemptError> {
-        let pid = worker.pid;
-        // No lock and no lookup: the counters hang off the `Arc` already held.
-        worker.meta.mark_busy(Instant::now(), self.started_at);
+        let who = worker.as_ref();
+        // No pool-wide lock and no lookup: the counters hang off the `Arc`
+        // already held.
+        worker
+            .meta
+            .mark_busy(Instant::now(), self.started_at, Arc::clone(req));
         match self
             .start_streaming(worker, req, permit, body_cleanup)
             .await
         {
             Ok(started) => Ok(started),
             Err(StartAttempt::TimedOut(permit, _body_cleanup)) => {
-                self.retire(pid, Retired::Watchdog);
+                self.retire(who, Retired::Watchdog);
                 Err(AttemptError::TimedOut(permit))
             }
             Err(StartAttempt::RequestTooLarge(permit, _body_cleanup)) => {
@@ -167,7 +214,7 @@ impl PoolManager {
             Err(StartAttempt::WorkerUnavailable(e, permit, body_cleanup)) => {
                 // Probably self-retired is not certainly: a worker wedged
                 // rather than parked would otherwise run on untracked.
-                self.retire(pid, Retired::Unavailable);
+                self.retire(who, Retired::Unavailable);
                 Err(AttemptError::WorkerUnavailable(e, permit, body_cleanup))
             }
         }
@@ -292,7 +339,7 @@ impl PoolManager {
         permit: OwnedSemaphorePermit,
         body_cleanup: Option<TempBodyFile>,
     ) -> Result<StreamedResponse, StartAttempt> {
-        let pid = worker.pid;
+        let who = worker.as_ref();
         // This runs on the connection's own task and the wait below spans the
         // whole of PHP's execution, so a client disconnect drops the future
         // mid-flight. The guard makes that window cancellation-safe.
@@ -343,7 +390,7 @@ impl PoolManager {
             Err(_elapsed) => {
                 logging::warn!(
                     r#type = "controller",
-                    pid,
+                    pid = who.pid,
                     request_timeout = ?self.request_timeout,
                     "worker exceeded request_timeout writing the request or waiting for headers"
                 );
@@ -372,13 +419,13 @@ impl PoolManager {
                     status,
                     headers,
                     body: Box::pin(tokio_stream::iter([Ok(body)])),
-                    worker_pid: pid,
+                    worker_pid: who.pid,
                 })
             }
             // Already-read bytes still go out, then the error ends the
             // stream; the worker cannot be pooled after this.
             Drained::Broken { prefix, error } => {
-                self.retire(pid, Retired::Failed);
+                self.retire(who, Retired::Failed);
                 drop(permit);
                 drop(body_cleanup);
                 Ok(StreamedResponse {
@@ -390,7 +437,7 @@ impl PoolManager {
                             .map(Ok)
                             .chain(std::iter::once(Err(error))),
                     )),
-                    worker_pid: pid,
+                    worker_pid: who.pid,
                 })
             }
             Drained::Pending { prefix } => {
@@ -412,7 +459,7 @@ impl PoolManager {
                     status,
                     headers,
                     body: Box::pin(stream),
-                    worker_pid: pid,
+                    worker_pid: who.pid,
                 })
             }
         }
@@ -466,7 +513,7 @@ impl PoolManager {
         body_tx: mpsc::Sender<std::io::Result<Bytes>>,
         _body_cleanup: Option<TempBodyFile>,
     ) {
-        let pid = worker.pid;
+        let who = worker.as_ref();
         // A script under ignore_user_abort(true) is entitled to run on past the
         // client, and one that has already called fastcgi_finish_request() has
         // been promised exactly that - so a client leaving mid-body only stops
@@ -478,7 +525,7 @@ impl PoolManager {
                     if !client_gone && body_tx.send(Ok(chunk)).await.is_err() {
                         logging::debug!(
                             r#type = "controller",
-                            pid,
+                            pid = who.pid,
                             "body receiver dropped (client gone), draining the worker to End"
                         );
                         client_gone = true;
@@ -495,18 +542,18 @@ impl PoolManager {
                         .await;
                     logging::error!(
                         r#type = "controller",
-                        pid,
+                        pid = who.pid,
                         "worker sent a second Headers frame, protocol violation"
                     );
-                    self.retire(pid, Retired::Watchdog);
+                    self.retire(who, Retired::Watchdog);
                     return;
                 }
                 Ok(Err(e)) => {
                     let _ = body_tx
                         .send(Err(std::io::Error::new(e.kind(), e.to_string())))
                         .await;
-                    logging::error!(r#type = "controller", pid, error = %e, "response stream read failed");
-                    self.retire(pid, Retired::Failed);
+                    logging::error!(r#type = "controller", pid = who.pid, error = %e, "response stream read failed");
+                    self.retire(who, Retired::Failed);
                     return;
                 }
                 Err(_elapsed) => {
@@ -518,11 +565,11 @@ impl PoolManager {
                         .await;
                     logging::error!(
                         r#type = "controller",
-                        pid,
+                        pid = who.pid,
                         request_timeout = ?self.request_timeout,
                         "worker exceeded request_timeout mid-response"
                     );
-                    self.retire(pid, Retired::Watchdog);
+                    self.retire(who, Retired::Watchdog);
                     return;
                 }
             }
@@ -531,25 +578,38 @@ impl PoolManager {
         self.finish_after_end(worker, permit, retiring, None).await;
     }
 
-    /// Everything after `End`: the worker may still be running past
-    /// `fastcgi_finish_request()`, so it is not poolable until its done
-    /// marker arrives.
-    async fn finish_after_end(
+    /// Everything after `End`: not poolable until its done marker arrives,
+    /// which a retiring worker sends too, right before exiting on its own.
+    pub(super) async fn finish_after_end(
         self: Arc<Self>,
         mut worker: PooledWorker,
         permit: OwnedSemaphorePermit,
         retiring: bool,
         _body_cleanup: Option<TempBodyFile>,
     ) {
-        let pid = worker.pid;
-        if retiring {
-            // The worker exits right after this, so there is no done marker
-            // coming and nothing to return to the pool.
-            self.retire(pid, Retired::RequestLimit);
-            return;
-        }
-
-        match with_timeout(self.request_timeout, worker.channel.read_worker_done()).await {
+        let who = worker.as_ref();
+        // A retiring worker already decided to exit, so `limits.timeout: 0`'s
+        // "let background work run forever" policy does not apply to it - it
+        // still gets a bounded wait, like any other worker nothing tracks.
+        let deadline = if retiring {
+            self.request_timeout.or(Some(ABANDONED_KILL_GRACE))
+        } else {
+            self.request_timeout
+        };
+        match with_timeout(deadline, worker.channel.read_worker_done()).await {
+            Ok(Ok(())) if retiring => {
+                // The marker confirms the request ended, not that the
+                // process has actually exited yet - it still has to run its
+                // own engine shutdown after writing it.
+                let gone = worker.channel.liveness_flag();
+                self.retire(who, Retired::RequestLimit);
+                tokio::spawn(kill_if_still_running(
+                    Arc::clone(&self),
+                    who,
+                    gone,
+                    ABANDONED_KILL_GRACE,
+                ));
+            }
             Ok(Ok(())) => {
                 let now = Instant::now();
                 // Past the done marker nothing borrows the scratch, and the
@@ -561,17 +621,18 @@ impl PoolManager {
                 drop(permit);
             }
             Ok(Err(e)) => {
-                logging::warn!(r#type = "controller", pid, error = %e, "trailing worker-done read failed");
-                self.retire(pid, Retired::Failed);
+                logging::warn!(r#type = "controller", pid = who.pid, error = %e, retiring, "trailing worker-done read failed");
+                self.retire(who, Retired::Failed);
             }
             Err(_elapsed) => {
                 logging::warn!(
                     r#type = "controller",
-                    pid,
+                    pid = who.pid,
+                    retiring,
                     request_timeout = ?self.request_timeout,
                     "worker exceeded request_timeout finishing work after fastcgi_finish_request()"
                 );
-                self.retire(pid, Retired::Watchdog);
+                self.retire(who, Retired::Watchdog);
             }
         }
     }

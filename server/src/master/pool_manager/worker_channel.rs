@@ -182,6 +182,12 @@ impl WorkerChannel {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// The liveness watcher's own flag, cloned out so a caller can poll it
+    /// after this channel - and the watcher's own reference to it - is gone.
+    pub(crate) fn liveness_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.worker_gone)
+    }
+
     /// Spawns the liveness watcher, which outlives this channel and ends only
     /// when the worker does.
     pub fn new(fds: WorkerReadyFds, pid: u32) -> std::io::Result<Self> {

@@ -93,8 +93,30 @@ fn sigkill_actually_terminates_the_process() {
     }
 }
 
-/// The busy/idle bookkeeping runs with no lock and no pid lookup; this pins
-/// that what `status_json` reports is still exact.
+/// Just enough to identify a request in `/status`; nothing reads it back
+/// over the wire.
+fn dummy_request() -> Arc<crate::ipc::data::PhpRequest<'static>> {
+    use std::borrow::Cow;
+    Arc::new(crate::ipc::data::PhpRequest {
+        script_path: Cow::Borrowed("/var/www/app/index.php"),
+        document_root: Cow::Borrowed("/var/www/app"),
+        script_name: Cow::Borrowed("/index.php"),
+        path_info: Cow::Borrowed(""),
+        method: Cow::Borrowed("GET"),
+        uri: Cow::Borrowed("/hello"),
+        headers: crate::ipc::data::HeaderBlob::default(),
+        client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        body: crate::ipc::data::RequestBody::Inline(Cow::Borrowed(&[])),
+        server_name: Cow::Borrowed("localhost"),
+        server_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        server_port: 80,
+        server_protocol: Cow::Borrowed("HTTP/1.1"),
+        https: false,
+    })
+}
+
+/// The busy/idle bookkeeping runs with no pool-wide lock and no pid lookup;
+/// this pins that what `status_json` reports is still exact.
 #[test]
 fn worker_meta_tracks_state_and_request_count_without_the_pool_lock() {
     let pool_started = Instant::now();
@@ -102,7 +124,7 @@ fn worker_meta_tracks_state_and_request_count_without_the_pool_lock() {
     assert_eq!(meta.state_str(), "idle");
     assert_eq!(meta.request_count.load(Relaxed), 0);
 
-    meta.mark_busy(Instant::now(), pool_started);
+    meta.mark_busy(Instant::now(), pool_started, dummy_request());
     assert_eq!(meta.state_str(), "busy");
     assert_eq!(
         meta.request_count.load(Relaxed),
@@ -118,8 +140,26 @@ fn worker_meta_tracks_state_and_request_count_without_the_pool_lock() {
         "returning to idle must not count as another request"
     );
 
-    meta.mark_busy(Instant::now(), pool_started);
+    meta.mark_busy(Instant::now(), pool_started, dummy_request());
     assert_eq!(meta.request_count.load(Relaxed), 2);
+}
+
+#[test]
+fn current_request_json_names_the_in_flight_request_and_clears_on_idle() {
+    let pool_started = Instant::now();
+    let meta = detached_meta(pool_started);
+    assert!(meta.current_request_json().is_null());
+
+    meta.mark_busy(Instant::now(), pool_started, dummy_request());
+    assert_eq!(meta.current_request_json()["method"], "GET");
+    assert_eq!(meta.current_request_json()["uri"], "/hello");
+    assert_eq!(
+        meta.current_request_json()["script"],
+        "/var/www/app/index.php"
+    );
+
+    meta.mark_idle(Instant::now(), pool_started);
+    assert!(meta.current_request_json().is_null());
 }
 
 /// Concurrent dispatches on distinct workers must need no lock between them
@@ -136,7 +176,7 @@ fn worker_meta_counts_are_exact_under_concurrent_updates() {
             let meta = Arc::clone(&meta);
             std::thread::spawn(move || {
                 for _ in 0..PER_THREAD {
-                    meta.mark_busy(Instant::now(), pool_started);
+                    meta.mark_busy(Instant::now(), pool_started, dummy_request());
                     meta.mark_idle(Instant::now(), pool_started);
                 }
             })
@@ -292,19 +332,21 @@ fn idle_worker(pool: &PoolManager, pid: u32, retired: bool) -> PooledWorker {
     PooledWorker {
         channel,
         pid,
-        meta: Arc::new(seated_meta(pool)),
+        id: WorkerId::next(),
+        meta: Arc::new(seated_meta(pool, pid)),
     }
 }
 
 /// A `WorkerMeta` holding one of `pool`'s admission seats, as a real spawn
 /// gives it.
-fn seated_meta(pool: &PoolManager) -> WorkerMeta {
+fn seated_meta(pool: &PoolManager, pid: u32) -> WorkerMeta {
     WorkerMeta::new(
         Arc::clone(&pool.admission)
             .try_acquire_owned()
             .expect("the fixture pool has a free seat"),
         pool.started_at,
         pool.started_at,
+        pid,
     )
 }
 
@@ -315,6 +357,7 @@ fn detached_meta(pool_started: Instant) -> WorkerMeta {
         seats.try_acquire_owned().expect("a fresh semaphore"),
         pool_started,
         pool_started,
+        0,
     )
 }
 
@@ -450,32 +493,6 @@ async fn idle_timeout_evicts_nobody_when_idle_count_equals_spare() {
     reap_tracked_prototype(&pool);
 }
 
-/// Workers are tracked by pid, and the OS reuses pids. An entry displaced by
-/// a new worker under the same pid must give its seat up with it, or the
-/// pool's ceiling drops by one for good every time that happens.
-#[tokio::test]
-async fn reusing_a_pid_that_was_never_reaped_gives_its_seat_back() {
-    let pool = make_test_pool_manager(spawn_sleeper());
-    assert_eq!(pool.admission.available_permits(), TEST_POOL_MAX);
-
-    // A worker that died without anyone noticing: still tracked, still seated.
-    const PID: u32 = 4242;
-    pool.track_worker(PID, Arc::new(seated_meta(&pool)));
-    assert_eq!(pool.admission.available_permits(), TEST_POOL_MAX - 1);
-
-    // The same pid comes back on a fresh worker, through the path a real
-    // spawn takes.
-    pool.track_worker(PID, Arc::new(seated_meta(&pool)));
-
-    assert_eq!(
-        pool.admission.available_permits(),
-        TEST_POOL_MAX - 1,
-        "the displaced entry kept its seat, so the pool is one worker poorer"
-    );
-    assert_eq!(pool.counters.workers_reaped_dead.load(Relaxed), 1);
-    reap_tracked_prototype(&pool);
-}
-
 /// A crash loop must not turn into a fork() storm: a respawn attempt inside
 /// its own backoff window has to bail before ever touching `prototype::spawn`,
 /// not just eventually fail once it gets there.
@@ -519,8 +536,10 @@ async fn became_a_zombie(pid: i32) -> bool {
 }
 
 /// A live worker the pool accounts for, holding a seat as a real one does.
-fn tracked_worker(pool: &PoolManager, pid: u32) {
-    pool.track_worker(pid, Arc::new(seated_meta(pool)));
+fn tracked_worker(pool: &PoolManager, pid: u32) -> WorkerId {
+    let id = WorkerId::next();
+    pool.track_worker(id, Arc::new(seated_meta(pool, pid)));
+    id
 }
 
 /// Every retirement path gives the seat back. Leaking one lowers the pool's
@@ -540,8 +559,14 @@ async fn every_retirement_reason_returns_the_seat() {
     ] {
         // Out of range, so the kill variants fail harmlessly with ESRCH.
         const NO_REAL_WORKER_PID: u32 = 999_999_999;
-        tracked_worker(&pool, NO_REAL_WORKER_PID);
-        pool.retire(NO_REAL_WORKER_PID, why);
+        let id = tracked_worker(&pool, NO_REAL_WORKER_PID);
+        pool.retire(
+            WorkerRef {
+                id,
+                pid: NO_REAL_WORKER_PID,
+            },
+            why,
+        );
         assert_eq!(
             pool.admission.available_permits(),
             TEST_POOL_MAX,
@@ -549,11 +574,7 @@ async fn every_retirement_reason_returns_the_seat() {
             why.as_str()
         );
         assert!(
-            !pool
-                .workers
-                .lock()
-                .unwrap()
-                .contains_key(&NO_REAL_WORKER_PID),
+            !pool.workers.lock().unwrap().contains_key(&id),
             "a retired worker is still tracked after {:?}",
             why.as_str()
         );
@@ -578,9 +599,15 @@ async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
         (Retired::Unavailable, true),
     ] {
         let worker_pid = spawn_sleeper();
-        tracked_worker(&pool, worker_pid);
+        let id = tracked_worker(&pool, worker_pid);
 
-        pool.retire(worker_pid, why);
+        pool.retire(
+            WorkerRef {
+                id,
+                pid: worker_pid,
+            },
+            why,
+        );
 
         assert_eq!(
             became_a_zombie(worker_pid as i32).await,
@@ -592,6 +619,266 @@ async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
         let _ = kill(pid, Signal::SIGKILL);
         let _ = waitpid(pid, None);
     }
+    reap_tracked_prototype(&pool);
+}
+
+/// Dropping the guard that owns a worker mid-dispatch (a client disconnect
+/// before `Headers`) must free its seat and signal `peer_death`
+/// synchronously - the safety net must never be what a fast worker waits on.
+#[tokio::test]
+async fn dropping_a_checked_out_worker_retires_and_signals_immediately() {
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+    const NO_REAL_WORKER_PID: u32 = 999_999_993;
+    let (worker, worker_side, _efd) = retiring_worker_fixture(&pool, NO_REAL_WORKER_PID);
+    let id = worker.id;
+
+    drop(super::dispatch::CheckedOutWorker::new(
+        Arc::clone(&pool),
+        worker,
+    ));
+
+    assert!(
+        worker_side.channel().peer_death.is_dead(),
+        "peer_death must be set synchronously, not deferred to a spawned task"
+    );
+    assert_eq!(pool.counters.workers_abandoned.load(Relaxed), 1);
+    assert_eq!(
+        pool.admission.available_permits(),
+        TEST_POOL_MAX,
+        "the seat must come back synchronously, not after a bounded wait"
+    );
+    assert!(!pool.workers.lock().unwrap().contains_key(&id));
+
+    reap_tracked_prototype(&pool);
+}
+
+/// A tracked `PooledWorker` around a fresh shm channel, handing back the
+/// worker's own end of the response ring and its notify eventfd so a test
+/// can write into it as the worker would.
+fn retiring_worker_fixture(
+    pool: &PoolManager,
+    pid: u32,
+) -> (
+    PooledWorker,
+    crate::ipc::shm::MappedChannel,
+    std::os::fd::RawFd,
+) {
+    use std::os::fd::AsRawFd;
+
+    let (fd, worker_side) = crate::ipc::shm::create_channel().unwrap();
+    let mapped = crate::ipc::shm::map_existing_channel(fd).unwrap();
+    let resp_efd = crate::ipc::shm::create_notify_eventfd().unwrap();
+    let resp_efd_raw = resp_efd.as_raw_fd();
+    let channel = crate::master::pool_manager::worker_channel::WorkerChannel::for_test(
+        pid,
+        Arc::new(mapped),
+        crate::ipc::shm::NotifyEfds {
+            req_space: crate::ipc::shm::create_notify_eventfd().unwrap(),
+            resp_data: resp_efd,
+        },
+        unused_link(),
+    );
+    let id = WorkerId::next();
+    let meta = Arc::new(seated_meta(pool, pid));
+    pool.track_worker(id, Arc::clone(&meta));
+    (
+        PooledWorker {
+            channel,
+            pid,
+            id,
+            meta,
+        },
+        worker_side,
+        resp_efd_raw,
+    )
+}
+
+/// A worker that announced retirement in its `End` frame but then never
+/// confirms it (e.g. wedged in a PHP shutdown function) must not be let go
+/// as a routine recycle - nothing else would ever notice it is still running.
+#[tokio::test]
+async fn a_retiring_worker_that_never_confirms_exit_is_treated_as_wedged() {
+    let mut pool = make_test_pool_manager(spawn_sleeper());
+    pool.request_timeout = Some(Duration::from_millis(50));
+    let pool = Arc::new(pool);
+    const NO_REAL_WORKER_PID: u32 = 999_999_999;
+
+    // Nothing is written to the ring: the marker that should follow `End`
+    // never comes.
+    let (worker, _worker_side, _efd) = retiring_worker_fixture(&pool, NO_REAL_WORKER_PID);
+    let id = worker.id;
+    let permit = Arc::clone(&pool.semaphore).try_acquire_owned().unwrap();
+
+    Arc::clone(&pool)
+        .finish_after_end(worker, permit, true, None)
+        .await;
+
+    assert_eq!(pool.counters.watchdog_kills.load(Relaxed), 1);
+    assert_eq!(pool.counters.recycled_request_limit.load(Relaxed), 0);
+    assert_eq!(
+        pool.admission.available_permits(),
+        TEST_POOL_MAX,
+        "the seat must still come back even though the worker was killed, not returned"
+    );
+    assert!(!pool.workers.lock().unwrap().contains_key(&id));
+
+    reap_tracked_prototype(&pool);
+}
+
+/// The mirror case: a retiring worker that does send its done marker must be
+/// recycled cleanly with no signal, so the fix above does not turn every
+/// ordinary request-limit recycle into a kill.
+#[tokio::test]
+async fn a_retiring_worker_that_confirms_exit_is_recycled_without_a_kill() {
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+    const NO_REAL_WORKER_PID: u32 = 999_999_998;
+
+    let (worker, worker_side, efd) = retiring_worker_fixture(&pool, NO_REAL_WORKER_PID);
+    let id = worker.id;
+    let ring = worker_side.channel();
+    crate::ipc::data::write_worker_done_to_ring(&ring.response, &ring.peer_death, efd).unwrap();
+    let permit = Arc::clone(&pool.semaphore).try_acquire_owned().unwrap();
+
+    Arc::clone(&pool)
+        .finish_after_end(worker, permit, true, None)
+        .await;
+
+    assert_eq!(pool.counters.recycled_request_limit.load(Relaxed), 1);
+    assert_eq!(pool.counters.watchdog_kills.load(Relaxed), 0);
+    assert_eq!(pool.admission.available_permits(), TEST_POOL_MAX);
+    assert!(!pool.workers.lock().unwrap().contains_key(&id));
+
+    reap_tracked_prototype(&pool);
+}
+
+/// The same wedge as above, but under the deployment default
+/// (`request_timeout: None`, i.e. `limits.timeout: 0`) - the retiring branch
+/// must still bound itself to `ABANDONED_KILL_GRACE`, not hold the seat
+/// forever just because the ordinary watchdog is disabled.
+#[tokio::test(start_paused = true)]
+async fn a_retiring_worker_that_never_confirms_exit_is_bounded_with_the_watchdog_disabled() {
+    let mut pool = make_test_pool_manager(spawn_sleeper());
+    pool.request_timeout = None;
+    let pool = Arc::new(pool);
+    const NO_REAL_WORKER_PID: u32 = 999_999_997;
+
+    let (worker, _worker_side, _efd) = retiring_worker_fixture(&pool, NO_REAL_WORKER_PID);
+    let id = worker.id;
+    let permit = Arc::clone(&pool.semaphore).try_acquire_owned().unwrap();
+
+    Arc::clone(&pool)
+        .finish_after_end(worker, permit, true, None)
+        .await;
+
+    assert_eq!(pool.counters.watchdog_kills.load(Relaxed), 1);
+    assert_eq!(
+        pool.admission.available_permits(),
+        TEST_POOL_MAX,
+        "the seat must come back even though `limits.timeout: 0` disabled the ordinary watchdog"
+    );
+    assert!(!pool.workers.lock().unwrap().contains_key(&id));
+
+    reap_tracked_prototype(&pool);
+}
+
+/// The done marker confirms the request ended, not that the process itself
+/// has exited - a worker that writes it but then hangs must still be caught
+/// by the same background check `Abandoned` workers get, not trusted forever.
+#[tokio::test(start_paused = true)]
+async fn a_retiring_worker_that_confirms_but_never_exits_is_eventually_killed() {
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+    const NO_REAL_WORKER_PID: u32 = 999_999_996;
+
+    let (worker, worker_side, efd) = retiring_worker_fixture(&pool, NO_REAL_WORKER_PID);
+    let id = worker.id;
+    let ring = worker_side.channel();
+    crate::ipc::data::write_worker_done_to_ring(&ring.response, &ring.peer_death, efd).unwrap();
+    let permit = Arc::clone(&pool.semaphore).try_acquire_owned().unwrap();
+
+    Arc::clone(&pool)
+        .finish_after_end(worker, permit, true, None)
+        .await;
+    assert_eq!(pool.counters.recycled_request_limit.load(Relaxed), 1);
+    assert_eq!(pool.counters.watchdog_kills.load(Relaxed), 0);
+    assert!(!pool.workers.lock().unwrap().contains_key(&id));
+
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(
+        pool.counters.watchdog_kills.load(Relaxed),
+        1,
+        "a worker that never actually exits after its done marker must still get killed"
+    );
+
+    reap_tracked_prototype(&pool);
+}
+
+/// An abandoned worker confirmed gone while this is still polling (the
+/// common case) must draw no kill - `retire(Abandoned)` already accounted
+/// for it, so this checker's only job is catching a lie.
+#[tokio::test]
+async fn kill_if_still_running_leaves_a_worker_that_confirms_mid_wait_alone() {
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+    const NO_REAL_WORKER_PID: u32 = 999_999_995;
+    let id = tracked_worker(&pool, NO_REAL_WORKER_PID);
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Flips well after the checker's first poll, so the assertions below
+    // exercise the loop actually noticing it, not just a zero-iteration exit.
+    tokio::spawn({
+        let gone = Arc::clone(&gone);
+        async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            gone.store(true, Relaxed);
+        }
+    });
+
+    super::dispatch::kill_if_still_running(
+        Arc::clone(&pool),
+        WorkerRef {
+            id,
+            pid: NO_REAL_WORKER_PID,
+        },
+        gone,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    assert_eq!(pool.counters.watchdog_kills.load(Relaxed), 0);
+    assert!(
+        pool.workers.lock().unwrap().contains_key(&id),
+        "confirmed-gone must not touch tracking - that already happened elsewhere"
+    );
+
+    reap_tracked_prototype(&pool);
+}
+
+/// An abandoned worker that never confirms exit within `grace` (still
+/// running PHP with nothing pending on the ring) must not be trusted
+/// forever - it is wedged, like any other worker that missed a deadline.
+#[tokio::test]
+async fn kill_if_still_running_kills_a_worker_that_never_confirms() {
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+    const NO_REAL_WORKER_PID: u32 = 999_999_994;
+    let id = tracked_worker(&pool, NO_REAL_WORKER_PID);
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    super::dispatch::kill_if_still_running(
+        Arc::clone(&pool),
+        WorkerRef {
+            id,
+            pid: NO_REAL_WORKER_PID,
+        },
+        gone,
+        Duration::from_millis(50),
+    )
+    .await;
+
+    assert_eq!(pool.counters.watchdog_kills.load(Relaxed), 1);
+    assert!(
+        !pool.workers.lock().unwrap().contains_key(&id),
+        "a wedged worker that gets killed must not stay tracked"
+    );
+
     reap_tracked_prototype(&pool);
 }
 
@@ -623,8 +910,14 @@ async fn each_reason_counts_under_its_own_name() {
         // Nothing moves: the caller accounts for this one.
         (Retired::Unavailable, [1, 1, 1, 1, 1, 1]),
     ] {
-        tracked_worker(&pool, NO_REAL_WORKER_PID);
-        pool.retire(NO_REAL_WORKER_PID, why);
+        let id = tracked_worker(&pool, NO_REAL_WORKER_PID);
+        pool.retire(
+            WorkerRef {
+                id,
+                pid: NO_REAL_WORKER_PID,
+            },
+            why,
+        );
         assert_eq!(counters(&pool), expected, "after {:?}", why.as_str());
     }
     reap_tracked_prototype(&pool);
@@ -697,12 +990,13 @@ async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
 
     // Every seat spoken for, so `spawn_worker` can only answer "pool full".
     let parked = idle_worker(&pool, 4242, false);
+    let parked_id = parked.id;
     let _held: Vec<_> =
         std::iter::from_fn(|| Arc::clone(&pool.admission).try_acquire_owned().ok()).collect();
 
     let waiter = {
         let pool = Arc::clone(&pool);
-        tokio::spawn(async move { pool.get_worker().await.map(|w| w.pid) })
+        tokio::spawn(async move { pool.get_worker().await.map(|w| (w.id, w.pid)) })
     };
     // Long enough that the waiter is parked on the notify, not still on its
     // first pop.
@@ -711,15 +1005,19 @@ async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
 
     pool.return_worker(parked);
 
-    let got = tokio::time::timeout(Duration::from_millis(250), waiter)
+    let (id, pid) = tokio::time::timeout(Duration::from_millis(250), waiter)
         .await
         .expect("a returned worker must reach the waiter, not leave it to time out")
         .unwrap()
         .expect("the returned worker is the one it gets");
-    assert_eq!(got, 4242);
+    assert_eq!(
+        id, parked_id,
+        "the waiter must get the exact worker that was parked, not merely one with the same pid"
+    );
+    assert_eq!(pid, 4242);
 
     // `Vanished`, not `IdleTimeout`: 4242 is a placeholder pid, not a real
     // process, and `IdleTimeout` now signals it.
-    pool.retire(4242, Retired::Vanished);
+    pool.retire(WorkerRef { id, pid }, Retired::Vanished);
     reap_tracked_prototype(&pool);
 }

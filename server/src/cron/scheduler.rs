@@ -16,12 +16,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
-/// Line number of a job to the process group of its currently in-flight run,
-/// if any. Shutdown reads this to know who to signal, and the orphan reaper
-/// reads it to know which exited pids are already someone else's to reap.
-type Registry = Arc<Mutex<HashMap<usize, Pid>>>;
+/// Job line to the process groups of its in-flight and still-draining runs -
+/// more than one can coexist while an earlier run's backgrounded
+/// descendants haven't finished draining.
+type Registry = Arc<Mutex<HashMap<usize, Vec<Pid>>>>;
 
-fn lock(registry: &Registry) -> MutexGuard<'_, HashMap<usize, Pid>> {
+fn lock(registry: &Registry) -> MutexGuard<'_, HashMap<usize, Vec<Pid>>> {
     registry.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -50,7 +50,15 @@ pub(crate) async fn run(jobs: Vec<CronJob>, identity: Identity, shutdown_grace: 
     signal_running(&registry, Signal::SIGCONT);
     signal_running(&registry, Signal::SIGTERM);
 
-    let drain = async { while tasks.join_next().await.is_some() {} };
+    // Draining `tasks` alone only waits for each wrapper to exit, not a
+    // backgrounded descendant it left running - the timeout below must
+    // also cover that, or the SIGKILL escalation can never fire.
+    let drain = async {
+        while tasks.join_next().await.is_some() {}
+        while !lock(&registry).is_empty() {
+            tokio::time::sleep(GROUP_DRAIN_POLL_INTERVAL).await;
+        }
+    };
     if tokio::time::timeout(shutdown_grace, drain).await.is_err() {
         logging::warn!(
             r#type = "cron",
@@ -75,7 +83,7 @@ async fn wait_for_shutdown_signal() {
 }
 
 fn signal_running(registry: &Registry, sig: Signal) {
-    for pgid in lock(registry).values() {
+    for pgid in lock(registry).values().flatten() {
         exec::signal_group(*pgid, sig);
     }
 }
@@ -99,7 +107,11 @@ async fn reap_orphans(registry: Registry) {
             );
             let Ok(status) = peeked else { break };
             let Some(pid) = status.pid() else { break };
-            if lock(&registry).values().any(|owned| *owned == pid) {
+            if lock(&registry)
+                .values()
+                .flatten()
+                .any(|owned| *owned == pid)
+            {
                 break;
             }
             let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
@@ -170,29 +182,90 @@ async fn run_job(job: &CronJob, identity: &Identity, registry: &Registry) {
             return;
         }
     };
-    lock(registry).insert(job.line, running.pgid);
+    let pgid = running.pgid;
+    lock(registry).entry(job.line).or_default().push(pgid);
     logging::info!(r#type = "cron", command = %job.command, "job started");
 
     let start = std::time::Instant::now();
     let status = running.child.wait().await;
-    lock(registry).remove(&job.line);
     let duration_ms = start.elapsed().as_millis();
 
     match status {
-        Ok(status) => logging::info!(
-            r#type = "cron",
-            exit_code = status.code(),
-            signal = status.signal(),
-            duration_ms,
-            "job finished"
-        ),
-        Err(e) => logging::error!(
-            r#type = "cron",
-            error = %e,
-            duration_ms,
-            "failed to wait for job"
-        ),
+        Ok(status) => {
+            logging::info!(
+                r#type = "cron",
+                exit_code = status.code(),
+                signal = status.signal(),
+                duration_ms,
+                "job finished"
+            );
+            // Untracked off `run_job`'s own return, so a still-backgrounded
+            // grandchild never delays this job's next scheduled occurrence.
+            tokio::spawn(untrack_once_group_is_empty(
+                Arc::clone(registry),
+                job.line,
+                pgid,
+            ));
+        }
+        Err(e) => {
+            logging::error!(
+                r#type = "cron",
+                error = %e,
+                duration_ms,
+                "failed to wait for job"
+            );
+            // No confirmed exit to poll a group emptying against, so this
+            // falls back to untracking now rather than risk `reap_orphans`
+            // matching a pid it can peek but never actually reap.
+            untrack_pgid(registry, job.line, pgid);
+        }
     }
+}
+
+/// Removes exactly `pgid` from `line`'s entry, dropping the entry itself
+/// once empty rather than leaving a still-draining sibling run untracked.
+fn untrack_pgid(registry: &Registry, line: usize, pgid: Pid) {
+    let mut map = lock(registry);
+    if let Some(pgids) = map.get_mut(&line) {
+        pgids.retain(|&p| p != pgid);
+        if pgids.is_empty() {
+            map.remove(&line);
+        }
+    }
+}
+
+/// How often a drained-but-possibly-still-populated process group is
+/// re-checked. Only ever running after a job's own wrapper already exited,
+/// off any latency-sensitive path.
+const GROUP_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Bounds how long a stubborn group is tracked before giving up on it:
+/// reaping what it backgrounds is the job's own responsibility, not
+/// something to poll forever if it never does.
+const MAX_GROUP_DRAIN_WAIT: Duration = Duration::from_secs(600);
+
+/// Keeps `registry` naming this job's group until nothing is left in it, so
+/// a shutdown that lands after the wrapper exits but before a backgrounded
+/// descendant does can still `killpg` it.
+///
+/// A job that fired again in the meantime keeps its own, separate entry -
+/// both stay signalable until each drains on its own.
+async fn untrack_once_group_is_empty(registry: Registry, line: usize, pgid: Pid) {
+    let deadline = tokio::time::Instant::now() + MAX_GROUP_DRAIN_WAIT;
+    while process_group_exists(pgid) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(GROUP_DRAIN_POLL_INTERVAL).await;
+    }
+    untrack_pgid(&registry, line, pgid);
+}
+
+/// Signal 0: reports whether the group still has a member, without sending
+/// anything. Only `ESRCH` means gone; anything else (e.g. `EPERM`) is a
+/// group that still exists and must stay tracked.
+fn process_group_exists(pgid: Pid) -> bool {
+    !matches!(
+        nix::sys::signal::kill(Pid::from_raw(-pgid.as_raw()), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 #[cfg(test)]

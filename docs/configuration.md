@@ -282,7 +282,7 @@ The `php` object configures the pool of PHP worker processes and the application
 | Option | Default | Description |
 |---|---|---|
 | `max_depth` | `512` | Integer; requests allowed to wait for a free worker at once. `0` is unbounded, which under sustained overload only delays an eventual `503` while consuming more memory — a bounded queue turns overload into fast, cheap failures instead. |
-| `timeout` | `5` | Integer; seconds a request waits in the queue for a worker before it gets a `503`. |
+| `timeout` | `5` | Integer; seconds a request waits in line for a worker before it gets a `503`. Once it's next in line, a slow *start* of that worker is covered separately by `processes.spawn_timeout`, not this. |
 
 ```json
 { "php": { "queue": { "max_depth": 1000, "timeout": 10 } } }
@@ -453,14 +453,15 @@ A `GET` to that listener returns a snapshot like this:
       "workers_spawned_total": 7,
       "recycled_request_limit": 2,
       "recycled_idle_timeout": 1,
-      "workers_reaped_dead": 0,
       "workers_vanished_idle": 0,
       "workers_abandoned": 0,
       "prototype_respawns_total": 0,
       "crash_loop_backoffs": 0
     },
     "workers": [
-      { "pid": 1240, "state": "idle", "request_count": 812, "started_ago_seconds": 3500, "last_active_ago_seconds": 12 }
+      { "pid": 1240, "state": "idle", "request_count": 812, "started_ago_seconds": 3500, "last_active_ago_seconds": 12, "current_request": null },
+      { "pid": 1241, "state": "busy", "request_count": 5, "started_ago_seconds": 40, "last_active_ago_seconds": 0,
+        "current_request": { "method": "GET", "uri": "/report?range=90d", "script": "/var/www/app/index.php" } }
     ]
   }
 }
@@ -471,7 +472,8 @@ A `GET` to that listener returns a snapshot like this:
 | `processes` | Current worker counts: `idle`, `busy`, `total`, and the configured `max`. |
 | `queue` | Requests currently waiting for a worker (`depth`), against `max_depth`. |
 | `counters` | Cumulative totals since startup: request outcomes and worker lifecycle events. See below for what each one means. |
-| `workers` | One entry per live worker, with its state, requests served, and how long ago it started or was last active. |
+| `workers` | One entry per live worker, with its state, requests served, how long ago it started or was last active, and — while `busy` — the request it is currently running. |
+| `workers[].current_request` | `null` when no request is in flight, otherwise the `method`, `uri`, and front-controller `script` of the one running, so a worker stuck past `limits.timeout` can be identified before the watchdog kills it. Read independently of `state`, so the two can very briefly disagree right at a transition. |
 
 <details>
 <summary>Counter meanings</summary>
@@ -486,7 +488,6 @@ A `GET` to that listener returns a snapshot like this:
 | `workers_spawned_total` | Workers forked over the process's whole lifetime. |
 | `recycled_request_limit` | Workers retired cleanly after reaching `limits.requests`. |
 | `recycled_idle_timeout` | Workers killed by master for sitting idle past `processes.idle_timeout`, beyond the `spare` floor. |
-| `workers_reaped_dead` | A worker's pid was reused before the old one was reaped. Should stay `0`. |
 | `workers_vanished_idle` | A worker was found already gone while idle — a crash or an external kill, not a decision Proteus made. |
 | `workers_abandoned` | The client disconnected while a worker was still handling its request. |
 | `prototype_respawns_total` | Times the PHP prototype process was respawned after dying. |

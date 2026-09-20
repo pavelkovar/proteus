@@ -53,6 +53,33 @@ fn lock_recovers_from_a_poisoned_mutex_instead_of_panicking() {
         panic!("deliberately poisoning the mutex");
     })
     .join();
-    lock(&registry).insert(1, Pid::from_raw(1));
+    lock(&registry).insert(1, vec![Pid::from_raw(1)]);
     assert_eq!(lock(&registry).len(), 1);
+}
+
+/// A due run that starts while its predecessor's group is still draining
+/// must not evict it from `registry` - or a shutdown landing in between
+/// would miss it entirely and never send it SIGTERM.
+#[test]
+fn a_second_run_does_not_evict_the_first_runs_still_draining_pgid() {
+    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+    let first = Pid::from_raw(100);
+    let second = Pid::from_raw(200);
+
+    lock(&registry).entry(1).or_default().push(first);
+    lock(&registry).entry(1).or_default().push(second);
+    assert_eq!(lock(&registry).get(&1).unwrap(), &vec![first, second]);
+
+    untrack_pgid(&registry, 1, first);
+    assert_eq!(
+        lock(&registry).get(&1).unwrap(),
+        &vec![second],
+        "untracking the first run must leave the second one signalable"
+    );
+
+    untrack_pgid(&registry, 1, second);
+    assert!(
+        lock(&registry).get(&1).is_none(),
+        "the line's entry must go away once nothing of it is left"
+    );
 }

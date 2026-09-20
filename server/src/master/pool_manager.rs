@@ -83,7 +83,7 @@ pub struct PoolManager {
     respawn_backoff: Mutex<RespawnBackoff>,
     /// Presence doubles as "still one of ours". Off the request path, which
     /// reaches a worker's own counters through `WorkerMeta` instead.
-    workers: StdMutex<HashMap<u32, Arc<WorkerMeta>>>,
+    workers: StdMutex<HashMap<WorkerId, Arc<WorkerMeta>>>,
 }
 
 /// Monotonic `/status` counters, all `Relaxed`: nothing reads one to decide
@@ -104,8 +104,6 @@ pub(crate) struct Counters {
     /// Killed by master, unlike `recycled_request_limit` above - the worker
     /// was not given a chance to exit on its own.
     recycled_idle_timeout: AtomicU64,
-    /// Non-zero means something else failed to release a worker.
-    workers_reaped_dead: AtomicU64,
     /// Found already exited while idle - a crash or an external kill.
     workers_vanished_idle: AtomicU64,
     /// Clients that went away while a worker was checked out.
@@ -120,11 +118,43 @@ struct RespawnBackoff {
     consecutive_failures: u32,
 }
 
-/// Carried together so the hot path never looks a worker up by pid.
+/// Identifies a worker for as long as the process runs. Never reused, unlike
+/// the pid the kernel can hand to an unrelated process the moment this
+/// worker is reaped.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct WorkerId(u64);
+
+impl WorkerId {
+    /// Unique process-wide, not just within one `PoolManager`.
+    fn next() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        WorkerId(NEXT.fetch_add(1, Relaxed))
+    }
+}
+
+/// Carried together so the hot path never needs the `workers` map.
 pub(crate) struct PooledWorker {
     pub(crate) channel: WorkerChannel,
     pub(crate) pid: u32,
+    pub(crate) id: WorkerId,
     pub(crate) meta: Arc<WorkerMeta>,
+}
+
+/// A worker's id and pid, read together so nothing downstream can pair one
+/// worker's id with another's pid.
+#[derive(Clone, Copy)]
+pub(crate) struct WorkerRef {
+    pub(crate) id: WorkerId,
+    pub(crate) pid: u32,
+}
+
+impl PooledWorker {
+    pub(crate) fn as_ref(&self) -> WorkerRef {
+        WorkerRef {
+            id: self.id,
+            pid: self.pid,
+        }
+    }
 }
 
 const STATE_IDLE: u8 = 0;
@@ -140,34 +170,52 @@ pub(crate) struct WorkerMeta {
     /// The worker's seat in the pool, given up when this is dropped - which
     /// is once neither `workers` nor any `PooledWorker` holds it any more.
     _admission: OwnedSemaphorePermit,
+    /// Display only - `workers` is keyed by `WorkerId`, not this.
+    pid: u32,
     state: std::sync::atomic::AtomicU8,
     request_count: std::sync::atomic::AtomicU32,
     started_at: Instant,
     last_active_ms: AtomicU64,
+    /// `Some` only while busy. Exactly one task owns a worker at a time, so
+    /// the only other contender for this lock is a rare `/status` read.
+    current_request: StdMutex<Option<Arc<crate::ipc::data::PhpRequest<'static>>>>,
 }
 
 impl WorkerMeta {
-    fn new(admission: OwnedSemaphorePermit, now: Instant, pool_started: Instant) -> Self {
+    fn new(admission: OwnedSemaphorePermit, now: Instant, pool_started: Instant, pid: u32) -> Self {
         WorkerMeta {
             _admission: admission,
+            pid,
             state: std::sync::atomic::AtomicU8::new(STATE_IDLE),
             request_count: std::sync::atomic::AtomicU32::new(0),
             started_at: now,
             last_active_ms: AtomicU64::new(now.duration_since(pool_started).as_millis() as u64),
+            current_request: StdMutex::new(None),
         }
     }
 
-    fn mark_busy(&self, at: Instant, pool_started: Instant) {
+    fn mark_busy(
+        &self,
+        at: Instant,
+        pool_started: Instant,
+        req: Arc<crate::ipc::data::PhpRequest<'static>>,
+    ) {
+        let previous = self.current_request.lock().unwrap().replace(req);
         self.state.store(STATE_BUSY, Relaxed);
         self.request_count.fetch_add(1, Relaxed);
         self.last_active_ms
             .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
+        drop(previous);
     }
 
     fn mark_idle(&self, at: Instant, pool_started: Instant) {
+        // Bound so the stale `Arc` - potentially the request's last
+        // reference - drops after the guard, not under the lock.
+        let previous = self.current_request.lock().unwrap().take();
         self.state.store(STATE_IDLE, Relaxed);
         self.last_active_ms
             .store(at.duration_since(pool_started).as_millis() as u64, Relaxed);
+        drop(previous);
     }
 
     /// How long since this worker last went idle (or was spawned, if never
@@ -181,6 +229,17 @@ impl WorkerMeta {
         match self.state.load(Relaxed) {
             STATE_BUSY => "busy",
             _ => "idle",
+        }
+    }
+
+    fn current_request_json(&self) -> serde_json::Value {
+        match self.current_request.lock().unwrap().as_deref() {
+            Some(req) => serde_json::json!({
+                "method": req.method,
+                "uri": req.uri,
+                "script": req.script_path,
+            }),
+            None => serde_json::Value::Null,
         }
     }
 }
@@ -408,7 +467,7 @@ impl PoolManager {
                 break;
             };
             if worker.channel.worker_has_exited() {
-                self.retire(worker.pid, Retired::Vanished);
+                self.retire(worker.as_ref(), Retired::Vanished);
                 continue;
             }
             let now = Instant::now();
@@ -419,7 +478,7 @@ impl PoolManager {
                 && worker.meta.idle_for(now, self.started_at) >= idle_timeout
                 && self.idle.lock().unwrap().len() >= spare
             {
-                self.retire(worker.pid, Retired::IdleTimeout);
+                self.retire(worker.as_ref(), Retired::IdleTimeout);
                 continue;
             }
             if now < deadline && worker.channel.reclaim_is_due() {
@@ -576,34 +635,31 @@ impl PoolManager {
         self.counters.workers_spawned.fetch_add(1, Relaxed);
         // Past every fallible step, so the seat now belongs to a worker that
         // `workers` will account for.
-        let meta = Arc::new(WorkerMeta::new(admission, Instant::now(), self.started_at));
-        self.track_worker(pid, Arc::clone(&meta));
+        let meta = Arc::new(WorkerMeta::new(
+            admission,
+            Instant::now(),
+            self.started_at,
+            pid,
+        ));
+        let id = WorkerId::next();
+        self.track_worker(id, Arc::clone(&meta));
         logging::debug!(r#type = "controller", pid, "spawned worker");
-        Ok(PooledWorker { channel, pid, meta })
+        Ok(PooledWorker {
+            channel,
+            pid,
+            id,
+            meta,
+        })
     }
 
-    /// Drops any entry this displaces, giving up its seat with it: the OS
-    /// reuses pids, and a worker whose pid came round again before it was
-    /// reaped would otherwise hold a seat for good.
-    fn track_worker(&self, pid: u32, meta: Arc<WorkerMeta>) {
-        // Bound first: as the scrutinee of an `if let`, the guard would live
-        // for the whole arm and put the log call under the map lock.
-        let displaced = self.workers.lock().unwrap().insert(pid, meta);
-        if displaced.is_some() {
-            // Gone for certain: the kernel does not hand out a live pid.
-            logging::warn!(
-                r#type = "controller",
-                pid,
-                "reusing the pid of a worker that was never reaped"
-            );
-            self.counters.workers_reaped_dead.fetch_add(1, Relaxed);
-        }
+    fn track_worker(&self, id: WorkerId, meta: Arc<WorkerMeta>) {
+        self.workers.lock().unwrap().insert(id, meta);
     }
 
     /// The one way a worker leaves the pool. Its seat comes back when the
     /// last reference to its `WorkerMeta` goes, which is why a caller still
     /// holding the `PooledWorker` need not do anything else.
-    pub(crate) fn retire(&self, pid: u32, why: Retired) {
+    pub(crate) fn retire(&self, who: WorkerRef, why: Retired) {
         let counter = match why {
             Retired::IdleTimeout => Some(&self.counters.recycled_idle_timeout),
             Retired::RequestLimit => Some(&self.counters.recycled_request_limit),
@@ -617,16 +673,16 @@ impl PoolManager {
             counter.fetch_add(1, Relaxed);
         }
         if why.needs_kill() {
-            sigkill(pid, why.as_str());
+            sigkill(who.pid, why.as_str());
         } else {
             logging::debug!(
                 r#type = "controller",
-                pid,
+                pid = who.pid,
                 reason = why.as_str(),
                 "retiring worker"
             );
         }
-        self.workers.lock().unwrap().remove(&pid);
+        self.workers.lock().unwrap().remove(&who.id);
     }
 
     /// An idle worker, or a freshly spawned one.
@@ -646,7 +702,7 @@ impl PoolManager {
                 if !worker.channel.worker_has_exited() {
                     return Ok(worker);
                 }
-                self.retire(worker.pid, Retired::Vanished);
+                self.retire(worker.as_ref(), Retired::Vanished);
             }
             match self.spawn_worker().await {
                 Err(e) if is_pool_full(&e) => {}
@@ -680,14 +736,15 @@ impl PoolManager {
             .workers
             .lock()
             .unwrap()
-            .iter()
-            .map(|(pid, meta)| {
+            .values()
+            .map(|meta| {
                 serde_json::json!({
-                    "pid": pid,
+                    "pid": meta.pid,
                     "state": meta.state_str(),
                     "request_count": meta.request_count.load(Relaxed),
                     "started_ago_seconds": meta.started_at.elapsed().as_secs(),
                     "last_active_ago_seconds": now_ms.saturating_sub(meta.last_active_ms.load(Relaxed)) / 1000,
+                    "current_request": meta.current_request_json(),
                 })
             })
             .collect();
@@ -713,7 +770,6 @@ impl PoolManager {
                     "workers_spawned_total": self.counters.workers_spawned.load(Relaxed),
                     "recycled_request_limit": self.counters.recycled_request_limit.load(Relaxed),
                     "recycled_idle_timeout": self.counters.recycled_idle_timeout.load(Relaxed),
-                    "workers_reaped_dead": self.counters.workers_reaped_dead.load(Relaxed),
                     "workers_vanished_idle": self.counters.workers_vanished_idle.load(Relaxed),
                     "workers_abandoned": self.counters.workers_abandoned.load(Relaxed),
                     "prototype_respawns_total": self.counters.prototype_respawns.load(Relaxed),

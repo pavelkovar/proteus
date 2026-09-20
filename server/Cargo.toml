@@ -51,3 +51,4 @@ zstd = "0.14"
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["gzip", "json", "multipart"] }
+tokio = { version = "1", features = ["test-util"] }
