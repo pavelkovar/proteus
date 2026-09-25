@@ -89,17 +89,6 @@ static void proteus_php_mod_log_message(char *message, int syslog_type_int) {
     proteus_php_mod_log_json("php", proteus_php_mod_level_name(syslog_type_int), message);
 }
 
-typedef struct {
-    char   *buf;
-    size_t  len;
-    size_t  cap;
-} proteus_php_mod_capture_t;
-
-/* Headers only; the body streams straight through and is never buffered.
- * Not part of proteus_request_ctx below: buf/cap persist across requests to
- * amortize allocation, only len is reset per-request. */
-static proteus_php_mod_capture_t g_headers;
-
 /* Everything one PHP request owns, reset in full at the top of every
  * execute_file() call. A static, not a threaded value: the SAPI hooks
  * below belong to libphp and carry no user-data parameter. */
@@ -125,62 +114,6 @@ typedef struct {
 
 static proteus_request_ctx g_ctx;
 
-/* On failure the buffer is left untouched, so a bail-out path cannot deref a
- * stale pointer and a retry stays safe. */
-static int proteus_php_mod_grow(proteus_php_mod_capture_t *c, size_t extra) {
-    if (c->len + extra + 1 <= c->cap) {
-        return 0;
-    }
-    size_t new_cap = c->cap ? c->cap * 2 : 4096;
-    while (new_cap < c->len + extra + 1) {
-        new_cap *= 2;
-    }
-    char *new_buf = realloc(c->buf, new_cap);
-    if (!new_buf) {
-        return -1;
-    }
-    c->buf = new_buf;
-    c->cap = new_cap;
-    return 0;
-}
-
-/* `grow` never shrinks and execute_file only resets `len`, so without this a
- * single huge header set would stay resident for the worker's whole life.
- *
- * Fixed thresholds rather than a high-water heuristic: crossing it already
- * means a set larger than any real HTTP client parses, so retaining the
- * buffer optimises for a case that won't recur. */
-#define PROTEUS_PHP_MOD_HEADERS_SHRINK_ABOVE (64 * 1024)
-#define PROTEUS_PHP_MOD_HEADERS_KEEP_CAP     (4 * 1024)
-
-/* A failed shrink is a no-op: keeping an oversized buffer beats dropping a
- * valid one. */
-static void proteus_php_mod_capture_shrink(proteus_php_mod_capture_t *c) {
-    if (c->cap <= PROTEUS_PHP_MOD_HEADERS_SHRINK_ABOVE) {
-        return;
-    }
-    char *shrunk = realloc(c->buf, PROTEUS_PHP_MOD_HEADERS_KEEP_CAP);
-    if (shrunk == NULL) {
-        return;
-    }
-    c->buf = shrunk;
-    c->cap = PROTEUS_PHP_MOD_HEADERS_KEEP_CAP;
-    /* `cap` must be exact: overstate it and `grow` skips the realloc it
-     * owes, and the next append writes past the end of the buffer. */
-    c->len = 0;
-    c->buf[0] = '\0';
-}
-
-static void proteus_php_mod_capture_append(proteus_php_mod_capture_t *c, const char *str, size_t str_length) {
-    if (proteus_php_mod_grow(c, str_length) != 0) {
-        /* Drop the append rather than crash the worker over one header. */
-        return;
-    }
-    memcpy(c->buf + c->len, str, str_length);
-    c->len += str_length;
-    c->buf[c->len] = '\0';
-}
-
 /* Core finalizes headers only by request end, not before an ordinary write,
  * so this forces the ordering. Idempotent. */
 static size_t proteus_php_mod_ub_write(const char *str, size_t str_length) {
@@ -198,28 +131,45 @@ static size_t proteus_php_mod_ub_write(const char *str, size_t str_length) {
     return str_length;
 }
 
-/* Newline-joined for the Rust side; header() has rejected embedded CR/LF
- * since PHP 5.1.2. */
-static void proteus_php_mod_collect_header(void *data, void *arg) {
-    sapi_header_struct *h = (sapi_header_struct *) data;
-    proteus_php_mod_capture_t *out = (proteus_php_mod_capture_t *) arg;
-    if (out->len > 0) {
-        proteus_php_mod_capture_append(out, "\n", 1);
-    }
-    proteus_php_mod_capture_append(out, h->header, h->header_len);
-}
+/* Covers typical header sets without a heap allocation. */
+#define PROTEUS_PHP_MOD_HEADERS_STACK (8 * 1024)
 
-/* Core calls this once with the full list, in place of the per-header hooks.
- * The return value tells core delivery is handled entirely here. */
+/* Core calls this once with the full list, in place of the per-header hooks,
+ * and the headers go to the Rust side newline-joined (header() has rejected
+ * embedded CR/LF since PHP 5.1.2). Outside the Zend heap on purpose: headers
+ * must still go out after a memory_limit fatal. */
 static int proteus_php_mod_send_headers(sapi_headers_struct *sapi_headers) {
-    g_headers.len = 0;
-    zend_llist_apply_with_argument(&sapi_headers->headers, proteus_php_mod_collect_header, &g_headers);
+    zend_llist *list = &sapi_headers->headers;
+    zend_llist_position it;
+    size_t total = 0;
+    for (sapi_header_struct *h = zend_llist_get_first_ex(list, &it); h != NULL;
+         h = zend_llist_get_next_ex(list, &it)) {
+        total += h->header_len + 1;
+    }
+
+    char stack_buf[PROTEUS_PHP_MOD_HEADERS_STACK];
+    char *buf = total <= sizeof(stack_buf) ? stack_buf : malloc(total);
+    size_t len = 0;
+    if (buf != NULL) {
+        for (sapi_header_struct *h = zend_llist_get_first_ex(list, &it); h != NULL;
+             h = zend_llist_get_next_ex(list, &it)) {
+            if (len > 0) {
+                buf[len++] = '\n';
+            }
+            memcpy(buf + len, h->header, h->header_len);
+            len += h->header_len;
+        }
+    }
+
     if (g_ctx.chunk_cb) {
         int status = sapi_headers->http_response_code;
         if (status == 0) {
             status = 200;
         }
-        g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_HEADERS, status, g_headers.buf, g_headers.len, g_ctx.chunk_cb_user_data);
+        g_ctx.chunk_cb(PROTEUS_PHP_MOD_CHUNK_HEADERS, status, buf, len, g_ctx.chunk_cb_user_data);
+    }
+    if (buf != stack_buf) {
+        free(buf);
     }
     return SAPI_HEADER_SENT_SUCCESSFULLY;
 }
@@ -510,14 +460,6 @@ int proteus_php_mod_execute_file(
     proteus_php_mod_chunk_fn chunk_cb, void *chunk_cb_user_data,
     int *out_early_sent
 ) {
-    g_headers.len = 0;
-    if (g_headers.cap == 0) {
-        if (proteus_php_mod_grow(&g_headers, 1) != 0) {
-            return -1; /* OOM before request startup even begins */
-        }
-        g_headers.buf[0] = '\0';
-    }
-
     /* Whole-struct zero, so a field this function forgets to set below
      * defaults to zero/NULL rather than carrying over from the last request. */
     g_ctx = (proteus_request_ctx){0};
@@ -539,7 +481,6 @@ int proteus_php_mod_execute_file(
             }
             proteus_php_mod_log_json("worker", "ERROR",
                 "could not open the request body fd, failing the request");
-            proteus_php_mod_capture_shrink(&g_headers);
             *out_early_sent = 0;
             return -1;
         }
@@ -570,7 +511,6 @@ int proteus_php_mod_execute_file(
             fclose(g_ctx.body_file);
             g_ctx.body_file = NULL;
         }
-        proteus_php_mod_capture_shrink(&g_headers);
         return -1;
     }
 
@@ -618,10 +558,6 @@ int proteus_php_mod_execute_file(
         /* Too late for an HTTP failure: the script already ran. */
         proteus_php_mod_log_json("worker", "ERROR", "request body read failed mid-request");
     }
-    /* Here rather than at the next call, or an idle worker holds the
-     * oversized buffer for exactly as long as it is least worth holding. */
-    proteus_php_mod_capture_shrink(&g_headers);
-
     *out_early_sent = g_ctx.early_sent;
     return 0;
 }

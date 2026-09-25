@@ -6820,3 +6820,49 @@ async fn a_client_that_leaves_during_a_worker_spawn_does_not_leak_the_worker() {
         .len();
     assert!(workers <= 1, "{workers} workers for a pool of max 1");
 }
+
+#[tokio::test]
+async fn response_headers_of_any_size_arrive_whole_and_in_order() {
+    let www = fixtures_dir().join("www");
+    let server = start_server("big-headers", www.to_str().unwrap(), serde_json::json!({})).await;
+    // Around php-mod's 8 KiB on-stack buffer, then well past it.
+    let cases = [
+        (1, 7000),
+        (1, 8150),
+        (1, 8170),
+        (1, 8190),
+        (1, 8210),
+        (1, 8230),
+        (1, 9000),
+        (3, 3000),
+        (60, 1000),
+    ];
+    for (n, size) in cases {
+        let resp = reqwest::get(format!(
+            "http://127.0.0.1:{}/big-headers?n={n}&size={size}",
+            server.port
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), 200, "n={n} size={size}");
+        let names: Vec<String> = resp
+            .headers()
+            .keys()
+            .filter(|k| k.as_str().starts_with("x-big-"))
+            .map(|k| k.to_string())
+            .collect();
+        let expected: Vec<String> = (0..n).map(|i| format!("x-big-{i}")).collect();
+        assert_eq!(names, expected, "n={n} size={size}");
+        for i in 0..n {
+            let value = resp.headers()[format!("x-big-{i}").as_str()]
+                .to_str()
+                .unwrap();
+            assert_eq!(
+                value,
+                format!("{i}{}", "h".repeat(size)),
+                "n={n} size={size} header {i}"
+            );
+        }
+        assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+}

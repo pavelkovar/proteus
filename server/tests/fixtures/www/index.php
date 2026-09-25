@@ -345,6 +345,14 @@ if (strpos($_SERVER['REQUEST_URI'], '/ini-values') !== false) {
     exit;
 }
 
+if (strpos($_SERVER['REQUEST_URI'], '/big-headers') !== false) {
+    for ($i = 0, $n = (int)($_GET['n'] ?? 1); $i < $n; $i++) {
+        header("X-Big-$i: " . $i . str_repeat('h', (int)($_GET['size'] ?? 100)));
+    }
+    echo "ok";
+    exit;
+}
+
 // More than socket buffers hold, so a client that stops reading blocks the writer.
 if (strpos($_SERVER['REQUEST_URI'], '/big-output') !== false) {
     $chunk = str_repeat('b', 65536);
