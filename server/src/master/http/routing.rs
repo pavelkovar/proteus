@@ -79,6 +79,32 @@ pub(crate) fn openat2_usable_for_test() -> bool {
     OPENAT2_USABLE.load(Relaxed)
 }
 
+/// Where `open` of a dentry-cached path never leaves memory. Network and FUSE
+/// filesystems revalidate on every open, so anything unlisted counts as remote.
+fn is_local_fs_type(f_type: u32) -> bool {
+    const EXT2_3_4: u32 = 0xEF53;
+    const XFS: u32 = 0x5846_5342;
+    const BTRFS: u32 = 0x9123_683E;
+    const TMPFS: u32 = 0x0102_1994;
+    const RAMFS: u32 = 0x8584_58F6;
+    const OVERLAYFS: u32 = 0x794C_7630;
+    const F2FS: u32 = 0xF2F5_2010;
+    const ZFS: u32 = 0x2FC1_2FC1;
+    matches!(
+        f_type,
+        EXT2_3_4 | XFS | BTRFS | TMPFS | RAMFS | OVERLAYFS | F2FS | ZFS
+    )
+}
+
+pub(crate) fn on_local_fs(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    is_local_fs_type(st.f_type as u64 as u32)
+}
+
 /// Whatever opened the fd, this decides what it promises.
 pub(crate) fn stat_and_advise(
     file: std::fs::File,
@@ -178,6 +204,42 @@ pub(crate) fn percent_decode_path(
         .map_err(|_| PathDecodeError::NotUtf8)
 }
 
+/// Folds empty and `.` segments as the kernel does, so `//admin/x` cannot route
+/// unlike `/admin/x` yet open the same file. `..` stays for `path_escapes_root`
+/// to refuse: resolving it here could turn a traversal into a passing path.
+pub(crate) fn request_path(raw: &str) -> Result<std::borrow::Cow<'_, str>, PathDecodeError> {
+    use std::borrow::Cow;
+    let decoded = percent_decode_path(raw)?;
+    if !needs_folding(&decoded) {
+        return Ok(decoded);
+    }
+    let mut out = String::with_capacity(decoded.len());
+    for segment in decoded.split('/') {
+        if segment.is_empty() || segment == "." {
+            continue;
+        }
+        out.push('/');
+        out.push_str(segment);
+    }
+    // A trailing `/` names a directory for index resolution and `match`.
+    if out.is_empty() || decoded.ends_with('/') || decoded.ends_with("/.") {
+        out.push('/');
+    }
+    Ok(Cow::Owned(out))
+}
+
+fn needs_folding(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'/'
+            && match bytes.get(i + 1) {
+                Some(b'/') => true,
+                Some(b'.') => matches!(bytes.get(i + 2), None | Some(b'/')),
+                _ => false,
+            }
+    })
+}
+
 fn hex_nibble(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -273,7 +335,8 @@ pub(crate) async fn dispatch_action(
 
                 // Only a cached miss or directory is actionable; a File
                 // verdict still needs the real open below.
-                let cached = state.fs_cache.get(&candidate);
+                let cached_entry = state.fs_cache.get_with_locality(&candidate);
+                let cached = cached_entry.map(|(kind, _)| kind);
                 if matches!(cached, Some(FsKind::Dir) | Some(FsKind::Missing)) {
                     match fallback {
                         Some(next) => {
@@ -284,19 +347,25 @@ pub(crate) async fn dispatch_action(
                     }
                 }
 
-                // Opening is the existence check. A directory must count as
-                // a miss: open() succeeds on one and would otherwise fail
-                // mid-stream, after the headers promised a body.
-                //
-                // open and stat share one `spawn_blocking`; separate
-                // `tokio::fs` calls would each be their own trip through the
-                // blocking pool.
-                let stat_result = match open_cached(&candidate) {
-                    Some(opened) => opened.and_then(stat_and_advise),
+                // A directory counts as a miss: it opens, then fails mid-stream.
+                // Without `openat2` (< 5.12, RHEL 8) a local file the pool opened
+                // within the TTL is still dentry-cached, so `open` stays in memory.
+                let (stat_result, learned_local) = match open_cached(&candidate) {
+                    Some(opened) => (opened.and_then(stat_and_advise), None),
+                    None if !OPENAT2_USABLE.load(Relaxed)
+                        && cached_entry == Some((FsKind::File, true)) =>
+                    {
+                        (
+                            std::fs::File::open(&candidate).and_then(stat_and_advise),
+                            None,
+                        )
+                    }
                     None => {
                         let candidate = candidate.clone();
                         tokio::task::spawn_blocking(move || {
-                            std::fs::File::open(&candidate).and_then(stat_and_advise)
+                            let opened = std::fs::File::open(&candidate).and_then(stat_and_advise);
+                            let local = opened.as_ref().is_ok_and(|(file, _)| on_local_fs(file));
+                            (opened, Some(local))
                         })
                         .await
                         .expect("blocking task panicked")
@@ -307,8 +376,14 @@ pub(crate) async fn dispatch_action(
                     Ok((file, meta)) => (Some((file, meta)), FsKind::File),
                     Err(_) => (None, FsKind::Missing),
                 };
-                if cached != Some(kind) {
-                    state.fs_cache.put(candidate.clone(), kind);
+                // Only on change: a rewrite restamps and would keep a stale entry alive.
+                match (kind, learned_local) {
+                    (FsKind::File, Some(local)) if cached_entry != Some((FsKind::File, local)) => {
+                        state.fs_cache.put_file(candidate.clone(), local);
+                    }
+                    (FsKind::File, Some(_)) => {}
+                    _ if cached != Some(kind) => state.fs_cache.put(candidate.clone(), kind),
+                    _ => {}
                 }
                 match opened {
                     Some((file, meta)) => {

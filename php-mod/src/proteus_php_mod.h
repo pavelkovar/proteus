@@ -20,8 +20,8 @@ typedef struct {
     const char *authorization;  /* raw Authorization header value, may be NULL - populates PHP_AUTH_* */
 } proteus_php_mod_request_t;
 
-/* "KEY=VALUE" strings. Admin entries lock against a later ini_set(); user
- * entries set a default only. */
+/* "KEY=VALUE" strings applied at startup as `php -d` would. Admin entries are
+ * locked against ini_set(); an unknown key fails the call. */
 int proteus_php_mod_init(
     const char *const *admin_entries, size_t admin_count,
     const char *const *user_entries, size_t user_count

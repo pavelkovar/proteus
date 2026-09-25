@@ -1,5 +1,6 @@
 //! Crontab parsing: `minute hour day-of-month month day-of-week command`,
-//! one job per line, blank lines and `#` comments skipped.
+//! one job per line, blank lines and `#` comments skipped, and `NAME=value`
+//! lines setting a variable for the jobs below them, as cronie does.
 
 mod exec;
 mod scheduler;
@@ -15,14 +16,29 @@ pub(crate) struct CronJob {
     pub(crate) line: usize,
     pub(crate) schedule: croner::Cron,
     pub(crate) command: String,
+    /// The crontab's `NAME=value` lines above this job.
+    pub(crate) env: Vec<(String, String)>,
 }
 
 pub(crate) fn parse(text: &str) -> Result<Vec<CronJob>, String> {
     let mut jobs = Vec::new();
+    let mut env: Vec<(String, String)> = Vec::new();
     for (i, raw_line) in text.lines().enumerate() {
         let line = i + 1;
         let trimmed = raw_line.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some((name, value)) = parse_env_line(trimmed) {
+            if name == "SHELL" && value != "/bin/sh" {
+                return Err(format!(
+                    "line {line}: jobs always run under /bin/sh, so SHELL={value} would only mislead them"
+                ));
+            }
+            match env.iter_mut().find(|(n, _)| *n == name) {
+                Some(slot) => slot.1 = value,
+                None => env.push((name, value)),
+            }
             continue;
         }
         let (expr, command) = split_schedule_and_command(trimmed)
@@ -39,9 +55,30 @@ pub(crate) fn parse(text: &str) -> Result<Vec<CronJob>, String> {
             line,
             schedule,
             command: command.to_string(),
+            env: env.clone(),
         });
     }
     Ok(jobs)
+}
+
+/// cronie's rules: blanks around `=`, matching quotes stripped. A job line never
+/// matches, as no schedule field starts like a variable name.
+fn parse_env_line(line: &str) -> Option<(String, String)> {
+    let (name, value) = line.split_once('=')?;
+    let name = name.trim_end();
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    let value = value.trim();
+    let value = ['"', '\'']
+        .iter()
+        .find_map(|&q| value.strip_prefix(q)?.strip_suffix(q))
+        .unwrap_or(value);
+    Some((name.to_string(), value.to_string()))
 }
 
 /// Splits `line` into its 5 whitespace-separated schedule fields (rejoined

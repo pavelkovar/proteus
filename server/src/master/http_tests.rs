@@ -462,3 +462,30 @@ async fn every_clone_observes_the_same_signal() {
         .await
         .expect("clone b must see the signal");
 }
+
+/// Unnormalized, `//admin/x` and `/./admin/x` reach the file `/admin/*` guards.
+#[test]
+fn a_deny_route_cannot_be_dodged_by_empty_or_dot_segments() {
+    let cfg = test_config(vec![uri_route(
+        &["/admin/*"],
+        RouteActionConfig::Return { status: 403 },
+    )]);
+    for raw in [
+        "/admin/secret.txt",
+        "//admin/secret.txt",
+        "/./admin/secret.txt",
+        "/%2e/admin/secret.txt",
+        "/.//./admin/secret.txt",
+    ] {
+        let path = request_path(raw).unwrap();
+        assert!(
+            matches!(
+                match_route(&cfg, &path, "GET", ""),
+                RouteDecision::Matched {
+                    action: RouteActionConfig::Return { status: 403 }
+                }
+            ),
+            "{raw:?} (seen by routing as {path:?}) walked around the deny route"
+        );
+    }
+}

@@ -186,3 +186,42 @@ async fn an_undecodable_frame_ends_the_sweep_with_what_it_had() {
         _ => panic!("an undecodable frame must not be treated as a normal response"),
     }
 }
+
+#[tokio::test]
+async fn a_worker_publishing_a_corrupt_frame_length_is_retired_not_pooled() {
+    use super::super::tests::{
+        dummy_request, make_test_pool_manager, reap_tracked_prototype, retiring_worker_fixture,
+        spawn_sleeper,
+    };
+
+    let pool = Arc::new(make_test_pool_manager(spawn_sleeper()));
+    let (worker, worker_side, _efd) = retiring_worker_fixture(&pool, NO_REAL_WORKER_PID);
+    let id = worker.id;
+    worker_side
+        .channel()
+        .response
+        .publish_raw_for_test(&u32::MAX.to_le_bytes());
+    let permit = Arc::clone(&pool.semaphore).try_acquire_owned().unwrap();
+
+    let outcome = pool
+        .try_dispatch_to(worker, &dummy_request(), permit, None)
+        .await;
+
+    match outcome {
+        Err(AttemptError::WorkerUnavailable(e, _, _)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData)
+        }
+        Err(AttemptError::RequestTooLarge(_)) => {
+            panic!("a worker's corrupt frame was blamed on the request")
+        }
+        _ => panic!("expected the worker to be treated as unavailable"),
+    }
+    assert!(
+        pool.idle.lock().unwrap().is_empty(),
+        "the broken worker went back into the pool"
+    );
+    assert!(!pool.workers.lock().unwrap().contains_key(&id));
+    assert_eq!(pool.counters.requests_too_large.load(Relaxed), 0);
+
+    reap_tracked_prototype(&pool);
+}

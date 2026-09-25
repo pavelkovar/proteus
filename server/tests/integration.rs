@@ -2683,6 +2683,111 @@ async fn admin_ini_option_wins_over_user_and_locks_against_ini_set() {
     );
 }
 
+/// Applied after startup these would be reported by `ini_get()` yet ignored.
+#[tokio::test]
+async fn startup_only_php_options_reach_the_engine_before_it_starts() {
+    let www = fixtures_dir().join("www");
+    let opcache_config = async |port: u16| -> String {
+        reqwest::get(format!("http://127.0.0.1:{port}/opcache-config"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    let field = |body: &str, name: &str| -> String {
+        body.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("fixture must report {name}: {body}"))
+            .trim()
+            .to_string()
+    };
+
+    let server = start_server(
+        "startup-ini",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": { "options": { "admin": { "opcache.max_accelerated_files": "50000" } } }
+        }),
+    )
+    .await;
+    let body = opcache_config(server.port).await;
+    let max_keys: i64 = field(&body, "OPCACHE_MAX_CACHED_KEYS").parse().unwrap();
+    assert!(
+        max_keys >= 50_000,
+        "OPcache sized its hash from its default, not from php.options: {body}"
+    );
+
+    // No JIT before 8.0 or in some builds, where its keys are rightly refused.
+    if field(&body, "JIT_AVAILABLE") != "true" {
+        return;
+    }
+    let server = start_server(
+        "startup-ini-jit",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": {
+                "options": {
+                    "admin": { "opcache.jit": "tracing", "opcache.jit_buffer_size": "16M" }
+                }
+            }
+        }),
+    )
+    .await;
+    let body = opcache_config(server.port).await;
+    assert_eq!(field(&body, "JIT_ENABLED"), "true", "JIT is off: {body}");
+    let buffer: i64 = field(&body, "JIT_BUFFER_SIZE").parse().unwrap();
+    assert!(buffer > 0, "no JIT buffer was allocated: {body}");
+}
+
+#[tokio::test]
+async fn php_options_follow_php_ini_syntax_and_user_ones_stay_changeable() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "ini-syntax",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": {
+                "options": {
+                    "admin": {
+                        "error_reporting": "E_ALL & ~E_DEPRECATED",
+                        "include_path": ".:/tmp/proteus-include"
+                    },
+                    "user": { "precision": "12" }
+                }
+            }
+        }),
+    )
+    .await;
+
+    let body = reqwest::get(format!("http://127.0.0.1:{}/ini-values", server.port))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let field = |name: &str| -> String {
+        body.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("fixture must report {name}: {body}"))
+            .trim()
+            .to_string()
+    };
+
+    assert_eq!(
+        field("ERROR_REPORTING"),
+        field("EXPECTED_ERROR_REPORTING"),
+        "the constant expression was not evaluated: {body}"
+    );
+    assert_eq!(field("INCLUDE_PATH"), ".:/tmp/proteus-include", "{body}");
+    assert_eq!(field("PRECISION"), "12", "{body}");
+    assert_eq!(
+        field("USER_INI_SET_RESULT"),
+        "true",
+        "a user option must stay changeable by the script: {body}"
+    );
+}
+
 /// This client is always a loopback peer, so only the value is exercised
 /// here; the trust boundary itself needs an untrusted peer and is unit-tested.
 #[tokio::test]
@@ -6102,4 +6207,616 @@ async fn query_string_matches_the_request_uri_it_is_derived_from() {
             "{target}: $_GET did not parse, got {body:?}"
         );
     }
+}
+
+fn lowest_free_fd(pid: u32) -> u64 {
+    let open: std::collections::HashSet<u64> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    (0..).find(|n| !open.contains(n)).unwrap()
+}
+
+fn nofile_soft(pid: u32) -> u64 {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let line = limits
+        .lines()
+        .find(|l| l.starts_with("Max open files"))
+        .unwrap();
+    line.split_whitespace().nth(3).unwrap().parse().unwrap()
+}
+
+/// From a child running as `phpapp`: matching credentials need no
+/// `CAP_SYS_RESOURCE`, which a container rarely grants.
+fn set_nofile_soft(pid: u32, soft: u64) {
+    let (uid, gid) = (1500, 1500);
+    let hard = {
+        let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+        let line = limits
+            .lines()
+            .find(|l| l.starts_with("Max open files"))
+            .unwrap();
+        line.split_whitespace()
+            .nth(4)
+            .unwrap()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // Only async-signal-safe calls between fork and _exit.
+    match unsafe { libc::fork() } {
+        0 => unsafe {
+            let new = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: hard,
+            };
+            let ok = libc::setgroups(0, std::ptr::null()) == 0
+                && libc::setgid(gid) == 0
+                && libc::setuid(uid) == 0
+                && libc::prlimit(
+                    pid as libc::pid_t,
+                    libc::RLIMIT_NOFILE,
+                    &new,
+                    std::ptr::null_mut(),
+                ) == 0;
+            libc::_exit(if ok { 0 } else { *libc::__errno_location() });
+        },
+        child if child > 0 => {
+            let mut status = 0;
+            unsafe { libc::waitpid(child, &mut status, 0) };
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "prlimit as phpapp failed: errno {}",
+                libc::WEXITSTATUS(status)
+            );
+        }
+        _ => panic!("fork: {}", std::io::Error::last_os_error()),
+    }
+    assert_eq!(nofile_soft(pid), soft, "the limit did not take");
+}
+
+#[tokio::test]
+async fn a_failed_worker_spawn_leaves_the_prototype_and_running_requests_alone() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "spawn-failure",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": { "processes": { "max": 4, "spare": 1 }, "limits": { "requests": 0, "timeout": 10 } }
+        }),
+    )
+    .await;
+    let prototype_pid = status_json(&server).await["php"]["prototype_pid"]
+        .as_u64()
+        .unwrap() as u32;
+
+    let port = server.port;
+    let running = tokio::spawn(async move {
+        reqwest::get(format!("http://127.0.0.1:{port}/?delay_ms=2500")).await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let old_soft = nofile_soft(prototype_pid);
+    set_nofile_soft(prototype_pid, lowest_free_fd(prototype_pid));
+    // Its own outcome does not matter, only what the failed spawn does to the rest.
+    let _ = reqwest::get(format!("http://127.0.0.1:{}/", server.port)).await;
+
+    let running = running
+        .await
+        .unwrap()
+        .expect("the running request's connection broke");
+    assert_eq!(
+        running.status(),
+        200,
+        "a spawn that failed for another request took this one down with it"
+    );
+    assert_eq!(
+        status_json(&server).await["php"]["prototype_pid"].as_u64(),
+        Some(prototype_pid as u64),
+        "the prototype was lost over a single refused spawn"
+    );
+
+    set_nofile_soft(prototype_pid, old_soft);
+    let port = server.port;
+    let both = futures_join(
+        reqwest::get(format!("http://127.0.0.1:{port}/?delay_ms=300")),
+        reqwest::get(format!("http://127.0.0.1:{port}/?delay_ms=300")),
+    )
+    .await;
+    assert_eq!(both.0.unwrap().status(), 200);
+    assert_eq!(both.1.unwrap().status(), 200);
+}
+
+async fn futures_join<A: std::future::Future, B: std::future::Future>(
+    a: A,
+    b: B,
+) -> (A::Output, B::Output) {
+    tokio::join!(a, b)
+}
+
+#[tokio::test]
+async fn sigterm_sends_busy_keep_alive_clients_away_instead_of_serving_them_until_the_grace_period()
+{
+    let www = fixtures_dir().join("www");
+    let mut server = start_server(
+        "sigterm-keepalive",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "shutdown": { "grace_period_seconds": 10 } } }),
+    )
+    .await;
+
+    let port = server.port;
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(1)
+        .build()
+        .unwrap();
+    let busy_client = tokio::spawn(async move {
+        let mut told_to_close = false;
+        loop {
+            let Ok(resp) = client
+                .get(format!("http://127.0.0.1:{port}/?delay_ms=100"))
+                .send()
+                .await
+            else {
+                return told_to_close; // the server is gone
+            };
+            if resp
+                .headers()
+                .get("connection")
+                .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"close"))
+            {
+                told_to_close = true;
+            }
+            let _ = resp.bytes().await;
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let signalled = std::time::Instant::now();
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(server.child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("failed to send SIGTERM");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while server.child.try_wait().unwrap().is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "master never exited"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let exited_after = signalled.elapsed();
+    let told_to_close = busy_client.await.unwrap();
+
+    assert!(
+        exited_after < Duration::from_secs(3),
+        "a busy keep-alive client held the drain open for {exited_after:?} of the 10 s grace period"
+    );
+    assert!(
+        told_to_close,
+        "the client was never told to close, only cut off"
+    );
+}
+
+#[tokio::test]
+async fn requests_racing_a_prototype_crash_all_use_the_one_respawn() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "respawn-race",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": { "processes": { "max": 8, "spare": 4 }, "limits": { "requests": 0, "timeout": 10 } }
+        }),
+    )
+    .await;
+    let prototype_pid = status_json(&server).await["php"]["prototype_pid"]
+        .as_u64()
+        .unwrap() as i32;
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(prototype_pid),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let port = server.port;
+    let requests: Vec<_> = (0..8)
+        .map(|_| {
+            tokio::spawn(async move {
+                reqwest::get(format!("http://127.0.0.1:{port}/?delay_ms=50"))
+                    .await
+                    .map(|r| r.status().as_u16())
+                    .unwrap_or(0)
+            })
+        })
+        .collect();
+    let mut statuses = Vec::new();
+    for r in requests {
+        statuses.push(r.await.unwrap());
+    }
+    assert!(
+        statuses.iter().all(|&s| s == 200),
+        "requests failed while a respawned prototype was available: {statuses:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_gives_its_worker_back_after_the_write_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "write-stall",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "connection": { "body_write_timeout": 2 },
+            "php": {
+                "processes": { "max": 2, "spare": 2 },
+                "limits": { "requests": 0, "timeout": 2 },
+                "queue": { "timeout": 15 }
+            }
+        }),
+    )
+    .await;
+
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut stream = socket
+            .connect(([127, 0, 0, 1], server.port).into())
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /big-output?mb=128 HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        stalled.push(stream);
+    }
+    let stalled_at = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let started = std::time::Instant::now();
+    let status = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/?delay_ms=10", server.port))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0);
+    assert_eq!(
+        status, 200,
+        "a request behind two stalled downloads was never served"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "served only after {:?}: the stalled clients held their workers past the write timeout",
+        started.elapsed()
+    );
+
+    // Read only once the cut is certain (up to two timeouts): reading earlier
+    // would be the client resuming.
+    tokio::time::sleep(
+        (stalled_at + Duration::from_secs(6)).saturating_duration_since(std::time::Instant::now()),
+    )
+    .await;
+    for mut stream in stalled {
+        let mut body = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut body)).await;
+        assert!(read.is_ok(), "a stalled connection was left open");
+        assert!(
+            !body.ends_with(b"0\r\n\r\n"),
+            "a dropped response must not end like a complete chunked body"
+        );
+        assert!(body.len() < 128 << 20);
+    }
+}
+
+#[tokio::test]
+async fn a_slow_but_reading_client_is_never_cut_off_by_the_write_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "write-slow",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "connection": { "body_write_timeout": 1 },
+            "php": { "limits": { "requests": 0, "timeout": 30 } }
+        }),
+    )
+    .await;
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stream = socket
+        .connect(([127, 0, 0, 1], server.port).into())
+        .await
+        .unwrap();
+    stream
+        .write_all(
+            b"GET /big-output?mb=16 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut body = Vec::new();
+    let mut buf = [0u8; 4096];
+    let slow_until = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < slow_until {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_ne!(
+            n,
+            0,
+            "cut off after {} bytes while still reading",
+            body.len()
+        );
+        body.extend_from_slice(&buf[..n]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut body))
+        .await
+        .expect("the rest never came")
+        .unwrap();
+    assert!(
+        body.ends_with(b"0\r\n\r\n"),
+        "a slow client got a truncated response ({} bytes)",
+        body.len()
+    );
+}
+
+#[tokio::test]
+async fn a_replaced_or_deleted_static_file_is_seen_at_once_whatever_the_fs_cache_ttl() {
+    let root = std::env::temp_dir().join(format!("proteus-static-swap-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let file = root.join("app.css");
+    std::fs::write(&file, "v1").unwrap();
+
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "static-swap",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "routes": [ { "match": {}, "action": "static", "root": root.to_str().unwrap() } ],
+            "fs_cache": { "ttl_ms": 60000 }
+        }),
+    )
+    .await;
+    let url = format!("http://127.0.0.1:{}/app.css", server.port);
+    let get = || async {
+        let r = reqwest::get(&url).await.unwrap();
+        (r.status().as_u16(), r.text().await.unwrap())
+    };
+
+    for _ in 0..3 {
+        assert_eq!(get().await, (200, "v1".to_string()));
+    }
+    let staged = root.join("app.css.new");
+    std::fs::write(&staged, "v2").unwrap();
+    std::fs::rename(&staged, &file).unwrap();
+    assert_eq!(
+        get().await,
+        (200, "v2".to_string()),
+        "a renamed-in deploy was not served"
+    );
+
+    std::fs::remove_file(&file).unwrap();
+    assert_eq!(get().await.0, 404, "a deleted file was still served");
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[tokio::test]
+async fn a_backgrounded_grandchild_that_outlives_its_job_is_reaped_when_it_exits() {
+    tokio::task::spawn_blocking(|| {
+        let pidfile =
+            std::env::temp_dir().join(format!("test-cron-orphan-pid-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+
+        let next_minute = chrono::Local::now() + chrono::Duration::minutes(1);
+        let schedule = format!(
+            "{} {} * * *",
+            next_minute.format("%M"),
+            next_minute.format("%H")
+        );
+        let crontab = write_crontab(
+            "orphan",
+            &format!(
+                "{schedule} sleep 1 & echo $! > {}; echo cron-job-started\n",
+                pidfile.display()
+            ),
+        );
+        let mut child = OwnedChildGuard(spawn_cron(&[crontab.to_str().unwrap()]));
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        assert!(
+            wait_for_line(&mut stdout, "cron-job-started", Duration::from_secs(75)),
+            "the job never ran within one minute of its schedule"
+        );
+        // The "job started" log line carries the command, marker included.
+        let written = std::time::Instant::now() + Duration::from_secs(5);
+        let orphan: i32 = loop {
+            match std::fs::read_to_string(&pidfile).map(|s| s.trim().parse()) {
+                Ok(Ok(pid)) => break pid,
+                _ if std::time::Instant::now() < written => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                other => panic!("the job never wrote its orphan's pid: {other:?}"),
+            }
+        };
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while process_state(orphan).is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            process_state(orphan),
+            None,
+            "the orphan was left behind (Z = never reaped)"
+        );
+        let _ = std::fs::remove_file(&pidfile);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_recycled_worker_is_reaped_by_the_prototype_at_once() {
+    let www = fixtures_dir().join("www");
+    // No spare, so no SPAWN follows the recycle to wake the prototype instead.
+    let server = start_server(
+        "reap-at-once",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": { "processes": { "max": 1, "spare": 0 }, "limits": { "requests": 2, "timeout": 5 } }
+        }),
+    )
+    .await;
+    let get = || async {
+        reqwest::get(format!("http://127.0.0.1:{}/", server.port))
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(get().await, 200);
+    let worker = status_json(&server).await["php"]["workers"][0]["pid"]
+        .as_u64()
+        .expect("the worker the first request spawned") as i32;
+    assert_eq!(get().await, 200);
+    // Well inside the prototype's 60 s fallback: its exit has to wake the reap.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while process_state(worker).is_some() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        process_state(worker),
+        None,
+        "the recycled worker was left unreaped (Z = zombie)"
+    );
+}
+
+#[tokio::test]
+async fn an_idle_worker_killed_from_outside_is_replaced_at_once() {
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "idle-worker-killed",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "processes": { "max": 2, "spare": 2 } } }),
+    )
+    .await;
+    // Past the first passes, so the pool has settled.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let status = status_json(&server).await;
+    let victim = status["php"]["workers"][0]["pid"].as_u64().unwrap() as i32;
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(victim),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+
+    // Well inside the settled pool's 60 s recheck.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = status_json(&server).await;
+        let pids: Vec<u64> = status["php"]["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["pid"].as_u64())
+            .collect();
+        if pids.len() == 2 && !pids.contains(&(victim as u64)) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the killed worker was not replaced: {pids:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn requests_waiting_on_a_full_pool_take_the_seat_a_recycled_worker_frees() {
+    let www = fixtures_dir().join("www");
+    // Every worker exits after one request, so seats free up without any
+    // worker ever returning to the pool.
+    let server = start_server(
+        "recycle-seat",
+        www.to_str().unwrap(),
+        serde_json::json!({
+            "php": {
+                "processes": { "max": 2, "spare": 0 },
+                "limits": { "requests": 1, "timeout": 10 },
+                "queue": { "timeout": 10 }
+            }
+        }),
+    )
+    .await;
+    let port = server.port;
+    let until = tokio::time::Instant::now() + Duration::from_secs(3);
+    let clients: Vec<_> = (0..16)
+        .map(|_| {
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let mut failed = Vec::new();
+                while tokio::time::Instant::now() < until {
+                    let status = client
+                        .get(format!("http://127.0.0.1:{port}/?delay_ms=5"))
+                        .send()
+                        .await
+                        .map(|r| r.status().as_u16())
+                        .unwrap_or(0);
+                    if status != 200 {
+                        failed.push(status);
+                    }
+                }
+                failed
+            })
+        })
+        .collect();
+    let mut failed = Vec::new();
+    for c in clients {
+        failed.extend(c.await.unwrap());
+    }
+    assert!(
+        failed.is_empty(),
+        "requests failed while seats were freeing up: {failed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_that_leaves_during_a_worker_spawn_does_not_leak_the_worker() {
+    use tokio::io::AsyncWriteExt;
+    let www = fixtures_dir().join("www");
+    let server = start_server(
+        "spawn-cancel",
+        www.to_str().unwrap(),
+        serde_json::json!({ "php": { "processes": { "max": 1, "spare": 0 } } }),
+    )
+    .await;
+    let port = server.port;
+    for attempt in 0..20u64 {
+        // Gone while its request waits on the spawn of the pool's only worker.
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /?delay_ms=5 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1 + attempt % 5)).await;
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let status = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(
+            status, 200,
+            "the pool's only seat leaked with the abandoned spawn"
+        );
+    }
+    let workers = status_json(&server).await["php"]["workers"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert!(workers <= 1, "{workers} workers for a pool of max 1");
 }

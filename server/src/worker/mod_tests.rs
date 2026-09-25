@@ -302,3 +302,34 @@ async fn a_file_body_with_no_fd_on_the_link_ends_the_worker_without_calling_php(
         "PHP must never run for a request whose body fd never arrived"
     );
 }
+
+#[test]
+fn a_received_body_fd_does_not_survive_an_exec() {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use nix::sys::socket::{
+        AddressFamily, ControlMessage, MsgFlags, SockFlag, SockType, sendmsg, socketpair,
+    };
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let (master_side, worker_side) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::empty(),
+    )
+    .unwrap();
+    let body = std::fs::File::open("/dev/null").unwrap();
+    let fds = [body.as_raw_fd()];
+    sendmsg::<()>(
+        master_side.as_raw_fd(),
+        &[std::io::IoSlice::new(b"B")],
+        &[ControlMessage::ScmRights(&fds)],
+        MsgFlags::empty(),
+        None,
+    )
+    .unwrap();
+
+    let received = recv_body_fd(&worker_side).unwrap();
+    let flags = FdFlag::from_bits_truncate(fcntl(received.as_fd(), FcntlArg::F_GETFD).unwrap());
+    assert!(flags.contains(FdFlag::FD_CLOEXEC));
+}

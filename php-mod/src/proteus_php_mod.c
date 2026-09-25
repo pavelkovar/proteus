@@ -3,6 +3,8 @@
 #include "proteus_php_mod.h"
 
 #include <sapi/embed/php_embed.h>
+#include <ctype.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -341,148 +343,109 @@ static size_t proteus_php_mod_read_post(char *buffer, size_t count_bytes) {
     return n;
 }
 
-/* The real table removal is a one-time pass during php_module_startup(),
- * already done by the time php.options are applied, so these directives must
- * be re-invoked explicitly. */
-#if PHP_VERSION_ID < 80500
-typedef int (*proteus_php_mod_disable_one_fn)(char *name, size_t name_length);
+/* php.options as `php -d` INI text for sapi_module.ini_entries, so PHP parses
+ * them after php.ini and before extensions read directives (OPcache sizes its
+ * memory then). Lives for the process: sapi_module points into it. */
+static char *g_ini_entries;
 
-/* Returns 0 if every name in `list` was disabled, -1 if any was not, but
- * always processes the whole list rather than stopping at the first failure. */
-static int proteus_php_mod_disable_list(const char *list, proteus_php_mod_disable_one_fn disable_one) {
-    if (list == NULL || *list == '\0') {
-        return 0;
-    }
-    char *base = strdup(list);
-    if (base == NULL) {
-        /* Skip the directive rather than deref NULL. */
+static int proteus_php_mod_ini_entry_ok(const char *entry) {
+    const char *eq = strchr(entry, '=');
+    if (eq == NULL || eq == entry || strpbrk(entry, "\r\n") != NULL) {
+        char msg[320];
+        snprintf(msg, sizeof(msg), "invalid php option '%.200s': expected one key=value line", entry);
+        proteus_php_mod_log_json("prototype", "ERROR", msg);
         return -1;
     }
-    int failed = 0;
-    char *s = NULL;
-    char *e = base;
-    while (*e) {
-        if (*e == ' ' || *e == ',') {
-            if (s != NULL) {
-                *e = '\0';
-                if (disable_one(s, (size_t) (e - s)) != SUCCESS) {
-                    failed = -1;
-                }
-                s = NULL;
-            }
-        } else if (s == NULL) {
-            s = e;
-        }
-        e++;
-    }
-    if (s != NULL && disable_one(s, (size_t) (e - s)) != SUCCESS) {
-        failed = -1;
-    }
-    free(base);
-    return failed;
-}
-#endif
-
-/* disable_classes and zend_disable_class() were removed in PHP 8.5. */
-#if PHP_VERSION_ID < 80500
-static int proteus_php_mod_disable_class_one(char *name, size_t name_length) {
-    int rc = zend_disable_class(name, name_length);
-    if (rc != SUCCESS) {
-        char msg[320];
-        snprintf(msg, sizeof(msg), "disable_classes: class '%.*s' was not found, not disabled", (int) name_length, name);
-        proteus_php_mod_log_json("prototype", "ERROR", msg);
-    }
-    return rc;
-}
-
-static int proteus_php_mod_disable_classes(const char *list) {
-    return proteus_php_mod_disable_list(list, proteus_php_mod_disable_class_one);
-}
-#else
-static int proteus_php_mod_disable_classes(const char *list) {
-    (void) list;
     return 0;
 }
-#endif
 
-#if PHP_VERSION_ID >= 80000
-/* zend_disable_functions() gives no per-name failure signal; silently
- * skipping an unknown name is its own intended behaviour, not a failure. */
-static int proteus_php_mod_disable_functions(const char *list) {
-    if (list != NULL && *list != '\0') {
-        zend_disable_functions(list);
+/* Quotes when `php -d` does (value not starting alphanumeric or with a quote):
+ * `E_ALL & ~E_DEPRECATED` is evaluated, `.:/usr/share/php` kept whole.
+ * `out` needs strlen(entry) + 3. */
+static size_t proteus_php_mod_render_ini_entry(char *out, const char *entry) {
+    const char *eq = strchr(entry, '=');
+    const char *val = eq + 1;
+    size_t key_len = (size_t) (val - entry); /* includes the '=' */
+    size_t val_len = strlen(val);
+    int quote = val_len > 0 && !isalnum((unsigned char) *val) && *val != '"' && *val != '\'';
+    size_t pos = 0;
+    memcpy(out + pos, entry, key_len);
+    pos += key_len;
+    if (quote) {
+        out[pos++] = '"';
     }
-    return 0;
-}
-#else
-static int proteus_php_mod_disable_function_one(char *name, size_t name_length) {
-    int rc = zend_disable_function(name, name_length);
-    if (rc != SUCCESS) {
-        char msg[320];
-        snprintf(msg, sizeof(msg), "disable_functions: function '%.*s' was not found, not disabled", (int) name_length, name);
-        proteus_php_mod_log_json("prototype", "ERROR", msg);
+    memcpy(out + pos, val, val_len);
+    pos += val_len;
+    if (quote) {
+        out[pos++] = '"';
     }
-    return rc;
+    out[pos++] = '\n';
+    return pos;
 }
 
-static int proteus_php_mod_disable_functions(const char *list) {
-    return proteus_php_mod_disable_list(list, proteus_php_mod_disable_function_one);
-}
-#endif
-
-/* Writes the directive in place: zend_alter_ini_entry_ex() would register it in
- * EG(modified_ini_directives), which zend_ini_deactivate() restores at the end
- * of the first request. Setting `modifiable` is what locks out ini_set(). */
-static int proteus_php_mod_set_ini(
-    const char *name, size_t name_len, const char *value, int modify_type
+/* Admin last, so it wins a key collision. */
+static int proteus_php_mod_build_ini_entries(
+    const char *const *admin_entries, size_t admin_count,
+    const char *const *user_entries, size_t user_count
 ) {
-    zend_ini_entry *ini_entry = zend_hash_str_find_ptr(EG(ini_directives), name, name_len);
-    if (ini_entry == NULL) {
+    size_t cap = 1;
+    for (size_t i = 0; i < user_count; i++) {
+        if (proteus_php_mod_ini_entry_ok(user_entries[i]) != 0) {
+            return -1;
+        }
+        cap += strlen(user_entries[i]) + 3;
+    }
+    for (size_t i = 0; i < admin_count; i++) {
+        if (proteus_php_mod_ini_entry_ok(admin_entries[i]) != 0) {
+            return -1;
+        }
+        cap += strlen(admin_entries[i]) + 3;
+    }
+    if (cap == 1) {
+        return 0; /* nothing to hand over */
+    }
+    char *buf = malloc(cap);
+    if (buf == NULL) {
         return -1;
     }
-
-    zend_string *new_value = zend_string_init(value, strlen(value), 1);
-    if (ini_entry->on_modify != NULL
-        && ini_entry->on_modify(ini_entry, new_value, ini_entry->mh_arg1, ini_entry->mh_arg2,
-                                ini_entry->mh_arg3, ZEND_INI_STAGE_ACTIVATE) != SUCCESS) {
-        zend_string_release(new_value);
-        return -1;
+    size_t pos = 0;
+    for (size_t i = 0; i < user_count; i++) {
+        pos += proteus_php_mod_render_ini_entry(buf + pos, user_entries[i]);
     }
-
-    ini_entry->value = new_value;
-    ini_entry->modifiable = (uint8_t) modify_type;
+    for (size_t i = 0; i < admin_count; i++) {
+        pos += proteus_php_mod_render_ini_entry(buf + pos, admin_entries[i]);
+    }
+    buf[pos] = '\0';
+    g_ini_entries = buf;
     return 0;
 }
 
-/* Returns 0 if every entry applied cleanly, -1 if anything failed - a
- * partially-applied, possibly security-relevant configuration must not look
- * like success to the caller. */
-static int proteus_php_mod_apply_ini(const char *const *entries, size_t count, int modify_type) {
+/* Instructions, not directives: they have no ini entry to look up. */
+static int proteus_php_mod_is_ini_instruction(const char *key, size_t key_len) {
+    return (key_len == strlen("extension") && strncmp(key, "extension", key_len) == 0)
+        || (key_len == strlen("zend_extension") && strncmp(key, "zend_extension", key_len) == 0);
+}
+
+/* After startup: rejects unknown keys (a typo must not pass as a setting) and
+ * locks admin ones against ini_set(). Returns -1 after reporting every unknown. */
+static int proteus_php_mod_check_ini(const char *const *entries, size_t count, int lock) {
     int failed = 0;
     for (size_t i = 0; i < count; i++) {
         const char *entry = entries[i];
-        const char *eq = strchr(entry, '=');
-        if (eq == NULL) {
+        size_t key_len = (size_t) (strchr(entry, '=') - entry);
+        if (proteus_php_mod_is_ini_instruction(entry, key_len)) {
             continue;
         }
-        size_t klen = (size_t) (eq - entry);
-        const char *val = eq + 1;
-
-        if (proteus_php_mod_set_ini(entry, klen, val, modify_type) != 0) {
+        zend_ini_entry *ini_entry = zend_hash_str_find_ptr(EG(ini_directives), entry, key_len);
+        if (ini_entry == NULL) {
             char msg[320];
-            snprintf(msg, sizeof(msg), "failed to set php option '%.*s'", (int) klen, entry);
+            snprintf(msg, sizeof(msg), "unknown php option '%.*s'", (int) key_len, entry);
             proteus_php_mod_log_json("prototype", "ERROR", msg);
             failed = -1;
+            continue;
         }
-
-        if (klen == strlen("disable_functions") && strncmp(entry, "disable_functions", klen) == 0) {
-            if (proteus_php_mod_disable_functions(val) != 0) {
-                failed = -1;
-            }
-        } else if (klen == strlen("disable_classes") && strncmp(entry, "disable_classes", klen) == 0) {
-            if (proteus_php_mod_disable_classes(val) != 0) {
-                failed = -1;
-            }
+        if (lock) {
+            ini_entry->modifiable = ZEND_INI_SYSTEM;
         }
     }
     return failed;
@@ -511,7 +474,14 @@ int proteus_php_mod_init(
     php_embed_module.name = "cli-server";
     php_embed_module.pretty_name = "proteus";
 
+    if (proteus_php_mod_build_ini_entries(admin_entries, admin_count, user_entries, user_count) != 0) {
+        return -1;
+    }
+
     sapi_startup(&php_embed_module);
+
+    /* sapi_startup() clears ini_entries; php_module_startup() parses them. */
+    php_embed_module.ini_entries = g_ini_entries;
 
 #if PHP_VERSION_ID < 80200
     if (php_module_startup(&php_embed_module, &proteus_php_mod_module_entry, 1) == FAILURE) {
@@ -524,9 +494,8 @@ int proteus_php_mod_init(
     /* Core already chdir()s into the script's directory and restores cwd
      * itself, even on zend_bailout. */
 
-    /* User first, then admin, so admin wins on a key collision. */
-    int user_ok = proteus_php_mod_apply_ini(user_entries, user_count, ZEND_INI_USER);
-    int admin_ok = proteus_php_mod_apply_ini(admin_entries, admin_count, ZEND_INI_SYSTEM);
+    int user_ok = proteus_php_mod_check_ini(user_entries, user_count, 0);
+    int admin_ok = proteus_php_mod_check_ini(admin_entries, admin_count, 1);
     if (user_ok != 0 || admin_ok != 0) {
         return -1;
     }
@@ -561,9 +530,9 @@ int proteus_php_mod_execute_file(
      * from master over SCM_RIGHTS and names an unlinked file, so there is no
      * path to race and nothing to check about ownership. */
     if (req->body_fd >= 0) {
-        /* dup, because fclose() below closes whatever fdopen took, and the
-         * fd itself belongs to the caller. */
-        int fd = dup(req->body_fd);
+        /* dup: fclose() below closes it and the fd is the caller's. Cloexec, so
+         * a process the script exec()s does not inherit the request body. */
+        int fd = fcntl(req->body_fd, F_DUPFD_CLOEXEC, 0);
         if (fd < 0 || !(g_ctx.body_file = fdopen(fd, "rb"))) {
             if (fd >= 0) {
                 close(fd);

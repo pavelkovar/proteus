@@ -60,3 +60,50 @@ fn preserves_extra_whitespace_within_the_command() {
     let jobs = parse("* * * * *   echo   hi  there\n").expect("should parse");
     assert_eq!(jobs[0].command, "echo   hi  there");
 }
+
+#[test]
+fn env_lines_apply_to_the_jobs_below_them_only() {
+    let jobs = parse(
+        "* * * * * first\n\
+         APP_ENV=prod\n\
+         * * * * * second\n\
+         APP_ENV = \"staging\"\n\
+         GREETING='hello world'\n\
+         EMPTY=\n\
+         * * * * * third\n",
+    )
+    .expect("should parse");
+    assert!(jobs[0].env.is_empty());
+    assert_eq!(jobs[1].env, vec![("APP_ENV".into(), "prod".into())]);
+    assert_eq!(
+        jobs[2].env,
+        vec![
+            ("APP_ENV".into(), "staging".into()),
+            ("GREETING".into(), "hello world".into()),
+            ("EMPTY".into(), String::new()),
+        ]
+    );
+}
+
+#[test]
+fn only_a_valid_name_before_the_equals_sign_makes_an_env_line() {
+    assert_eq!(
+        parse_env_line("PATH=/a:/b"),
+        Some(("PATH".into(), "/a:/b".into()))
+    );
+    assert_eq!(
+        parse_env_line("_X1 = 'a=b'"),
+        Some(("_X1".into(), "a=b".into()))
+    );
+    assert_eq!(parse_env_line("Q=\"a'"), Some(("Q".into(), "\"a'".into())));
+    assert_eq!(parse_env_line("1X=a"), None);
+    assert_eq!(parse_env_line("*/5 * * * * FOO=bar cmd"), None);
+    assert_eq!(parse_env_line("0 3 * * * php a.php --x=1"), None);
+}
+
+#[test]
+fn a_shell_other_than_bin_sh_is_refused() {
+    assert!(parse("SHELL=/bin/sh\n* * * * * true\n").is_ok());
+    let err = parse("SHELL=/bin/bash\n* * * * * true\n").unwrap_err();
+    assert!(err.contains("line 1"), "unexpected error: {err}");
+}

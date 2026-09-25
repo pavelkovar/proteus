@@ -657,6 +657,7 @@ fn validate_rejects_a_zero_spawn_timeout() {
 fn connection_timeouts_default_when_the_whole_block_is_absent() {
     let cfg = parse(&minimal_config_json("")).expect("should parse");
     assert_eq!(cfg.connection.body_read_timeout, 60);
+    assert_eq!(cfg.connection.body_write_timeout, 60);
     assert_eq!(cfg.connection.header_read_timeout, 10);
     assert_eq!(cfg.connection.idle_timeout, 65);
     // Derived from the core count, so only the zero case is worth asserting:
@@ -939,4 +940,52 @@ fn validate_rejects_a_zero_rate_limit_period_seconds() {
             .any(|e| e.contains("rate_limit.period_seconds")),
         "expected a rate_limit.period_seconds error, got: {errors:?}"
     );
+}
+
+#[test]
+fn validate_rejects_php_options_that_would_break_out_of_their_ini_line() {
+    let mut cfg: Config =
+        serde_json::from_str(&base_config_json("", r#""app": { "root": "/var/www" }"#)).unwrap();
+    cfg.php
+        .options
+        .admin
+        .insert("memory_limit".into(), "128M\ndisable_functions=".into());
+    cfg.php.options.user.insert("bad\rkey".into(), "1".into());
+    cfg.php.options.user.insert("a=b".into(), "1".into());
+    cfg.php
+        .options
+        .user
+        .insert("precision".into(), "1\0".into());
+
+    let errors = validate(&cfg);
+    assert_eq!(errors.len(), 4, "{errors:#?}");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("php.options.admin.memory_limit"))
+    );
+    assert!(errors.iter().any(|e| e.contains(r#""bad\rkey""#)));
+    assert!(errors.iter().any(|e| e.contains(r#""a=b""#)));
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("php.options.user.precision"))
+    );
+}
+
+#[test]
+fn validate_accepts_ordinary_php_ini_values() {
+    let mut cfg: Config =
+        serde_json::from_str(&base_config_json("", r#""app": { "root": "/var/www" }"#)).unwrap();
+    for (k, v) in [
+        ("error_reporting", "E_ALL & ~E_DEPRECATED"),
+        ("include_path", ".:/usr/share/php"),
+        ("opcache.jit", "tracing"),
+        ("date.timezone", "Europe/Prague"),
+        ("disable_functions", "exec,passthru,shell_exec"),
+        ("session.save_path", ""),
+    ] {
+        cfg.php.options.admin.insert(k.into(), v.into());
+    }
+    assert_eq!(validate(&cfg), Vec::<String>::new());
 }

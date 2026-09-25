@@ -158,3 +158,155 @@ fn percent_decode_rejects_nul_malformed_and_non_utf8() {
         Err(PathDecodeError::NotUtf8)
     );
 }
+
+#[test]
+fn request_path_folds_empty_and_dot_segments() {
+    for (raw, want) in [
+        ("//admin/x", "/admin/x"),
+        ("/./admin/x", "/admin/x"),
+        ("/%2e/admin/x", "/admin/x"),
+        ("/a//b///c", "/a/b/c"),
+        ("/a/./b/.", "/a/b/"),
+        ("/dir/", "/dir/"),
+        ("/dir//", "/dir/"),
+        ("/.", "/"),
+        ("//", "/"),
+        ("/", "/"),
+        ("/.well-known/x", "/.well-known/x"),
+        ("/a/.hidden", "/a/.hidden"),
+        ("/a..b/c.", "/a..b/c."),
+    ] {
+        assert_eq!(request_path(raw).unwrap(), want, "for {raw:?}");
+    }
+}
+
+#[test]
+fn request_path_leaves_parent_segments_for_the_traversal_check() {
+    for raw in ["/a/../b", "//../etc/passwd", "/./%2e%2e/etc/passwd"] {
+        let path = request_path(raw).unwrap();
+        assert!(
+            path_escapes_root(&path),
+            "{raw:?} became {path:?}, which no longer trips the traversal check"
+        );
+    }
+}
+
+#[test]
+fn request_path_borrows_an_already_canonical_path() {
+    for raw in ["/", "/index.php", "/a/b/c/", "/.well-known/acme"] {
+        assert!(
+            matches!(request_path(raw).unwrap(), std::borrow::Cow::Borrowed(_)),
+            "{raw:?} was copied"
+        );
+    }
+}
+
+/// `cargo test --release --bin proteus -- --ignored bench_ --nocapture --test-threads=1`
+#[test]
+#[ignore]
+fn bench_request_path_then_route() {
+    use crate::config::{Route, RouteMatch};
+    use crate::utils::match_pattern::MatchPattern;
+    let route = |pat: &str, status: u16| Route {
+        when: None,
+        matcher: RouteMatch {
+            uri: vec![MatchPattern::try_from(pat.to_string()).unwrap()],
+            ..Default::default()
+        },
+        action: RouteActionConfig::Return { status },
+    };
+    let mut cfg =
+        crate::config::parse(r#"{ "listen": "127.0.0.1:0", "php": { "processes": {} } }"#).unwrap();
+    cfg.routes = vec![
+        route("/health", 200),
+        route("/admin/*", 403),
+        route("*.php", 404),
+        route("/static/*", 200),
+        route("*", 200),
+    ];
+    for (label, paths) in [
+        (
+            "canonical paths",
+            vec![
+                "/",
+                "/products/123",
+                "/static/app.3f2a1b.css",
+                "/api/v1/orders?x=1",
+                "/a/b/c/d/e/f/g/h/index.html",
+            ],
+        ),
+        (
+            "paths needing work",
+            vec![
+                "//admin/x",
+                "/./a/b",
+                "/a//b///c/",
+                "/%2e/static/x.css",
+                "/p/./q/./r/.",
+            ],
+        ),
+        (
+            "percent-encoded",
+            vec!["/search/caf%C3%A9", "/files/a%20b%20c.txt", "/x/%7Euser/y"],
+        ),
+    ] {
+        let iters = 2_000_000usize;
+        let mut hits = 0usize;
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            for i in 0..iters {
+                let raw = paths[i % paths.len()];
+                let path = request_path(raw).unwrap();
+                if matches!(
+                    match_route(&cfg, &path, "GET", ""),
+                    RouteDecision::Matched { .. }
+                ) {
+                    hits += 1;
+                }
+            }
+            if round == 2 {
+                println!(
+                    "BENCH request_path + match_route, {label:20} {:6.1} ns/request",
+                    t.elapsed().as_nanos() as f64 / iters as f64
+                );
+            }
+        }
+        std::hint::black_box(hits);
+    }
+}
+
+#[test]
+fn only_filesystems_known_to_answer_open_from_memory_count_as_local() {
+    for local in [0xEF53, 0x5846_5342, 0x9123_683E, 0x0102_1994, 0x794C_7630] {
+        assert!(is_local_fs_type(local), "{local:#x} should be local");
+    }
+    // NFS, FUSE, CIFS, SMB2, Ceph, procfs.
+    for remote in [
+        0x6969,
+        0x6573_5546,
+        0xFF53_4D42,
+        0xFE53_4D42,
+        0x00C3_6400,
+        0x9FA0,
+    ] {
+        assert!(!is_local_fs_type(remote), "{remote:#x} must not be local");
+    }
+}
+
+#[test]
+fn on_local_fs_reads_the_filesystem_an_fd_is_on() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("proteus-local-fs-{}", std::process::id()));
+    std::fs::write(&path, b"x").unwrap();
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::statfs(c.as_ptr(), &mut st) }, 0);
+    assert_eq!(
+        on_local_fs(&std::fs::File::open(&path).unwrap()),
+        is_local_fs_type(st.f_type as u64 as u32)
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(!on_local_fs(
+        &std::fs::File::open("/proc/self/status").unwrap()
+    ));
+}

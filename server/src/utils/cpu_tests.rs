@@ -34,3 +34,23 @@ fn allowed_cpus_reports_real_ids_under_a_restricted_cpuset() {
     .join()
     .expect("affinity thread panicked");
 }
+
+#[test]
+fn a_quota_below_the_mask_caps_the_threads_and_leaves_them_unpinned() {
+    assert_eq!(serving_cpus(&[4, 5, 6, 7], 2), vec![None, None]);
+    // A quota under one CPU still serves.
+    assert_eq!(serving_cpus(&[4, 5, 6, 7], 0), vec![None]);
+}
+
+#[test]
+fn without_a_quota_below_the_mask_every_allowed_cpu_gets_a_pinned_thread() {
+    assert_eq!(
+        serving_cpus(&[4, 5, 6, 7], 4),
+        vec![Some(4), Some(5), Some(6), Some(7)]
+    );
+}
+
+#[test]
+fn an_unreadable_mask_serves_the_budget_unpinned() {
+    assert_eq!(serving_cpus(&[], 3), vec![None, None, None]);
+}

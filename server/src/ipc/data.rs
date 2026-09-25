@@ -491,6 +491,11 @@ pub(crate) fn ring_err_to_io(e: shm::RingError) -> std::io::Error {
             std::io::ErrorKind::InvalidData,
             "peer published a frame header without its payload",
         ),
+        // The peer broke the ring: replace it, do not blame the request.
+        shm::RingError::Corrupt => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer corrupted the ring's positions or a frame length",
+        ),
     }
 }
 

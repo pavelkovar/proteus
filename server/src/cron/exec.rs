@@ -4,6 +4,8 @@ use crate::logging;
 use crate::utils::process;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use tokio::process::{Child, Command};
 
 /// `uid`/`gid` are `None` together: a job then inherits whatever identity
@@ -14,6 +16,7 @@ pub(crate) struct Identity {
     gid: Option<u32>,
     home: String,
     name: String,
+    inherit_env: bool,
 }
 
 impl Identity {
@@ -27,6 +30,7 @@ impl Identity {
                     gid: Some(g.gid.as_raw()),
                     home: u.dir.to_string_lossy().into_owned(),
                     name: u.name,
+                    inherit_env: false,
                 }
             }
             (None, None) => {
@@ -38,11 +42,46 @@ impl Identity {
                     gid: None,
                     home: u.dir.to_string_lossy().into_owned(),
                     name: u.name,
+                    inherit_env: false,
                 }
             }
             _ => panic!("--user and --group must be set together or not at all"),
         }
     }
+
+    pub(crate) fn inheriting_env(self, inherit_env: bool) -> Identity {
+        Identity {
+            inherit_env,
+            ..self
+        }
+    }
+}
+
+pub(crate) const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+
+/// Lowest precedence first: defaults, `inherited`, the job's real identity and
+/// shell (an inherited env may belong to another user), then the crontab.
+fn job_environment(
+    identity: &Identity,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+    crontab: &[(String, String)],
+) -> BTreeMap<OsString, OsString> {
+    let mut env = BTreeMap::new();
+    env.insert("PATH".into(), DEFAULT_PATH.into());
+    if let Some(tz) = std::env::var_os("TZ") {
+        env.insert("TZ".into(), tz);
+    }
+    env.extend(inherited);
+    env.insert("HOME".into(), identity.home.clone().into());
+    env.insert("LOGNAME".into(), identity.name.clone().into());
+    env.insert("USER".into(), identity.name.clone().into());
+    env.insert("SHELL".into(), "/bin/sh".into());
+    env.extend(
+        crontab
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+    );
+    env
 }
 
 /// A spawned job. `child` must only be touched through the explicit
@@ -53,24 +92,24 @@ pub(crate) struct RunningJob {
     pub(crate) pgid: Pid,
 }
 
-/// `sh -c command`, with a fresh minimal environment (cronie's own default,
-/// not `proteus cron`'s) and its own process group so a signal can reach
-/// `sh`'s children too, not just `sh` itself.
-pub(crate) fn spawn(identity: &Identity, command: &str) -> std::io::Result<RunningJob> {
+/// In its own process group, so a signal reaches `sh`'s children too.
+pub(crate) fn spawn(
+    identity: &Identity,
+    command: &str,
+    crontab_env: &[(String, String)],
+) -> std::io::Result<RunningJob> {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c").arg(command);
     if let (Some(uid), Some(gid)) = (identity.uid, identity.gid) {
         cmd.uid(uid).gid(gid);
     }
     cmd.env_clear();
-    cmd.env("HOME", &identity.home);
-    cmd.env("LOGNAME", &identity.name);
-    cmd.env("USER", &identity.name);
-    cmd.env("SHELL", "/bin/sh");
-    cmd.env("PATH", "/usr/bin:/bin");
-    if let Ok(tz) = std::env::var("TZ") {
-        cmd.env("TZ", tz);
-    }
+    let inherited: Vec<_> = if identity.inherit_env {
+        std::env::vars_os().collect()
+    } else {
+        Vec::new()
+    };
+    cmd.envs(job_environment(identity, inherited, crontab_env));
     cmd.current_dir(&identity.home);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::inherit());

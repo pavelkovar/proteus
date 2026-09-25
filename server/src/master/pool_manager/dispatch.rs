@@ -5,7 +5,7 @@
 //! still reach private fields.
 
 use super::worker_channel::WorkerEvent;
-use super::{PoolManager, PooledWorker, Retired, TempBodyFile, WorkerRef};
+use super::{PoolManager, PooledWorker, Retired, TempBodyFile, WorkerRef, is_pool_full};
 use crate::ipc::data::{HeaderBlob, PhpRequest};
 use crate::logging;
 use bytes::Bytes;
@@ -304,6 +304,16 @@ impl PoolManager {
         // second stale worker from the same recycle burst.
         let worker = match self.spawn_worker().await {
             Ok(w) => w,
+            // The seat went to a worker spawned or returned meanwhile, e.g. the
+            // pool topping itself up after a prototype respawn: wait for one.
+            Err(e) if is_pool_full(&e) => match self.get_worker().await {
+                Ok(w) => w,
+                Err(e) => {
+                    return self.give_up(&format!(
+                        "no worker freed up after a failed dispatch ({e}), giving up on this request"
+                    ));
+                }
+            },
             Err(e) => {
                 return self.give_up(&format!(
                     "fresh worker spawn also failed ({e}), giving up on this request"
@@ -377,7 +387,6 @@ impl PoolManager {
                     // Nothing was written, so this worker is still good.
                     let mut w = worker.take();
                     w.channel.shrink_scratch();
-                    w.channel.park_notify();
                     w.meta.mark_idle(Instant::now(), self.started_at);
                     self.return_worker(w);
                     return Err(StartAttempt::RequestTooLarge(permit, body_cleanup));
@@ -612,10 +621,8 @@ impl PoolManager {
             }
             Ok(Ok(())) => {
                 let now = Instant::now();
-                // Past the done marker nothing borrows the scratch, and the
-                // eventfds can leave this runtime's reactor.
+                // Past the done marker nothing borrows the scratch.
                 worker.channel.shrink_scratch();
-                worker.channel.park_notify();
                 worker.meta.mark_idle(now, self.started_at);
                 self.return_worker(worker);
                 drop(permit);

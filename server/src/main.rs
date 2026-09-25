@@ -44,6 +44,9 @@ enum Command {
         /// Group to run jobs as; give together with --user, or omit both.
         #[arg(long)]
         group: Option<String>,
+        /// Start jobs from this process's environment instead of an empty one.
+        #[arg(long)]
+        inherit_env: bool,
         /// How long a running job gets after the shutdown signal before SIGKILL.
         #[arg(long, default_value = "15s")]
         shutdown_grace: humantime::Duration,
@@ -98,19 +101,22 @@ fn run_envsubst() -> ! {
 fn run_cron(
     user: Option<String>,
     group: Option<String>,
+    inherit_env: bool,
     shutdown_grace: std::time::Duration,
     crontab_path: std::path::PathBuf,
 ) -> ! {
     utils::proctitle::set_title(&format!("{APP_NAME}: cron"));
-    logging::init(true);
+    // A few lines a minute: written directly, no logger thread.
+    logging::init(false);
     enable_child_subreaper();
 
     let text = std::fs::read_to_string(&crontab_path)
         .unwrap_or_else(|e| panic!("reading {}: {e}", crontab_path.display()));
     let jobs = cron::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", crontab_path.display()));
-    let identity = cron::Identity::resolve(user.as_deref(), group.as_deref());
+    let identity =
+        cron::Identity::resolve(user.as_deref(), group.as_deref()).inheriting_env(inherit_env);
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
@@ -144,11 +150,10 @@ fn run_server(config_path: std::path::PathBuf) {
     logging::init(true);
     enable_child_subreaper();
 
-    // Two is enough: this runtime owns the prototype control socket, the pool's
-    // background loops and the status endpoint, none of which are per-request.
-    // Connections are accepted and served by the per-core runtimes.
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
+    // One thread is enough: this runtime owns the prototype control socket, the
+    // pool's background loops and the status endpoint, none of which are
+    // per-request. Connections are accepted and served by the per-core runtimes.
+    let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
@@ -172,9 +177,10 @@ fn main() {
         Some(Command::Cron {
             user,
             group,
+            inherit_env,
             shutdown_grace,
             crontab,
-        }) => run_cron(user, group, shutdown_grace.into(), crontab),
+        }) => run_cron(user, group, inherit_env, shutdown_grace.into(), crontab),
         None => match cli.config {
             Some(config_path) => run_server(config_path),
             None => Cli::command()
@@ -201,24 +207,27 @@ async fn run_master(config: Config) {
     );
     let state = Arc::new(AppState::new(pool, config, fs_cache));
 
-    // `None` where the mask could not be read: the count is still worth having,
-    // but pinning to invented ids would land threads on CPUs this process may
-    // not run on.
     let cpus: Vec<Option<usize>> = {
         let allowed = utils::cpu::allowed_cpus();
+        let budget = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cpus = utils::cpu::serving_cpus(&allowed, budget);
         if allowed.is_empty() {
-            let n = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
             logging::warn!(
                 r#type = "controller",
-                cores = n,
+                cores = cpus.len(),
                 "could not read this process's CPU affinity, serving unpinned"
             );
-            vec![None; n]
-        } else {
-            allowed.into_iter().map(Some).collect()
+        } else if cpus.len() < allowed.len() {
+            logging::info!(
+                r#type = "controller",
+                cores = cpus.len(),
+                allowed_cpus = allowed.len(),
+                "CPU quota is below the CPUs this process may run on, serving on fewer threads, unpinned"
+            );
         }
+        cpus
     };
 
     // Raced against accept(), so it bounds how long the accept loops run

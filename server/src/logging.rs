@@ -32,6 +32,10 @@ pub(crate) fn min_level() -> u8 {
 
 const MAX_BATCH: usize = 4096;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+/// While lines keep coming the logger polls instead of parking in `recv`, where
+/// every sender would pay a futex wake and the logger a context switch per line.
+/// Once a drain finds nothing it parks, so an idle process never wakes.
+const DRAIN_INTERVAL: Duration = Duration::from_millis(10);
 
 static SENDER: OnceLock<SyncSender<Vec<u8>>> = OnceLock::new();
 
@@ -76,13 +80,46 @@ fn drain_loop(receiver: Receiver<Vec<u8>>) {
         bytes: Vec::with_capacity(MAX_BATCH),
         lines: 0,
     };
-    while let Ok(line) = receiver.recv() {
-        batch.push(&line, &mut out);
-        while let Ok(line) = receiver.try_recv() {
-            batch.push(&line, &mut out);
+    loop {
+        match drain_queued(&receiver, &mut batch, &mut out) {
+            Drained::Lines => std::thread::sleep(DRAIN_INTERVAL),
+            Drained::Nothing => match receiver.recv() {
+                Ok(line) => batch.push(&line, &mut out),
+                Err(_) => return,
+            },
+            Drained::Disconnected => return,
         }
-        batch.write(&mut out);
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum Drained {
+    Lines,
+    Nothing,
+    Disconnected,
+}
+
+fn drain_queued<W: std::io::Write>(
+    receiver: &Receiver<Vec<u8>>,
+    batch: &mut Batch,
+    out: &mut W,
+) -> Drained {
+    let mut drained = Drained::Nothing;
+    loop {
+        match receiver.try_recv() {
+            Ok(line) => {
+                batch.push(&line, out);
+                drained = Drained::Lines;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                drained = Drained::Disconnected;
+                break;
+            }
+        }
+    }
+    batch.write(out);
+    drained
 }
 
 struct Batch {

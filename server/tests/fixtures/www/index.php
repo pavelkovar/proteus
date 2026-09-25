@@ -324,6 +324,36 @@ if (strpos($_SERVER['REQUEST_URI'], '/opcache-status') !== false) {
     exit;
 }
 
+// OPcache sizes these once at startup, so they only follow php.options that
+// reached the engine before it (max_cached_keys derives from max_accelerated_files).
+if (strpos($_SERVER['REQUEST_URI'], '/opcache-config') !== false) {
+    $status = function_exists('opcache_get_status') ? opcache_get_status(false) : false;
+    echo "OPCACHE_MAX_CACHED_KEYS=" . ($status['opcache_statistics']['max_cached_keys'] ?? -1) . "\n";
+    echo "JIT_AVAILABLE=" . var_export(isset($status['jit']), true) . "\n";
+    echo "JIT_ENABLED=" . var_export($status['jit']['enabled'] ?? false, true) . "\n";
+    echo "JIT_BUFFER_SIZE=" . ($status['jit']['buffer_size'] ?? 0) . "\n";
+    exit;
+}
+
+// php.options must mean what the same php.ini line means, and user ones stay changeable.
+if (strpos($_SERVER['REQUEST_URI'], '/ini-values') !== false) {
+    echo "ERROR_REPORTING=" . error_reporting() . "\n";
+    echo "EXPECTED_ERROR_REPORTING=" . (E_ALL & ~E_DEPRECATED) . "\n";
+    echo "INCLUDE_PATH=" . ini_get('include_path') . "\n";
+    echo "PRECISION=" . ini_get('precision') . "\n";
+    echo "USER_INI_SET_RESULT=" . var_export(ini_set('precision', '10') !== false, true) . "\n";
+    exit;
+}
+
+// More than socket buffers hold, so a client that stops reading blocks the writer.
+if (strpos($_SERVER['REQUEST_URI'], '/big-output') !== false) {
+    $chunk = str_repeat('b', 65536);
+    for ($i = 0, $n = (int)($_GET['mb'] ?? 1) * 16; $i < $n; $i++) {
+        echo $chunk;
+    }
+    exit;
+}
+
 // A lost client only surfaces through a write, so this keeps writing well past
 // the point the caller hangs up. The marker is reached only if PHP did not
 // abort, which is ignore_user_abort()'s call to make.

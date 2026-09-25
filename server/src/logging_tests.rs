@@ -1,7 +1,11 @@
 use super::*;
 
+/// Tests that write batches move the global `WRITTEN` counter.
+static WRITTEN_COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn a_batch_writes_whole_lines_and_counts_only_what_the_sink_took() {
+    let _counter = WRITTEN_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
     let line = vec![b'x'; 1000];
     let mut batch = Batch {
         bytes: Vec::new(),
@@ -33,6 +37,43 @@ fn a_batch_writes_whole_lines_and_counts_only_what_the_sink_took() {
         WRITTEN.load(Ordering::Acquire),
         before,
         "a refused write is not a write"
+    );
+}
+
+#[test]
+fn a_drain_writes_everything_queued_and_reports_when_senders_are_gone() {
+    let _counter = WRITTEN_COUNTER.lock().unwrap_or_else(|e| e.into_inner());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+    let mut batch = Batch {
+        bytes: Vec::new(),
+        lines: 0,
+    };
+    let mut sink: Vec<Vec<u8>> = Vec::new();
+
+    assert_eq!(
+        drain_queued(&receiver, &mut batch, &mut CapturingWriter(&mut sink)),
+        Drained::Nothing
+    );
+    assert!(sink.is_empty());
+
+    sender.try_send(b"a\n".to_vec()).unwrap();
+    sender.try_send(b"b\n".to_vec()).unwrap();
+    assert_eq!(
+        drain_queued(&receiver, &mut batch, &mut CapturingWriter(&mut sink)),
+        Drained::Lines
+    );
+    assert_eq!(sink.concat(), b"a\nb\n");
+
+    sender.try_send(b"c\n".to_vec()).unwrap();
+    drop(sender);
+    assert_eq!(
+        drain_queued(&receiver, &mut batch, &mut CapturingWriter(&mut sink)),
+        Drained::Disconnected
+    );
+    assert_eq!(
+        sink.concat(),
+        b"a\nb\nc\n",
+        "lines queued before the last sender left are still written"
     );
 }
 

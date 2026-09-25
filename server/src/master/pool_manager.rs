@@ -19,7 +19,10 @@ use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use prototype::Handle;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicBool, AtomicU64,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -44,6 +47,11 @@ impl TempBodyFile {
 pub struct PoolManager {
     /// tokio mutex: the guard is held across an `.await`.
     control: Mutex<UnixSeqpacket>,
+    /// Dup of `control` for `KILL`s: one seqpacket message needs no lock and
+    /// no `.await`, so `retire` and `Drop` can send it directly.
+    kill_channel: StdMutex<Option<std::os::fd::OwnedFd>>,
+    /// Lets concurrent spawns that failed on the same dead prototype reuse one respawn.
+    prototype_generation: AtomicU64,
     /// Where the control socket is registered. Everything that polls it has
     /// to run here, whatever runtime a request happens to arrive on.
     control_rt: tokio::runtime::Handle,
@@ -53,6 +61,10 @@ pub struct PoolManager {
     /// Raised whenever a worker is parked, so a caller waiting at
     /// `processes.max` hears about it rather than polling for it.
     worker_returned: Notify,
+    /// Wakes a settled `maintain_loop`: pool activity, or a worker's exit.
+    maintenance: Arc<Notify>,
+    /// Set by activity, cleared by each maintenance pass.
+    active: AtomicBool,
     /// Caps in-flight requests. `Arc` so a permit can outlive the dispatch
     /// that took it, as far as the response's own task.
     semaphore: Arc<Semaphore>,
@@ -110,6 +122,7 @@ pub(crate) struct Counters {
     workers_abandoned: AtomicU64,
     prototype_respawns: AtomicU64,
     crash_loop_backoffs: AtomicU64,
+    spawns_refused: AtomicU64,
 }
 
 #[derive(Default)]
@@ -296,11 +309,8 @@ impl Retired {
     }
 }
 
-/// SIGKILL rather than SIGTERM: this is only ever reached for a process
-/// already known to be wedged or abandoned, which will not shut itself down.
-///
-/// Logs rather than panics on delivery failure; ESRCH on an already-dead pid
-/// is the expected case.
+/// For a wedged or abandoned prototype; workers go through
+/// `PoolManager::kill_worker`. ESRCH on an already-dead pid is expected.
 pub(crate) fn sigkill(pid: u32, context: &str) {
     logging::warn!(r#type = "controller", pid, context, "sending SIGKILL");
     if let Err(e) =
@@ -329,10 +339,61 @@ fn is_pool_full(e: &std::io::Error) -> bool {
     e.kind() == std::io::ErrorKind::WouldBlock
 }
 
+fn dup_control(control: &UnixSeqpacket) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::AsFd;
+    control
+        .as_fd()
+        .try_clone_to_owned()
+        .inspect_err(|e| {
+            logging::error!(r#type = "controller", error = %e, "could not duplicate the control socket, workers cannot be killed")
+        })
+        .ok()
+}
+
+/// A spawn's result on its way to a caller that may be cancelled first: a
+/// worker already sent is returned to the pool here, one sent later by the
+/// spawning task once it sees the channel closed.
+struct SpawnReply {
+    rx: tokio::sync::oneshot::Receiver<std::io::Result<PooledWorker>>,
+    pool: Arc<PoolManager>,
+}
+
+impl Drop for SpawnReply {
+    fn drop(&mut self) {
+        self.rx.close();
+        if let Ok(Ok(worker)) = self.rx.try_recv() {
+            self.pool.return_worker(worker);
+        }
+    }
+}
+
+/// Only `Control` justifies a respawn: it kills every running worker
+/// (PDEATHSIG), which fixes nothing when the prototype itself is fine.
+enum SpawnFailure {
+    PoolFull,
+    /// Out of fds, pids or memory in the prototype.
+    Refused(std::io::Error),
+    /// Master could not set up its side of a spawned worker.
+    Local(std::io::Error),
+    Control(std::io::Error),
+}
+
+impl SpawnFailure {
+    fn into_io(self) -> std::io::Error {
+        match self {
+            SpawnFailure::PoolFull => pool_full_error(),
+            SpawnFailure::Refused(e) | SpawnFailure::Local(e) | SpawnFailure::Control(e) => e,
+        }
+    }
+}
+
 /// How long one sweep may spend returning ring pages. A swept worker is
 /// unavailable for the length of a `spawn_blocking` hop, and nothing here is
 /// urgent: whatever is still due is due again a tick later.
 const RECLAIM_BUDGET: Duration = Duration::from_millis(2);
+
+/// A settled pool's pass anyway, in case a wakeup was missed.
+const SETTLED_RECHECK: Duration = Duration::from_secs(60);
 
 impl PoolManager {
     pub fn spawn_prototype(cfg: &Config) -> Self {
@@ -373,10 +434,14 @@ impl PoolManager {
         );
 
         PoolManager {
+            kill_channel: StdMutex::new(dup_control(&control)),
+            prototype_generation: AtomicU64::new(0),
             control: Mutex::new(control),
             control_rt: tokio::runtime::Handle::current(),
             idle: StdMutex::new(VecDeque::with_capacity(cfg.php.processes.max)),
             worker_returned: Notify::new(),
+            maintenance: Arc::new(Notify::new()),
+            active: AtomicBool::new(true),
             semaphore: Arc::new(Semaphore::new(cfg.php.processes.max)),
             admission: Arc::new(Semaphore::new(cfg.php.processes.max)),
             max_workers: cfg.php.processes.max,
@@ -402,10 +467,18 @@ impl PoolManager {
         }
     }
 
-    /// Rate-limited by `respawn_backoff_delay`. Returns whether it actually
-    /// respawned.
-    async fn try_respawn_prototype(&self) -> bool {
+    fn prototype_generation(&self) -> u64 {
+        self.prototype_generation.load(Acquire)
+    }
+
+    /// Rate-limited by `respawn_backoff_delay`. Returns whether a prototype
+    /// newer than `observed_generation` is in place, so the spawns queued
+    /// behind the one that respawned are not refused by its backoff window.
+    async fn try_respawn_prototype(&self, observed_generation: u64) -> bool {
         let mut backoff = self.respawn_backoff.lock().await;
+        if self.prototype_generation() != observed_generation {
+            return true;
+        }
         let now = Instant::now();
         if let Some(last) = backoff.last_attempt {
             let required_delay = respawn_backoff_delay(backoff.consecutive_failures);
@@ -428,8 +501,10 @@ impl PoolManager {
             .expect("prototype::spawn blocking task panicked");
         match spawn_result {
             Ok((new_control, new_pid)) => {
+                *self.kill_channel.lock().unwrap() = dup_control(&new_control);
                 *self.control.lock().await = new_control;
                 self.prototype_child.lock().unwrap().replace(new_pid);
+                self.prototype_generation.fetch_add(1, Release);
 
                 backoff.consecutive_failures = 0;
                 self.counters.prototype_respawns.fetch_add(1, Relaxed);
@@ -489,8 +564,9 @@ impl PoolManager {
                 reclaimed += 1;
             }
             // Not a bare push: a caller parked at the ceiling is owed the
-            // wakeup, and a sweep is as much a return as a dispatch's is.
-            self.return_worker(worker);
+            // wakeup. Not `return_worker` either: that counts as activity.
+            self.idle.lock().unwrap().push_back(worker);
+            self.worker_returned.notify_one();
         }
         if reclaimed > 0 {
             logging::debug!(
@@ -501,22 +577,64 @@ impl PoolManager {
         }
     }
 
-    /// All of master's periodic process management. One task, so a respawn
-    /// cannot run concurrently with a spawn against the control socket it is
-    /// replacing.
-    ///
-    /// Polls rather than reacting to each exit: a prototype that dies while
-    /// the pool still has spares is otherwise unnoticed until they run out.
+    /// A load, and a write only on the idle-to-active edge, so a busy pool pays
+    /// no shared-line write per request.
+    fn note_activity(&self) {
+        if !self.active.load(Relaxed) && !self.active.swap(true, Relaxed) {
+            self.maintenance.notify_one();
+        }
+    }
+
+    /// When a pass would find nothing to do until then: no activity since the
+    /// last one, spares topped up, nothing to reclaim or reap. `None` while
+    /// there is.
+    fn settled_until(&self, spare: usize, now: Instant) -> Option<Instant> {
+        if self.active.load(Relaxed) {
+            return None;
+        }
+        let idle = self.idle.lock().unwrap();
+        if idle.len() < spare && self.admission.available_permits() > 0 {
+            return None;
+        }
+        if idle
+            .iter()
+            .any(|w| w.channel.reclaim_is_due() || w.channel.worker_has_exited())
+        {
+            return None;
+        }
+        let mut until = now + SETTLED_RECHECK;
+        if let Some(idle_timeout) = self.idle_timeout
+            && idle.len() > spare
+        {
+            for w in idle.iter() {
+                let idle_for = w.meta.idle_for(now, self.started_at);
+                until = until.min(now + idle_timeout.saturating_sub(idle_for));
+            }
+        }
+        Some(until)
+    }
+
+    /// One task, so a respawn never races a spawn on the socket it replaces. Runs
+    /// every `interval` while the pool is busy; once settled, only after activity,
+    /// a worker's or the prototype's exit, or at the next idle timeout.
     pub async fn maintain_loop(self: Arc<Self>, spare: usize, interval: Duration) {
-        let mut tick = tokio::time::interval(interval);
+        let mut sigchld = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        {
+            Ok(s) => Some(s),
+            Err(e) => {
+                logging::warn!(r#type = "controller", error = %e, "no SIGCHLD handler, pool maintenance keeps polling");
+                None
+            }
+        };
         loop {
-            tick.tick().await;
+            self.active.store(false, Relaxed);
             if self.reap_children() {
                 logging::warn!(
                     r#type = "controller",
                     "prototype exited with no pending worker-spawn attempt to notice it - respawning proactively"
                 );
-                self.try_respawn_prototype().await;
+                self.try_respawn_prototype(self.prototype_generation())
+                    .await;
             }
             self.sweep_idle_workers(spare).await;
             // Seats rather than the worker map: a spawn holds its seat from
@@ -531,6 +649,39 @@ impl PoolManager {
                         break;
                     }
                 }
+            }
+            let now = Instant::now();
+            // Only a settled pool listens for activity: a busy one would
+            // otherwise run a pass per request instead of per `interval`.
+            let (wake_at, settled) = match (self.settled_until(spare, now), &sigchld) {
+                (Some(until), Some(_)) => (until, true),
+                _ => (now + interval, false),
+            };
+            let activity = async {
+                if settled {
+                    self.maintenance.notified().await
+                } else {
+                    std::future::pending().await
+                }
+            };
+            let child_exit = async {
+                match sigchld.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let woken = tokio::select! {
+                () = tokio::time::sleep_until(wake_at.into()) => false,
+                () = activity => true,
+                () = child_exit => true,
+            };
+            // A pass one `interval` after the event, as the fixed tick had it:
+            // an immediate one would top up for a worker that is about to be
+            // returned, or respawn under a request already doing so.
+            if woken {
+                tokio::time::sleep(interval).await;
             }
         }
     }
@@ -561,41 +712,53 @@ impl PoolManager {
         }
     }
 
-    /// Hops to the control runtime, which owns the control socket's
-    /// registration whatever runtime the caller arrived on.
-    ///
-    /// A failed spawn escalates to a prototype respawn, but a full pool must
-    /// not: that would kill a healthy prototype and fail every worker in
-    /// flight, only to lose the same race again.
+    /// On the control runtime, which owns the control socket. Only a broken control
+    /// channel respawns the prototype, never a full pool. Outlives a cancelled
+    /// caller, whose worker then goes to the pool instead of holding a seat.
     async fn spawn_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
         let pool = Arc::clone(self);
-        let spawned = self.control_rt.spawn(async move {
-            match pool.spawn_worker_once().await {
+        let (reply, spawned) = tokio::sync::oneshot::channel();
+        self.control_rt.spawn(async move {
+            // Before the attempt, so a respawn landing meanwhile is reused.
+            let generation = pool.prototype_generation();
+            let result = match pool.spawn_worker_once().await {
                 Ok(w) => Ok(w),
-                Err(e) if is_pool_full(&e) => Err(e),
-                Err(e) => {
+                Err(SpawnFailure::Control(e)) => {
                     logging::warn!(r#type = "controller", error = %e, "worker spawn failed, trying to respawn the prototype");
-                    if pool.try_respawn_prototype().await {
-                        pool.spawn_worker_once().await
+                    if pool.try_respawn_prototype(generation).await {
+                        pool.spawn_worker_once().await.map_err(SpawnFailure::into_io)
                     } else {
                         Err(e)
                     }
                 }
+                Err(SpawnFailure::Refused(e)) => {
+                    pool.counters.spawns_refused.fetch_add(1, Relaxed);
+                    logging::warn!(r#type = "controller", error = %e, "the prototype could not make a worker, leaving it running");
+                    Err(e)
+                }
+                Err(other) => Err(other.into_io()),
+            };
+            if let Err(Ok(worker)) = reply.send(result) {
+                pool.return_worker(worker);
             }
         });
-        spawned.await.unwrap_or_else(|e| {
-            Err(std::io::Error::other(format!(
-                "worker spawn task on the control runtime failed: {e}"
-            )))
+        let mut spawned = SpawnReply {
+            rx: spawned,
+            pool: Arc::clone(self),
+        };
+        (&mut spawned.rx).await.unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "worker spawn task on the control runtime failed",
+            ))
         })
     }
 
-    async fn spawn_worker_once(&self) -> std::io::Result<PooledWorker> {
+    async fn spawn_worker_once(&self) -> Result<PooledWorker, SpawnFailure> {
         // The only atomic admission gate: `workers.len() < max_workers` is a
         // check-then-act two spawns can pass at once. Dropped on any early
         // return below, so a failed spawn does not cost a seat for good.
         let Ok(admission) = Arc::clone(&self.admission).try_acquire_owned() else {
-            return Err(pool_full_error());
+            return Err(SpawnFailure::PoolFull);
         };
 
         let control = self.control.lock().await;
@@ -603,7 +766,9 @@ impl PoolManager {
             tokio::time::timeout(self.spawn_timeout, control::request_worker(&control)).await;
         drop(control);
         let (fds, pid) = match request {
-            Ok(result) => result?,
+            Ok(Ok(reply)) => reply,
+            Ok(Err(e)) if control::is_spawn_refused(&e) => return Err(SpawnFailure::Refused(e)),
+            Ok(Err(e)) => return Err(SpawnFailure::Control(e)),
             Err(_elapsed) => {
                 // SPAWN went out and no reply came, so this control channel
                 // is desynced: a later request could read this one's stale
@@ -618,19 +783,21 @@ impl PoolManager {
                     .lock()
                     .unwrap()
                     .kill("prototype stopped answering a worker-spawn request");
-                return Err(std::io::Error::new(
+                return Err(SpawnFailure::Control(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "prototype did not answer a worker-spawn request in time",
-                ));
+                )));
             }
         };
 
         // The worker is already forked and parked on its rings, and nothing
         // else knows its pid yet, so failing to kill it here leaks it
         // permanently.
-        let channel = WorkerChannel::new(fds, pid).inspect_err(|_| {
-            sigkill(pid, "failed to set up the worker channel after the fork");
-        })?;
+        let channel = WorkerChannel::new(fds, pid, Some(Arc::clone(&self.maintenance)))
+            .inspect_err(|_| {
+                self.kill_worker(pid, "failed to set up the worker channel after the fork");
+            })
+            .map_err(SpawnFailure::Local)?;
 
         self.counters.workers_spawned.fetch_add(1, Relaxed);
         // Past every fallible step, so the seat now belongs to a worker that
@@ -660,6 +827,7 @@ impl PoolManager {
     /// last reference to its `WorkerMeta` goes, which is why a caller still
     /// holding the `PooledWorker` need not do anything else.
     pub(crate) fn retire(&self, who: WorkerRef, why: Retired) {
+        self.note_activity();
         let counter = match why {
             Retired::IdleTimeout => Some(&self.counters.recycled_idle_timeout),
             Retired::RequestLimit => Some(&self.counters.recycled_request_limit),
@@ -673,7 +841,7 @@ impl PoolManager {
             counter.fetch_add(1, Relaxed);
         }
         if why.needs_kill() {
-            sigkill(who.pid, why.as_str());
+            self.kill_worker(who.pid, why.as_str());
         } else {
             logging::debug!(
                 r#type = "controller",
@@ -685,6 +853,26 @@ impl PoolManager {
         self.workers.lock().unwrap().remove(&who.id);
     }
 
+    /// Via the prototype: only the parent knows the pid was not already reaped
+    /// and reused. An unreachable prototype is dead and PDEATHSIG does the job.
+    pub(crate) fn kill_worker(&self, pid: u32, context: &str) {
+        use nix::sys::socket::{MsgFlags, send};
+        use std::os::fd::AsRawFd;
+        logging::warn!(r#type = "controller", pid, context, "killing worker");
+        let channel = self.kill_channel.lock().unwrap();
+        let Some(fd) = channel.as_ref() else {
+            return;
+        };
+        let msg = control::kill_command(pid);
+        if let Err(e) = send(
+            fd.as_raw_fd(),
+            &msg,
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_NOSIGNAL,
+        ) {
+            logging::warn!(r#type = "controller", pid, error = %e, "could not ask the prototype to kill a worker");
+        }
+    }
+
     /// An idle worker, or a freshly spawned one.
     async fn get_worker(self: &Arc<Self>) -> std::io::Result<PooledWorker> {
         // A caller holding a permit with the pool at `processes.max` is owed a
@@ -692,6 +880,7 @@ impl PoolManager {
         // rather than failing the request.
         const POOL_FULL_WAIT: Duration = Duration::from_secs(1);
         let deadline = tokio::time::Instant::now() + POOL_FULL_WAIT;
+        let mut refused = None;
 
         loop {
             let returned = self.worker_returned.notified();
@@ -704,24 +893,50 @@ impl PoolManager {
                 }
                 self.retire(worker.as_ref(), Retired::Vanished);
             }
-            match self.spawn_worker().await {
-                Err(e) if is_pool_full(&e) => {}
+            let pool_full = match self.spawn_worker().await {
+                Err(e) if is_pool_full(&e) => true,
+                // No new worker for now, but a running one may free up soon.
+                Err(e)
+                    if control::is_spawn_refused(&e)
+                        && !self.workers.lock().unwrap().is_empty() =>
+                {
+                    refused = Some(e);
+                    false
+                }
                 other => return other,
-            }
-            if tokio::time::timeout_at(deadline, returned).await.is_err() {
-                return Err(pool_full_error());
+            };
+            // A recycled or killed worker frees a seat without returning. Not
+            // after a refusal: the seat is free already and would be refused again.
+            let seat_freed = async {
+                if pool_full {
+                    drop(self.admission.acquire().await);
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                () = &mut returned => {}
+                () = seat_freed => {}
+                () = tokio::time::sleep_until(deadline) => {
+                    return Err(refused.unwrap_or_else(pool_full_error));
+                }
             }
         }
     }
 
-    /// The warmest parked worker: its heap and OPcache are the least cold,
-    /// and leaving the rest alone is what lets each reach its own idle
-    /// timeout instead of being cycled evenly.
+    /// The warmest parked worker (least cold heap and OPcache; the rest can reach
+    /// their idle timeout), preferring one already registered with this runtime.
     fn take_idle(&self) -> Option<PooledWorker> {
-        self.idle.lock().unwrap().pop_back()
+        self.note_activity();
+        let mut idle = self.idle.lock().unwrap();
+        match idle.iter().rposition(|w| w.channel.registered_here()) {
+            Some(i) => idle.remove(i),
+            None => idle.pop_back(),
+        }
     }
 
     fn return_worker(&self, worker: PooledWorker) {
+        self.note_activity();
         self.idle.lock().unwrap().push_back(worker);
         self.worker_returned.notify_one();
     }
@@ -774,6 +989,7 @@ impl PoolManager {
                     "workers_abandoned": self.counters.workers_abandoned.load(Relaxed),
                     "prototype_respawns_total": self.counters.prototype_respawns.load(Relaxed),
                     "crash_loop_backoffs": self.counters.crash_loop_backoffs.load(Relaxed),
+                    "spawns_refused": self.counters.spawns_refused.load(Relaxed),
                 },
                 "workers": workers,
             }

@@ -113,6 +113,9 @@ pub struct ConnectionConfig {
     /// the gap, never the whole upload, so a slow but honest client still
     /// completes.
     pub body_read_timeout: u64,
+    /// How long a response may go unacknowledged by the client; 0 disables.
+    /// Frees the PHP worker behind a client that stopped reading.
+    pub body_write_timeout: u64,
 }
 
 /// Per core, so the cap tracks the size of the machine the way the runtime's
@@ -128,6 +131,7 @@ impl Default for ConnectionConfig {
             header_read_timeout: 10,
             idle_timeout: 65,
             body_read_timeout: 60,
+            body_write_timeout: 60,
         }
     }
 }
@@ -519,6 +523,28 @@ pub fn validate(cfg: &Config) -> Vec<String> {
                 errors.push(format!(
                     "php.targets.{name}.{field} {value:?} does not end in one of php.script_extensions ({:?}), so it could never be executed",
                     cfg.php.script_extensions
+                ));
+            }
+        }
+    }
+    // Passed as INI lines: a line break would smuggle in another directive,
+    // a NUL would truncate the C string.
+    for (scope, options) in [
+        ("admin", &cfg.php.options.admin),
+        ("user", &cfg.php.options.user),
+    ] {
+        let mut keys: Vec<&String> = options.keys().collect();
+        keys.sort();
+        for key in keys {
+            let value = &options[key];
+            if key.is_empty() || key.contains(['=', '\n', '\r', '\0']) {
+                errors.push(format!(
+                    "php.options.{scope} key {key:?} must be a plain php.ini directive name"
+                ));
+            }
+            if value.contains(['\n', '\r', '\0']) {
+                errors.push(format!(
+                    "php.options.{scope}.{key} must be a single line without NUL bytes"
                 ));
             }
         }

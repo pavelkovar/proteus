@@ -182,6 +182,10 @@ const WINDOW_LOG_MAX: u32 = 18;
 /// zstd rejects a `WindowLog` below this.
 const WINDOW_LOG_MIN: u32 = 10;
 
+/// zstd level 3's table sizes for an input of unknown size.
+const ZSTD_L3_HASH_LOG: u32 = 17;
+const ZSTD_L3_CHAIN_LOG: u32 = 16;
+
 /// The window to give an encoder for a body of `size_hint` bytes, rounded up
 /// to a power of two - wider than the body costs memory and buys no ratio.
 ///
@@ -217,6 +221,19 @@ impl SyncEncoder {
                 .expect("zstd encoder init is infallible for an in-memory sink");
                 enc.set_parameter(zstd::stream::raw::CParameter::WindowLog(window_log))
                     .expect("WindowLog is a valid zstd parameter at this encoder stage");
+                // As zstd does for a known size: a 3 KiB file would otherwise
+                // zero 768 KiB of tables. Level 1 (no hint) has smaller ones.
+                if size_hint.is_some() {
+                    for param in [
+                        zstd::stream::raw::CParameter::HashLog(
+                            (window_log + 1).min(ZSTD_L3_HASH_LOG),
+                        ),
+                        zstd::stream::raw::CParameter::ChainLog(window_log.min(ZSTD_L3_CHAIN_LOG)),
+                    ] {
+                        enc.set_parameter(param)
+                            .expect("table sizes are valid zstd parameters at this encoder stage");
+                    }
+                }
                 SyncEncoder::Zstd(enc)
             }
             Encoding::Gzip => SyncEncoder::Gzip(flate2::write::GzEncoder::new(
@@ -289,7 +306,9 @@ where
 
     tokio::spawn(async move {
         tokio::pin!(source);
-        let mut encoder = SyncEncoder::new(encoding, size_hint);
+        // Built by the first encode, on the pool: it zeroes its tables.
+        let mut encoder: Option<SyncEncoder> = None;
+        let new_encoder = move || SyncEncoder::new(encoding, size_hint);
 
         loop {
             let first = match source.next().await {
@@ -324,9 +343,25 @@ where
                 }
             }
 
+            // A small body fits one batch: encode and finish in a single hop.
+            if source_done {
+                let result = tokio::task::spawn_blocking(move || -> std::io::Result<Bytes> {
+                    let mut encoder = encoder.unwrap_or_else(new_encoder);
+                    for chunk in &pending {
+                        encoder.write(chunk)?;
+                    }
+                    encoder.finish()
+                })
+                .await
+                .expect("compression task panicked");
+                send_tail(&out_tx, result).await;
+                return;
+            }
+
             // `encoder` moves into the closure and back out, because it has
             // to survive into the next batch.
             let encode = move || -> std::io::Result<(SyncEncoder, Bytes)> {
+                let mut encoder = encoder.unwrap_or_else(new_encoder);
                 for chunk in &pending {
                     encoder.write(chunk)?;
                 }
@@ -338,7 +373,7 @@ where
                 .expect("compression task panicked")
             {
                 Ok((enc, produced)) => {
-                    encoder = enc;
+                    encoder = Some(enc);
                     if !produced.is_empty() && out_tx.send(Ok(produced)).await.is_err() {
                         return;
                     }
@@ -348,27 +383,32 @@ where
                     return;
                 }
             }
-
-            if source_done {
-                break;
-            }
         }
 
-        match tokio::task::spawn_blocking(move || encoder.finish())
-            .await
-            .expect("compression task panicked")
-        {
-            Ok(tail) if !tail.is_empty() => {
-                let _ = out_tx.send(Ok(tail)).await;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let _ = out_tx.send(Err(e)).await;
-            }
-        }
+        // An empty source still owes a valid encoded stream.
+        let result =
+            tokio::task::spawn_blocking(move || encoder.unwrap_or_else(new_encoder).finish())
+                .await
+                .expect("compression task panicked");
+        send_tail(&out_tx, result).await;
     });
 
     body_from_stream(ReceiverStream::new(out_rx))
+}
+
+async fn send_tail(
+    out_tx: &tokio::sync::mpsc::Sender<std::io::Result<Bytes>>,
+    result: std::io::Result<Bytes>,
+) {
+    match result {
+        Ok(tail) if !tail.is_empty() => {
+            let _ = out_tx.send(Ok(tail)).await;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = out_tx.send(Err(e)).await;
+        }
+    }
 }
 
 pub(crate) fn body_from_stream<S>(stream: S) -> ResponseBody

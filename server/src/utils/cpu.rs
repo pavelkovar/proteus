@@ -17,6 +17,18 @@ pub fn allowed_cpus() -> Vec<usize> {
     }
 }
 
+/// `budget` is `available_parallelism`, i.e. capped by a CFS quota. Under a quota
+/// the threads go unpinned: it limits CPU time, not CPUs, and pinning would put
+/// every container on the node onto the same first cores.
+pub fn serving_cpus(allowed: &[usize], budget: usize) -> Vec<Option<usize>> {
+    let budget = budget.max(1);
+    if allowed.is_empty() || budget < allowed.len() {
+        vec![None; budget]
+    } else {
+        allowed.iter().copied().map(Some).collect()
+    }
+}
+
 /// Pins the calling thread to one CPU, keeping its connections' state on one
 /// core instead of following the thread around. Best-effort: a cpuset that
 /// refuses is a reason to serve unpinned, not to refuse to serve.

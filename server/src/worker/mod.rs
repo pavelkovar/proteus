@@ -222,7 +222,7 @@ pub(crate) fn recv_body_fd(socket: &OwnedFd) -> std::io::Result<OwnedFd> {
         socket.as_raw_fd(),
         &mut iov,
         Some(&mut cmsg),
-        MsgFlags::empty(),
+        MsgFlags::MSG_CMSG_CLOEXEC,
     )
     .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
     for c in msg

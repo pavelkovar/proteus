@@ -96,26 +96,41 @@ fn signal_running(registry: &Registry, sig: Signal) {
 /// `registry` still owns is left for `Child::wait` to reap normally; only
 /// pids `registry` doesn't recognize are actually reaped here.
 async fn reap_orphans(registry: Registry) {
+    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .expect("failed to install a SIGCHLD handler");
     loop {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        loop {
-            let peeked = nix::sys::wait::waitid(
-                nix::sys::wait::Id::All,
-                nix::sys::wait::WaitPidFlag::WEXITED
-                    | nix::sys::wait::WaitPidFlag::WNOHANG
-                    | nix::sys::wait::WaitPidFlag::WNOWAIT,
-            );
-            let Ok(status) = peeked else { break };
-            let Some(pid) = status.pid() else { break };
-            if lock(&registry)
-                .values()
-                .flatten()
-                .any(|owned| *owned == pid)
-            {
-                break;
+        if reap_unowned(&registry) {
+            // Queued behind a job `Child::wait` has yet to reap, whose SIGCHLD
+            // may be the last one: look again shortly rather than wait for more.
+            tokio::select! {
+                _ = sigchld.recv() => {}
+                () = tokio::time::sleep(OWNED_EXIT_RETRY) => {}
             }
-            let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
+        } else {
+            sigchld.recv().await;
         }
+    }
+}
+
+const OWNED_EXIT_RETRY: Duration = Duration::from_millis(100);
+
+/// True if it stopped at an exited pid `registry` owns.
+fn reap_unowned(registry: &Registry) -> bool {
+    loop {
+        let peeked = nix::sys::wait::waitid(
+            nix::sys::wait::Id::All,
+            nix::sys::wait::WaitPidFlag::WEXITED
+                | nix::sys::wait::WaitPidFlag::WNOHANG
+                | nix::sys::wait::WaitPidFlag::WNOWAIT,
+        );
+        let Ok(status) = peeked else { return false };
+        let Some(pid) = status.pid() else {
+            return false;
+        };
+        if lock(registry).values().flatten().any(|owned| *owned == pid) {
+            return true;
+        }
+        let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
     }
 }
 
@@ -175,7 +190,7 @@ async fn sleep_until_or_shutdown(
 }
 
 async fn run_job(job: &CronJob, identity: &Identity, registry: &Registry) {
-    let mut running = match exec::spawn(identity, &job.command) {
+    let mut running = match exec::spawn(identity, &job.command, &job.env) {
         Ok(r) => r,
         Err(e) => {
             logging::error!(r#type = "cron", error = %e, "failed to spawn job");

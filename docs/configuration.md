@@ -233,7 +233,7 @@ The `php` object configures the pool of PHP worker processes and the application
 | `environment` | `{}` | Object of string key/value pairs, injected into each worker's environment before it's forked. Reaches `getenv()` always, and `$_ENV` only if PHP's `variables_order` includes `E`. |
 | `user` | inherited | String; the OS user PHP workers run as. Must be set together with `group`. |
 | `group` | inherited | String; the OS group PHP workers run as. Must be set together with `user`. Omitting both keeps the workers running as whatever identity started the master process. |
-| `options` | `{}` | Object with `admin` and `user` sub-objects, each a map of `php.ini` setting names to values. Settings under `admin` can't be changed by a script at runtime (`ini_set()`); settings under `user` can. |
+| `options` | `{}` | Object with `admin` and `user` sub-objects, each a map of `php.ini` setting names to values. Settings under `admin` can't be changed by a script at runtime (`ini_set()`); settings under `user` can. An unknown setting name stops the server from starting. |
 | `script_extensions` | `["php"]` | Array of strings; the file extensions a request is allowed to execute, matched case-sensitively. Applies to `script`/`index` in every target, and is worth keeping deliberately narrow — without it, a file upload that smuggles PHP into an unexpected extension becomes remote code execution. |
 | `no_new_privs` | `true` | Boolean; stops worker processes — and anything they `exec()`/`shell_exec()` into — from gaining new privileges through a setuid/setgid program (the Linux `PR_SET_NO_NEW_PRIVS` flag). Turn off only if something you run genuinely needs that, e.g. `mail()` delivering through a setgid helper like `postdrop`. |
 
@@ -310,6 +310,7 @@ The `connection` object bounds what a single client connection may cost before a
 | `header_read_timeout` | `10` | Integer; seconds a connection may take to send a complete request head, counted from the first byte received. Without this, a client that dribbles a request one byte at a time (a slowloris attack) can hold a connection slot forever. |
 | `idle_timeout` | `65` | Integer; seconds a keep-alive connection may sit with no request in flight before it's closed. `0` disables the timeout. |
 | `body_read_timeout` | `60` | Integer; seconds a request body may stall between reads before the connection is closed. Bounds the gap between reads, not the whole upload, so a slow but honest client can still finish. `0` disables the timeout. |
+| `body_write_timeout` | `60` | Integer; seconds a response may stall with the client reading nothing before the connection is closed, freeing the PHP worker behind it. Bounds the gap, not the whole download, so a slow client can still finish. `0` disables the timeout. |
 
 > [!WARNING]
 > Disabling `idle_timeout` turns `max` into a denial-of-service vector of its own: a client can open every available connection slot, send one request on each with `Connection: keep-alive`, and then go silent, locking out every other client indefinitely. Leave it enabled unless every client that can reach this listener is trusted.

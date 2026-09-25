@@ -75,3 +75,49 @@ async fn wait_until_idle_keeps_waiting_while_a_request_is_in_flight() {
         "must not return while the request is still in flight"
     );
 }
+
+async fn unread_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (client, accepted) = tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+    (accepted.unwrap().0, client.unwrap())
+}
+
+async fn write_until_error(io: &mut WriteStall<tokio::net::TcpStream>) -> std::io::Error {
+    use tokio::io::AsyncWriteExt;
+    let chunk = vec![0u8; 64 * 1024];
+    loop {
+        if let Err(e) = io.write_all(&chunk).await {
+            return e;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_write_the_peer_takes_nothing_of_fails_after_the_timeout() {
+    let (server, _peer) = unread_pair().await;
+    let mut io = WriteStall::new(server, Some(std::time::Duration::from_millis(300)));
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        write_until_error(&mut io),
+    )
+    .await
+    .expect("a stalled write never failed");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+}
+
+#[tokio::test]
+async fn without_a_timeout_a_stalled_write_just_waits() {
+    let (server, _peer) = unread_pair().await;
+    let mut io = WriteStall::new(server, None);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            write_until_error(&mut io)
+        )
+        .await
+        .is_err()
+    );
+}

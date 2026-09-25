@@ -257,7 +257,8 @@ fn read_frame_rejects_corrupt_length_prefix_not_panicked() {
     let err = ring
         .read_frame(&mut scratch, peer, efd.as_raw_fd())
         .unwrap_err();
-    assert!(matches!(err, RingError::FrameTooLarge));
+    // Not `FrameTooLarge`, which would blame the request and keep the worker.
+    assert!(matches!(err, RingError::Corrupt));
 }
 
 #[test]
@@ -1129,7 +1130,7 @@ fn declare_waiting_retracts_the_claim_unless_the_caller_will_actually_park() {
     let peer = make_peer_death();
     let state = AtomicU32::new(EMPTY);
 
-    let park = Ring::<64>::declare_waiting(&state, peer, || true).unwrap();
+    let park = Ring::<64>::declare_waiting(&state, peer, || Ok(true)).unwrap();
     assert!(!park, "no park is needed once the condition holds");
     assert_eq!(
         state.load(Ordering::SeqCst),
@@ -1138,7 +1139,7 @@ fn declare_waiting_retracts_the_claim_unless_the_caller_will_actually_park() {
     );
 
     // The claim must stay published for a notifier to see.
-    let park = Ring::<64>::declare_waiting(&state, peer, || false).unwrap();
+    let park = Ring::<64>::declare_waiting(&state, peer, || Ok(false)).unwrap();
     assert!(park);
     assert_eq!(
         state.load(Ordering::SeqCst),
@@ -1147,8 +1148,17 @@ fn declare_waiting_retracts_the_claim_unless_the_caller_will_actually_park() {
     );
 
     peer.mark_dead();
-    let err = Ring::<64>::declare_waiting(&state, peer, || false).unwrap_err();
+    let err = Ring::<64>::declare_waiting(&state, peer, || Ok(false)).unwrap_err();
     assert!(matches!(err, RingError::PeerGone));
+    assert_eq!(state.load(Ordering::SeqCst), EMPTY);
+}
+
+#[test]
+fn declare_waiting_retracts_the_claim_when_the_recheck_finds_corruption() {
+    let peer = make_peer_death();
+    let state = AtomicU32::new(EMPTY);
+    let err = Ring::<64>::declare_waiting(&state, peer, || Err(RingError::Corrupt)).unwrap_err();
+    assert!(matches!(err, RingError::Corrupt));
     assert_eq!(state.load(Ordering::SeqCst), EMPTY);
 }
 
@@ -1206,7 +1216,7 @@ fn a_waiter_bounced_by_the_dead_stamp_finds_peer_death_already_set() {
     let err = Ring::<REQUEST_RING_CAPACITY>::declare_waiting(
         &channel.request.data_state,
         &channel.peer_death,
-        || false,
+        || Ok(false),
     )
     .unwrap_err();
     assert!(
@@ -1379,4 +1389,158 @@ fn read_frame_until_prefers_a_ready_frame_over_an_expired_deadline() {
 
     assert!(got, "a published frame must not be lost to the deadline");
     assert_eq!(scratch, b"work");
+}
+
+// --- A peer scribbling on positions or the length prefix: an error, never a panic or hang.
+
+fn kind(e: RingError) -> std::io::ErrorKind {
+    crate::ipc::data::ring_err_to_io(e).kind()
+}
+
+#[test]
+fn a_corrupt_length_prefix_reads_as_a_broken_peer_not_an_oversized_request() {
+    let ring: &Ring<16> = make_ring();
+    let peer = make_peer_death();
+    let mut scratch = Vec::new();
+
+    unsafe { ring.copy_at(0, &9_999u32.to_le_bytes()) };
+    ring.write_pos.store(LEN_PREFIX as u64, Ordering::Release);
+
+    let err = ring.try_read_frame(&mut scratch, peer).unwrap_err();
+    assert_eq!(kind(err), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_writer_facing_a_read_position_past_its_own_reports_corruption() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+
+    ring.read_pos.store(1_000, Ordering::SeqCst);
+
+    let err = ring.write_frame(b"x", peer, efd.as_raw_fd()).unwrap_err();
+    assert_eq!(kind(err), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_reader_facing_a_write_position_behind_its_own_reports_corruption() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let mut scratch = Vec::new();
+
+    ring.read_pos.store(100, Ordering::SeqCst);
+    ring.write_pos.store(50, Ordering::SeqCst);
+
+    let err = ring.try_read_frame(&mut scratch, peer).unwrap_err();
+    assert_eq!(kind(err), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_reader_facing_more_than_a_lap_of_published_data_reports_corruption() {
+    let ring: &Ring<64> = make_ring();
+    let peer = make_peer_death();
+    let mut scratch = Vec::new();
+
+    // A reader trusting the position would find a plausible empty frame.
+    unsafe { ring.copy_at(0, &[0u8; 64]) };
+    ring.write_pos.store(64 * 3, Ordering::SeqCst);
+
+    let err = ring.try_read_frame(&mut scratch, peer).unwrap_err();
+    assert_eq!(kind(err), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn a_reclaim_mark_ahead_of_the_read_position_is_resynced_not_trusted() {
+    let (fd, _worker_side) = create_channel().unwrap();
+    let master = map_existing_channel(fd).unwrap();
+    let request = &master.channel().request;
+
+    request.reclaimed_pos.store(1 << 20, Ordering::Relaxed);
+
+    let _ = master.reclaim_is_due();
+    master.reclaim_if_due();
+    assert_eq!(
+        request.reclaimed_pos.load(Ordering::Relaxed),
+        request.read_pos.load(Ordering::Relaxed),
+        "the mark must be pulled back to what was really consumed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Benchmarks: `cargo test --release --bin proteus -- --ignored bench_ --nocapture --test-threads=1`
+// ---------------------------------------------------------------------------
+
+fn bench_report(name: &str, frames: usize, elapsed: Duration) {
+    println!(
+        "BENCH {name:44} {:8.1} ns/frame  {:7.2} Mframes/s",
+        elapsed.as_nanos() as f64 / frames as f64,
+        frames as f64 / elapsed.as_secs_f64() / 1e6
+    );
+}
+
+#[test]
+#[ignore]
+fn bench_ring_roundtrip_same_thread() {
+    let peer = make_peer_death();
+    let efd = make_notify_efd();
+    let ring: &Ring<RESPONSE_RING_CAPACITY> = make_ring();
+    let mut scratch = Vec::new();
+    for (size, frames) in [
+        (64usize, 4_000_000usize),
+        (4096, 1_000_000),
+        (65536, 100_000),
+    ] {
+        let payload = vec![7u8; size];
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..frames {
+                ring.write_frame(&payload, peer, efd.as_raw_fd()).unwrap();
+                assert!(ring.try_read_frame(&mut scratch, peer).unwrap());
+            }
+            if round == 2 {
+                bench_report(
+                    &format!("ring write+read same thread, {size} B"),
+                    frames,
+                    t.elapsed(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_ring_spsc_across_threads() {
+    let peer = make_peer_death();
+    let ring: &'static Ring<RESPONSE_RING_CAPACITY> = make_ring();
+    for (size, frames) in [(64usize, 4_000_000usize), (4096, 1_000_000)] {
+        for round in 0..3 {
+            let efd = make_notify_efd();
+            let efd_raw = efd.as_raw_fd();
+            let t = std::time::Instant::now();
+            let writer = std::thread::spawn(move || {
+                let payload = vec![7u8; size];
+                for _ in 0..frames {
+                    ring.write_frame(&payload, peer, efd_raw).unwrap();
+                }
+            });
+            let mut scratch = Vec::new();
+            for _ in 0..frames {
+                while !ring.try_read_frame(&mut scratch, peer).unwrap() {
+                    // Stands in for master's AsyncFd wake.
+                    Ring::<RESPONSE_RING_CAPACITY>::notify(&ring.space_state, Wake::Futex);
+                    std::hint::spin_loop();
+                }
+            }
+            writer.join().unwrap();
+            drop(efd);
+            if round == 2 {
+                bench_report(
+                    &format!("ring SPSC across threads, {size} B"),
+                    frames,
+                    t.elapsed(),
+                );
+            }
+        }
+    }
 }

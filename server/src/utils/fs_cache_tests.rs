@@ -103,3 +103,36 @@ fn the_cap_bounds_how_many_entries_are_kept() {
         "{resident} entries resident with a cap of {CAP}"
     );
 }
+
+#[test]
+fn locality_is_only_ever_reported_for_a_file_put_as_local() {
+    let cache = FsCache::new(10, Duration::from_millis(100));
+    cache.put_file(PathBuf::from("/tmp/local"), true);
+    cache.put_file(PathBuf::from("/tmp/remote"), false);
+    cache.put(PathBuf::from("/tmp/plain"), FsKind::File);
+    assert_eq!(
+        cache.get_with_locality(Path::new("/tmp/local")),
+        Some((FsKind::File, true))
+    );
+    assert_eq!(
+        cache.get_with_locality(Path::new("/tmp/remote")),
+        Some((FsKind::File, false))
+    );
+    assert_eq!(
+        cache.get_with_locality(Path::new("/tmp/plain")),
+        Some((FsKind::File, false))
+    );
+    cache.put(PathBuf::from("/tmp/local"), FsKind::Missing);
+    assert_eq!(
+        cache.get_with_locality(Path::new("/tmp/local")),
+        Some((FsKind::Missing, false))
+    );
+}
+
+#[test]
+fn locality_expires_with_the_entry() {
+    let cache = FsCache::new(10, Duration::from_millis(10));
+    cache.put_file(PathBuf::from("/tmp/local"), true);
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(cache.get_with_locality(Path::new("/tmp/local")), None);
+}

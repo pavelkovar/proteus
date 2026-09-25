@@ -45,15 +45,15 @@ pub struct WorkerChannel {
     worker_gone: Arc<AtomicBool>,
 }
 
-/// The notify eventfds, wrapped in `AsyncFd` only while the worker is checked
-/// out. An `AsyncFd` belongs to the reactor that created it, so registering for
-/// the worker's whole life would pin it to one runtime.
+/// Stay registered with the reactor of the runtime that last used them, so a
+/// dispatch there needs no `epoll_ctl`; another runtime re-registers.
 enum Notify {
     Parked(shm::NotifyEfds),
-    /// Held by the task driving one response.
     Registered {
         req_space: AsyncFd<OwnedFd>,
         resp_data: AsyncFd<OwnedFd>,
+        /// Each serving runtime is one thread, so its id names the reactor.
+        on: std::thread::ThreadId,
     },
     /// Only while a transition is in progress; never observed outside one.
     Moving,
@@ -61,6 +61,12 @@ enum Notify {
 
 impl Notify {
     fn register(&mut self) -> std::io::Result<()> {
+        if let Notify::Registered { on, .. } = self {
+            if *on == std::thread::current().id() {
+                return Ok(());
+            }
+            self.park();
+        }
         let shm::NotifyEfds {
             req_space,
             resp_data,
@@ -100,12 +106,11 @@ impl Notify {
         *self = Notify::Registered {
             req_space,
             resp_data,
+            on: std::thread::current().id(),
         };
         Ok(())
     }
 
-    /// Must run on the runtime that registered, which is where a response is
-    /// always finished.
     fn park(&mut self) {
         // Total, not an `if let`: anything left unmatched would be dropped
         // here, taking the eventfds with it.
@@ -113,6 +118,7 @@ impl Notify {
             Notify::Registered {
                 req_space,
                 resp_data,
+                ..
             } => Notify::Parked(shm::NotifyEfds {
                 req_space: req_space.into_inner(),
                 resp_data: resp_data.into_inner(),
@@ -126,6 +132,7 @@ impl Notify {
             Notify::Registered {
                 req_space,
                 resp_data,
+                ..
             } => Some((req_space, resp_data)),
             _ => None,
         }
@@ -190,7 +197,12 @@ impl WorkerChannel {
 
     /// Spawns the liveness watcher, which outlives this channel and ends only
     /// when the worker does.
-    pub fn new(fds: WorkerReadyFds, pid: u32) -> std::io::Result<Self> {
+    /// `on_exit` is woken once the worker is gone.
+    pub fn new(
+        fds: WorkerReadyFds,
+        pid: u32,
+        on_exit: Option<Arc<tokio::sync::Notify>>,
+    ) -> std::io::Result<Self> {
         let WorkerReadyFds {
             channel: channel_fd,
             notify,
@@ -212,6 +224,7 @@ impl WorkerChannel {
             Arc::clone(&mapped),
             Arc::clone(&worker_gone),
             watcher_notify,
+            on_exit,
         )?;
 
         Ok(WorkerChannel {
@@ -258,8 +271,6 @@ impl WorkerChannel {
         self.pending_headers = None;
         self.pending_headers_bytes = 0;
         self.deferred = None;
-        // Joins this runtime's reactor for the dispatch; left in
-        // `park_notify`.
         self.notify.register()?;
 
         let Self {
@@ -380,13 +391,14 @@ impl WorkerChannel {
 
         self.pending_headers_bytes += self.read_scratch.len();
         if self.pending_headers_bytes > MAX_PENDING_HEADERS_BYTES {
-            // Abandoning the ring is not enough: the worker would park
-            // forever in its untimed wait_for_space, whose only other escape
-            // is real process death.
-            super::sigkill(self.pid, "worker sent an oversized run of Headers frames");
+            // The worker would park forever in wait_for_space; every caller
+            // retires it with a kill on this error.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "worker sent an oversized run of Headers frames",
+                format!(
+                    "worker pid={} sent an oversized run of Headers frames",
+                    self.pid
+                ),
             ));
         }
         match &mut self.pending_headers {
@@ -427,11 +439,8 @@ impl WorkerChannel {
         data::shrink_scratch(&mut self.encode_scratch);
     }
 
-    /// Releases the eventfds from this runtime's reactor so the next dispatch
-    /// can register them elsewhere. Belongs where the worker returns to idle;
-    /// the kill paths drop the channel, which deregisters with it.
-    pub fn park_notify(&mut self) {
-        self.notify.park();
+    pub fn registered_here(&self) -> bool {
+        matches!(&self.notify, Notify::Registered { on, .. } if *on == std::thread::current().id())
     }
 
     /// Whether either ring has consumed enough to be worth a `fallocate`.
@@ -482,6 +491,7 @@ fn spawn_liveness_watcher(
     mapped: Arc<shm::MappedChannel>,
     worker_gone: Arc<AtomicBool>,
     notify: shm::NotifyEfds,
+    on_exit: Option<Arc<tokio::sync::Notify>>,
 ) -> std::io::Result<()> {
     let link = AsyncFd::new(link)?;
     tokio::spawn(async move {
@@ -498,6 +508,9 @@ fn spawn_liveness_watcher(
         shm::eventfd_notify(notify.req_space.as_raw_fd());
         shm::eventfd_notify(notify.resp_data.as_raw_fd());
         worker_gone.store(true, Ordering::Relaxed);
+        if let Some(on_exit) = on_exit {
+            on_exit.notify_one();
+        }
     });
     Ok(())
 }

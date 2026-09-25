@@ -120,3 +120,70 @@ fn recv_command_returns_the_bytes_actually_sent() {
     let result = recv_command(&mut b).expect("read failed");
     assert_eq!(result.as_deref(), Some(SPAWN));
 }
+
+#[test]
+fn kill_command_round_trips_and_nothing_else_parses_as_one() {
+    assert_eq!(parse_command(&kill_command(4242)), Command::Kill(4242));
+    assert_eq!(parse_command(SPAWN), Command::Spawn);
+    for junk in [&b"KILL"[..], b"KILL123", b"KILL12345", b"SPAWNX", b""] {
+        assert_eq!(parse_command(junk), Command::Unknown, "{junk:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_refused_spawn_comes_back_as_its_own_error_with_the_errno() {
+    let (master_end, prototype_end) = UnixSeqpacket::pair().expect("socketpair failed");
+    let responder = tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        prototype_end
+            .recv(&mut buf)
+            .await
+            .expect("SPAWN never arrived");
+        let mut reply = b"FAIL".to_vec();
+        reply.extend_from_slice(&libc::EMFILE.to_le_bytes());
+        prototype_end.send(&reply).await.expect("send failed");
+    });
+
+    let err = request_worker(&master_end).await.err().expect("must fail");
+    responder.await.unwrap();
+    assert!(is_spawn_refused(&err), "{err}");
+    let inner = err
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<SpawnRefused>()
+        .unwrap();
+    assert_eq!(inner.0.raw_os_error(), Some(libc::EMFILE));
+}
+
+#[tokio::test]
+async fn a_malformed_reply_is_not_mistaken_for_a_refusal() {
+    let (master_end, prototype_end) = UnixSeqpacket::pair().expect("socketpair failed");
+    let responder = tokio::spawn(async move {
+        let mut buf = [0u8; 64];
+        prototype_end
+            .recv(&mut buf)
+            .await
+            .expect("SPAWN never arrived");
+        prototype_end.send(b"FAILURE!").await.expect("send failed");
+    });
+    let err = request_worker(&master_end).await.err().expect("must fail");
+    responder.await.unwrap();
+    assert!(!is_spawn_refused(&err), "{err}");
+}
+
+#[test]
+fn send_spawn_failed_writes_the_marker_and_the_errno() {
+    let (mut prototype, mut master) = StdUnixStream::pair().expect("socketpair failed");
+    send_spawn_failed(
+        &mut prototype,
+        &std::io::Error::from_raw_os_error(libc::EAGAIN),
+    )
+    .unwrap();
+    let mut buf = [0u8; 8];
+    master.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf[..4], b"FAIL");
+    assert_eq!(
+        i32::from_le_bytes(buf[4..].try_into().unwrap()),
+        libc::EAGAIN
+    );
+}

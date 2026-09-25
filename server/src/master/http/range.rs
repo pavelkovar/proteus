@@ -57,6 +57,9 @@ static NOWAIT_USABLE: AtomicBool = AtomicBool::new(true);
 /// length, nothing in the fast path being an await point.
 const MAX_SYNC_CHUNKS: u8 = 8;
 
+/// Large enough that a blocking-pool hop per chunk is noise next to the copy.
+const BLOCKING_CHUNK: usize = 256 * 1024;
+
 /// `pread` that reports `EAGAIN` instead of waiting when the data is not
 /// already in page cache, so a hit can be served without a trip through the
 /// blocking pool.
@@ -96,6 +99,67 @@ fn nowait_unsupported(e: &std::io::Error) -> bool {
     )
 }
 
+/// A never-touched mapping only for `mincore` to report page-cache residency.
+/// Where the kernel withholds it (5.2+ without write access or ownership) every
+/// page reads as cached, i.e. the behaviour without this check.
+struct Residency {
+    addr: *mut libc::c_void,
+    len: usize,
+    base: u64,
+}
+
+// The mapping is only ever passed to `mincore`.
+unsafe impl Send for Residency {}
+unsafe impl Sync for Residency {}
+
+impl Residency {
+    fn page_size() -> u64 {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    }
+
+    fn map(file: &std::fs::File, offset: u64, len: u64) -> Option<Self> {
+        let base = offset & !(Self::page_size() - 1);
+        let len = usize::try_from(offset - base + len).ok()?;
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                base as libc::off_t,
+            )
+        };
+        (addr != libc::MAP_FAILED).then_some(Residency { addr, len, base })
+    }
+
+    /// False when it cannot tell.
+    fn cached(&self, offset: u64, len: usize) -> bool {
+        let page = Self::page_size() as usize;
+        let start = (offset - self.base) as usize & !(page - 1);
+        let end = ((offset - self.base) as usize + len).min(self.len);
+        let mut vec = [0u8; 80];
+        let pages = (end - start).div_ceil(page);
+        if pages > vec.len() {
+            return false;
+        }
+        let rc = unsafe {
+            libc::mincore(
+                self.addr.cast::<u8>().add(start).cast(),
+                end - start,
+                vec.as_mut_ptr(),
+            )
+        };
+        rc == 0 && vec[..pages].iter().all(|v| v & 1 == 1)
+    }
+}
+
+impl Drop for Residency {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.addr, self.len) };
+    }
+}
+
 /// Either the fd is ours to read from or a blocking read has it, never both
 /// and never neither while the stream is still live.
 enum ReadState {
@@ -116,6 +180,10 @@ pub(crate) struct FileBody {
     offset: u64,
     remaining: u64,
     sync_chunks: u8,
+    /// `Some(None)` after a failed mapping or a miss: `mincore` counts pages
+    /// readahead has inserted but not yet filled as cached, so after one miss
+    /// the rest of the stream goes to the blocking pool.
+    residency: Option<Option<Residency>>,
 }
 
 impl FileBody {
@@ -125,6 +193,7 @@ impl FileBody {
             offset,
             remaining: len,
             sync_chunks: 0,
+            residency: None,
         }
     }
 
@@ -184,7 +253,13 @@ impl Stream for FileBody {
             };
 
             let offset = this.offset;
-            let chunk_len = this.remaining.min(COALESCE_FLUSH_THRESHOLD as u64) as usize;
+            let nowait = NOWAIT_USABLE.load(Relaxed);
+            let chunk_cap = if nowait {
+                COALESCE_FLUSH_THRESHOLD
+            } else {
+                BLOCKING_CHUNK
+            };
+            let chunk_len = this.remaining.min(chunk_cap as u64) as usize;
 
             if this.sync_chunks >= MAX_SYNC_CHUNKS {
                 this.sync_chunks = 0;
@@ -196,7 +271,7 @@ impl Stream for FileBody {
             // Moved into the fallback below if the fast path cannot serve
             // this chunk, rather than allocated twice.
             let mut buf = vec![0u8; chunk_len];
-            if NOWAIT_USABLE.load(Relaxed) {
+            if nowait {
                 match pread_nowait(&file, &mut buf, offset) {
                     Ok(n) => {
                         buf.truncate(n);
@@ -209,21 +284,28 @@ impl Stream for FileBody {
                     Err(e) => return this.fail(e),
                 }
             } else {
-                // Nothing here can ask whether this read would block, so the
-                // blocking pool would spend a cross-thread round trip on every
-                // chunk, page cache hits included.
-                this.sync_chunks += 1;
-                let result = file.read_at(&mut buf, offset).map(|n| {
-                    buf.truncate(n);
-                    Bytes::from(buf)
-                });
-                this.state = ReadState::Idle(file);
-                return match result {
-                    Ok(bytes) => Poll::Ready(this.advance(bytes)),
-                    Err(e) => this.fail(e),
-                };
+                let remaining = this.remaining;
+                let residency = this
+                    .residency
+                    .get_or_insert_with(|| Residency::map(&file, offset, remaining));
+                if residency
+                    .as_ref()
+                    .is_some_and(|r| r.cached(offset, chunk_len))
+                {
+                    this.sync_chunks += 1;
+                    let result = file.read_at(&mut buf, offset).map(|n| {
+                        buf.truncate(n);
+                        Bytes::from(buf)
+                    });
+                    this.state = ReadState::Idle(file);
+                    return match result {
+                        Ok(bytes) => Poll::Ready(this.advance(bytes)),
+                        Err(e) => this.fail(e),
+                    };
+                }
+                *residency = None;
             }
-
+            // A miss read here would stall every connection on this runtime.
             this.sync_chunks = 0;
             this.state = ReadState::Reading(tokio::task::spawn_blocking(move || {
                 let result = file.read_at(&mut buf, offset).map(|n| {

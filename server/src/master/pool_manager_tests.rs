@@ -9,13 +9,24 @@ const TEST_POOL_MAX: usize = 4;
 /// Enough real state for the lifecycle tests, which touch only the prototype
 /// handle, the admission seats and the counters. `prototype_pid` must name a
 /// real killable process, since these tests signal and reap it.
-fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
-    let (control_sock, _unused_other_end) = UnixSeqpacket::pair().unwrap();
-    PoolManager {
+pub(super) fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
+    make_test_pool_manager_with_control(prototype_pid).0
+}
+
+/// Also returns the prototype's end of the control socket.
+pub(super) fn make_test_pool_manager_with_control(
+    prototype_pid: u32,
+) -> (PoolManager, UnixSeqpacket) {
+    let (control_sock, prototype_end) = UnixSeqpacket::pair().unwrap();
+    let pool = PoolManager {
+        kill_channel: StdMutex::new(dup_control(&control_sock)),
+        prototype_generation: AtomicU64::new(0),
         control: Mutex::new(control_sock),
         control_rt: tokio::runtime::Handle::current(),
         idle: StdMutex::new(VecDeque::new()),
         worker_returned: Notify::new(),
+        maintenance: Arc::new(Notify::new()),
+        active: AtomicBool::new(true),
         semaphore: Arc::new(Semaphore::new(1)),
         admission: Arc::new(Semaphore::new(TEST_POOL_MAX)),
         max_workers: 1,
@@ -36,7 +47,21 @@ fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
         },
         respawn_backoff: Mutex::new(RespawnBackoff::default()),
         workers: StdMutex::new(HashMap::new()),
+    };
+    (pool, prototype_end)
+}
+
+async fn kills_sent(prototype_end: &UnixSeqpacket) -> Vec<u32> {
+    let mut pids = Vec::new();
+    let mut buf = [0u8; 32];
+    while let Ok(Ok(n)) =
+        tokio::time::timeout(Duration::from_millis(100), prototype_end.recv(&mut buf)).await
+    {
+        if let control::Command::Kill(pid) = control::parse_command(&buf[..n.bytes_read()]) {
+            pids.push(pid);
+        }
     }
+    pids
 }
 
 /// A real, killable process standing in for a prototype or a worker; which
@@ -44,7 +69,7 @@ fn make_test_pool_manager(prototype_pid: u32) -> PoolManager {
 // The `Child` is dropped unwaited on purpose: these tests reap through
 // `waitpid`, as master does, and a second reaper would race it.
 #[allow(clippy::zombie_processes)]
-fn spawn_sleeper() -> u32 {
+pub(super) fn spawn_sleeper() -> u32 {
     let child = std::process::Command::new("sleep")
         .arg("100")
         .spawn()
@@ -95,7 +120,7 @@ fn sigkill_actually_terminates_the_process() {
 
 /// Just enough to identify a request in `/status`; nothing reads it back
 /// over the wire.
-fn dummy_request() -> Arc<crate::ipc::data::PhpRequest<'static>> {
+pub(super) fn dummy_request() -> Arc<crate::ipc::data::PhpRequest<'static>> {
     use std::borrow::Cow;
     Arc::new(crate::ipc::data::PhpRequest {
         script_path: Cow::Borrowed("/var/www/app/index.php"),
@@ -223,7 +248,7 @@ async fn replacing_a_still_running_prototype_kills_and_reaps_it() {
     reap_tracked_prototype(&pool);
 }
 
-fn reap_tracked_prototype(pool: &PoolManager) {
+pub(super) fn reap_tracked_prototype(pool: &PoolManager) {
     let pid = Pid::from_raw(pool.prototype_child.lock().unwrap().pid() as i32);
     let _ = kill(pid, Signal::SIGKILL);
     let _ = waitpid(pid, None);
@@ -411,7 +436,7 @@ async fn a_sweep_leaves_the_order_it_found() {
 /// the worker, and a placeholder pid could collide with an unrelated real one.
 #[tokio::test]
 async fn idle_timeout_never_touches_the_spare_floor() {
-    let pool = make_test_pool_manager(spawn_sleeper());
+    let (pool, prototype_end) = make_test_pool_manager_with_control(spawn_sleeper());
     let pool = PoolManager {
         idle_timeout: Some(Duration::from_secs(60)),
         // `idle_worker` stamps `last_active_ms` as "idle since pool start",
@@ -434,13 +459,12 @@ async fn idle_timeout_never_touches_the_spare_floor() {
     let left: Vec<u32> = pool.idle.lock().unwrap().iter().map(|w| w.pid).collect();
     assert_eq!(left, pids[2..].to_vec(), "only the floor should survive");
     assert_eq!(pool.counters.recycled_idle_timeout.load(Relaxed), 2);
-    for &pid in &pids[..2] {
-        assert!(
-            became_a_zombie(pid as i32).await,
-            "excess idle worker {pid} should have been killed"
-        );
-    }
-    for &pid in &pids[2..] {
+    assert_eq!(
+        kills_sent(&prototype_end).await,
+        pids[..2].to_vec(),
+        "exactly the excess idle workers should have been killed"
+    );
+    for &pid in &pids {
         let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
         let _ = waitpid(Pid::from_raw(pid as i32), None);
     }
@@ -507,7 +531,9 @@ async fn try_respawn_prototype_backs_off_within_its_own_window() {
         backoff.consecutive_failures = 0;
     }
 
-    let respawned = pool.try_respawn_prototype().await;
+    let respawned = pool
+        .try_respawn_prototype(pool.prototype_generation())
+        .await;
 
     assert!(
         !respawned,
@@ -519,6 +545,23 @@ async fn try_respawn_prototype_backs_off_within_its_own_window() {
         0,
         "the backoff gate must fire before any real spawn is attempted"
     );
+    reap_tracked_prototype(&pool);
+}
+
+#[tokio::test]
+async fn a_respawn_someone_else_already_did_is_reused_inside_the_backoff_window() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    let observed = pool.prototype_generation();
+    {
+        let mut backoff = pool.respawn_backoff.lock().await;
+        backoff.last_attempt = Some(Instant::now());
+        backoff.consecutive_failures = 0;
+    }
+    pool.prototype_generation.fetch_add(1, Release);
+
+    assert!(pool.try_respawn_prototype(observed).await);
+    assert_eq!(pool.counters.crash_loop_backoffs.load(Relaxed), 0);
+    assert_eq!(pool.counters.prototype_respawns.load(Relaxed), 0);
     reap_tracked_prototype(&pool);
 }
 
@@ -587,9 +630,10 @@ async fn every_retirement_reason_returns_the_seat() {
 /// including an `IdleTimeout` worker master decided to evict, must be killed.
 #[tokio::test]
 async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
-    let pool = make_test_pool_manager(spawn_sleeper());
+    let (pool, prototype_end) = make_test_pool_manager_with_control(spawn_sleeper());
 
-    for (why, expect_killed) in [
+    // Only ever sent to the prototype, so placeholder pids are safe.
+    for (i, (why, expect_killed)) in [
         (Retired::IdleTimeout, true),
         (Retired::RequestLimit, false),
         (Retired::Abandoned, false),
@@ -597,8 +641,11 @@ async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
         (Retired::Failed, true),
         (Retired::Vanished, false),
         (Retired::Unavailable, true),
-    ] {
-        let worker_pid = spawn_sleeper();
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let worker_pid = 900_000 + i as u32;
         let id = tracked_worker(&pool, worker_pid);
 
         pool.retire(
@@ -609,15 +656,17 @@ async fn only_the_reasons_that_leave_a_worker_running_kill_it() {
             why,
         );
 
+        let expected = if expect_killed {
+            vec![worker_pid]
+        } else {
+            vec![]
+        };
         assert_eq!(
-            became_a_zombie(worker_pid as i32).await,
-            expect_killed,
+            kills_sent(&prototype_end).await,
+            expected,
             "wrong kill decision for {:?}",
             why.as_str()
         );
-        let pid = Pid::from_raw(worker_pid as i32);
-        let _ = kill(pid, Signal::SIGKILL);
-        let _ = waitpid(pid, None);
     }
     reap_tracked_prototype(&pool);
 }
@@ -655,7 +704,7 @@ async fn dropping_a_checked_out_worker_retires_and_signals_immediately() {
 /// A tracked `PooledWorker` around a fresh shm channel, handing back the
 /// worker's own end of the response ring and its notify eventfd so a test
 /// can write into it as the worker would.
-fn retiring_worker_fixture(
+pub(super) fn retiring_worker_fixture(
     pool: &PoolManager,
     pid: u32,
 ) -> (
@@ -1019,5 +1068,134 @@ async fn a_caller_waiting_at_the_ceiling_is_woken_by_a_returned_worker() {
     // `Vanished`, not `IdleTimeout`: 4242 is a placeholder pid, not a real
     // process, and `IdleTimeout` now signals it.
     pool.retire(WorkerRef { id, pid }, Retired::Vanished);
+    reap_tracked_prototype(&pool);
+}
+
+/// The prototype reaps workers, so a pid master remembers may already be reused.
+#[tokio::test]
+async fn retiring_a_worker_never_signals_its_pid_from_master() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    // An unrelated process that got the reaped worker's pid.
+    let squatter = spawn_sleeper();
+    let id = tracked_worker(&pool, squatter);
+
+    pool.retire(WorkerRef { id, pid: squatter }, Retired::Failed);
+
+    assert!(
+        !became_a_zombie(squatter as i32).await,
+        "master signalled a pid it does not own"
+    );
+    let pid = Pid::from_raw(squatter as i32);
+    let _ = kill(pid, Signal::SIGKILL);
+    let _ = waitpid(pid, None);
+    reap_tracked_prototype(&pool);
+}
+
+#[tokio::test]
+async fn a_retired_worker_is_killed_through_the_prototype() {
+    let (pool, prototype_end) = make_test_pool_manager_with_control(spawn_sleeper());
+    let id = tracked_worker(&pool, 4242);
+
+    pool.retire(WorkerRef { id, pid: 4242 }, Retired::Watchdog);
+
+    assert_eq!(kills_sent(&prototype_end).await, vec![4242]);
+    reap_tracked_prototype(&pool);
+}
+
+#[tokio::test]
+async fn a_pool_is_settled_only_once_nothing_is_left_for_a_pass_to_do() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    let now = Instant::now();
+    pool.idle
+        .lock()
+        .unwrap()
+        .push_back(idle_worker(&pool, 601, false));
+
+    assert_eq!(
+        pool.settled_until(1, now),
+        None,
+        "activity since the last pass"
+    );
+    pool.active.store(false, Relaxed);
+    assert_eq!(pool.settled_until(1, now), Some(now + SETTLED_RECHECK));
+    assert_eq!(pool.settled_until(2, now), None, "a spare still to top up");
+
+    pool.idle
+        .lock()
+        .unwrap()
+        .push_back(idle_worker(&pool, 602, true));
+    assert_eq!(
+        pool.settled_until(1, now),
+        None,
+        "a vanished worker to retire"
+    );
+    reap_tracked_prototype(&pool);
+}
+
+#[tokio::test]
+async fn a_settled_pool_wakes_for_the_next_idle_timeout_above_spare() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    let now = Instant::now();
+    let pool = PoolManager {
+        idle_timeout: Some(Duration::from_secs(60)),
+        started_at: now - Duration::from_secs(10),
+        ..pool
+    };
+    for pid in [701u32, 702] {
+        pool.idle
+            .lock()
+            .unwrap()
+            .push_back(idle_worker(&pool, pid, false));
+    }
+    pool.active.store(false, Relaxed);
+
+    assert_eq!(
+        pool.settled_until(1, now),
+        Some(now + Duration::from_secs(50))
+    );
+    assert_eq!(
+        pool.settled_until(2, now),
+        Some(now + SETTLED_RECHECK),
+        "nothing above spare to time out"
+    );
+    reap_tracked_prototype(&pool);
+}
+
+#[tokio::test]
+async fn the_first_activity_after_settling_wakes_maintenance() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    pool.active.store(false, Relaxed);
+    let woken = pool.maintenance.notified();
+
+    let _ = pool.take_idle();
+
+    tokio::time::timeout(Duration::from_secs(1), woken)
+        .await
+        .expect("take_idle on a settled pool must wake maintenance");
+    assert!(pool.active.load(Relaxed));
+    reap_tracked_prototype(&pool);
+}
+
+#[tokio::test]
+async fn a_worker_returning_to_a_settled_pool_wakes_maintenance_but_a_sweep_does_not() {
+    let pool = make_test_pool_manager(spawn_sleeper());
+    pool.idle
+        .lock()
+        .unwrap()
+        .push_back(idle_worker(&pool, 801, false));
+    pool.active.store(false, Relaxed);
+
+    pool.sweep_idle_workers(1).await;
+    assert!(
+        !pool.active.load(Relaxed),
+        "a sweep alone must let the pool settle"
+    );
+
+    let worker = pool.idle.lock().unwrap().pop_front().unwrap();
+    pool.return_worker(worker);
+    assert!(
+        pool.active.load(Relaxed),
+        "a returned worker can put the pool above spare"
+    );
     reap_tracked_prototype(&pool);
 }

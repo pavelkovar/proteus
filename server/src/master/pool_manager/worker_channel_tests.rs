@@ -445,7 +445,7 @@ async fn a_stray_byte_on_the_worker_link_is_treated_as_fatal_same_as_eof() {
         notify,
         link: master_link_side,
     };
-    let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
+    let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID, None).unwrap();
 
     // A real worker never sends anything, so this is the protocol-violation
     // case rather than the ordinary EOF one.
@@ -461,34 +461,11 @@ async fn a_stray_byte_on_the_worker_link_is_treated_as_fatal_same_as_eof() {
     }
 }
 
-/// Kills and reaps on drop, so a failing assertion cannot leak the child.
-struct ChildGuard(std::process::Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 #[tokio::test]
 async fn a_worker_that_never_stops_sending_headers_frames_is_rejected() {
-    // A `Headers` run is worker-controlled and, unlike `Body`, bounded by no
-    // channel capacity. Uses a real disposable child's pid so a wrong or
-    // missing kill shows up as a process still alive at the end.
-    //
-    // What this cannot prove: that a worker genuinely blocked mid-write is
-    // released by that kill. This harness has no liveness watcher, so
-    // `peer.is_dead()` never becomes true; the integration suite covers it
-    // with a real forked process.
-    let child = ChildGuard(
-        std::process::Command::new("sleep")
-            .arg("100")
-            .spawn()
-            .expect("failed to spawn sleep"),
-    );
-    let child_pid = child.0.id();
-
-    let h = spawn_harness(child_pid);
+    // Unlike `Body`, a `Headers` run is bounded by no channel capacity. The
+    // kill that follows is the callers' and tested in the pool's tests.
+    let h = spawn_harness(NO_REAL_WORKER_PID);
     let resp_data_efd_raw = h.resp_data_efd_raw;
     let worker_side = h.worker_side;
     let mut channel = h.channel;
@@ -554,26 +531,11 @@ async fn a_worker_that_never_stops_sending_headers_frames_is_rejected() {
         }
     }
 
+    // Marks the peer dead, releasing a writer parked on ring space.
+    drop(channel);
     tokio::task::spawn_blocking(move || writer.join().unwrap())
         .await
         .unwrap();
-
-    // Poll for a real death rather than assume the call happened.
-    let mut child = child;
-    let reap_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match child.0.try_wait() {
-            Ok(Some(_status)) => break,
-            Ok(None) => {
-                assert!(
-                    tokio::time::Instant::now() < reap_deadline,
-                    "pid={child_pid} is still alive - the cap-exceeded path never sent it SIGKILL"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            Err(e) => panic!("try_wait failed: {e}"),
-        }
-    }
 }
 
 // --- abandoning a worker must not leak the process ---
@@ -607,7 +569,7 @@ fn channel_with_live_worker_side() -> (WorkerChannel, shm::MappedChannel, shm::N
         notify,
         link: link_master_side,
     };
-    let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID).unwrap();
+    let channel = WorkerChannel::new(fds, NO_REAL_WORKER_PID, None).unwrap();
     (channel, worker_side, worker_notify, link_worker_side)
 }
 
@@ -752,20 +714,38 @@ async fn a_failed_registration_leaves_the_channel_parked_with_both_fds() {
     assert!(matches!(notify, Notify::Parked(_)));
 }
 
-/// Parking is called on the way back to the idle pool, and a channel that was
-/// never registered is already parked. Doing it anyway must leave the channel
-/// usable rather than consuming the eventfds it was meant to keep.
-#[tokio::test]
-async fn parking_a_channel_that_was_never_registered_keeps_it_usable() {
-    let mut h = spawn_harness(NO_REAL_WORKER_PID);
+#[test]
+fn a_channel_stays_registered_on_its_runtime_and_moves_with_the_next_dispatch() {
+    let rt = || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    };
+    let mut h = rt().block_on(async { spawn_harness(NO_REAL_WORKER_PID) });
+    assert!(!h.channel.registered_here());
 
-    // Nothing has been dispatched to it, so this is the already-parked case.
-    h.channel.park_notify();
+    let first = rt();
+    first
+        .block_on(h.channel.write_request(&dummy_request()))
+        .unwrap();
+    assert!(h.channel.registered_here());
+    first
+        .block_on(h.channel.write_request(&dummy_request()))
+        .unwrap();
+    assert!(h.channel.registered_here());
 
-    h.channel
-        .write_request(&dummy_request())
-        .await
-        .expect("a parked channel must still be able to register and write");
+    let h = std::thread::spawn(move || {
+        assert!(!h.channel.registered_here());
+        let mut h = h;
+        rt().block_on(h.channel.write_request(&dummy_request()))
+            .expect("a channel registered elsewhere must re-register and write");
+        assert!(h.channel.registered_here());
+        h
+    })
+    .join()
+    .unwrap();
+    assert!(!h.channel.registered_here());
 }
 
 /// One socket does both of master's jobs on a worker. Sending over it must

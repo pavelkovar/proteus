@@ -17,6 +17,53 @@ use tokio_seqpacket::ancillary::OwnedAncillaryMessage;
 
 pub const SPAWN: &[u8] = b"SPAWN";
 
+/// Followed by the pid (LE). Unanswered, so it cannot desync a `SPAWN` exchange.
+const KILL: &[u8] = b"KILL";
+
+/// Answer to a `SPAWN` that failed, followed by the errno (LE).
+const SPAWN_FAILED: &[u8] = b"FAIL";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    Spawn,
+    Kill(u32),
+    Unknown,
+}
+
+pub fn parse_command(cmd: &[u8]) -> Command {
+    if cmd == SPAWN {
+        return Command::Spawn;
+    }
+    match cmd.strip_prefix(KILL).map(<[u8; 4]>::try_from) {
+        Some(Ok(pid)) => Command::Kill(u32::from_le_bytes(pid)),
+        _ => Command::Unknown,
+    }
+}
+
+pub fn kill_command(pid: u32) -> [u8; 8] {
+    let mut msg = [0u8; 8];
+    msg[..4].copy_from_slice(KILL);
+    msg[4..].copy_from_slice(&pid.to_le_bytes());
+    msg
+}
+
+/// The prototype is still up and in sync: respawning it would not help.
+#[derive(Debug)]
+pub struct SpawnRefused(pub std::io::Error);
+
+impl std::fmt::Display for SpawnRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the prototype could not make a worker: {}", self.0)
+    }
+}
+
+impl std::error::Error for SpawnRefused {}
+
+pub fn is_spawn_refused(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<SpawnRefused>().is_some())
+}
+
 /// Named fields rather than a tuple, so two same-typed fds cannot be
 /// transposed at a call site without a compile error.
 pub struct WorkerReadyFds {
@@ -40,6 +87,15 @@ pub async fn request_worker(control: &UnixSeqpacket) -> std::io::Result<(WorkerR
         .await?;
 
     let n = msg_info.bytes_read();
+    if n == SPAWN_FAILED.len() + 4 && buf.starts_with(SPAWN_FAILED) {
+        let errno = i32::from_le_bytes(buf[4..8].try_into().unwrap());
+        // Anything but a real errno means the channel is out of sync.
+        if (1..4096).contains(&errno) {
+            return Err(std::io::Error::other(SpawnRefused(
+                std::io::Error::from_raw_os_error(errno),
+            )));
+        }
+    }
     if n < 4 || &buf[4..n] != b"READY" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -107,10 +163,23 @@ pub fn send_worker_ready(
     let cmsg = [ControlMessage::ScmRights(&raw_fds)];
     let iov = [IoSlice::new(&payload)];
 
-    sendmsg::<()>(control.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None)
-        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-    Ok(())
-    // Closes the prototype's own copies; master holds its own duplicates.
+    // The prototype takes SIGCHLD without `SA_RESTART`. Returning closes its
+    // own copies of the fds; master holds duplicates.
+    loop {
+        match sendmsg::<()>(control.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None) {
+            Ok(_) => return Ok(()),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(std::io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+/// Prototype side.
+pub fn send_spawn_failed(control: &mut StdUnixStream, err: &std::io::Error) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut payload = SPAWN_FAILED.to_vec();
+    payload.extend_from_slice(&err.raw_os_error().unwrap_or(libc::EIO).to_le_bytes());
+    control.write_all(&payload)
 }
 
 /// Reaps every child that has already exited, handing each terminal status to
@@ -132,16 +201,20 @@ pub fn reap_exited_children(mut on_exit: impl FnMut(Pid, WaitStatus)) {
 }
 
 /// Prototype side: a worker's abnormal exit turns a mystery 500 into a
-/// diagnosable one.
-pub fn reap_finished_workers() {
-    reap_exited_children(|pid, status| match status {
-        WaitStatus::Signaled(_, signal, _) => {
-            logging::warn!(r#type = "prototype", worker_pid = %pid, ?signal, "worker killed by signal")
+/// diagnosable one. `on_reaped` hears every pid that is no longer this
+/// prototype's to signal.
+pub fn reap_finished_workers(mut on_reaped: impl FnMut(Pid)) {
+    reap_exited_children(|pid, status| {
+        on_reaped(pid);
+        match status {
+            WaitStatus::Signaled(_, signal, _) => {
+                logging::warn!(r#type = "prototype", worker_pid = %pid, ?signal, "worker killed by signal")
+            }
+            WaitStatus::Exited(_, code) if code != 0 => {
+                logging::warn!(r#type = "prototype", worker_pid = %pid, code, "worker exited with non-zero code")
+            }
+            _ => {}
         }
-        WaitStatus::Exited(_, code) if code != 0 => {
-            logging::warn!(r#type = "prototype", worker_pid = %pid, code, "worker exited with non-zero code")
-        }
-        _ => {}
     });
 }
 

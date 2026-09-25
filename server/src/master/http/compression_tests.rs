@@ -138,6 +138,82 @@ fn sizing_the_window_to_a_small_body_does_not_cost_compression() {
     );
 }
 
+fn decode(encoding: Encoding, data: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    match encoding {
+        Encoding::Zstd => out = zstd::stream::decode_all(data).expect("not valid zstd"),
+        Encoding::Brotli => {
+            brotli::Decompressor::new(data, 4096)
+                .read_to_end(&mut out)
+                .expect("not valid brotli");
+        }
+        Encoding::Gzip => {
+            flate2::read::GzDecoder::new(data)
+                .read_to_end(&mut out)
+                .expect("not valid gzip");
+        }
+    }
+    out
+}
+
+fn roundtrip_all_encodings<S>(make_source: impl Fn() -> S, expected: &[u8], size_hint: Option<u64>)
+where
+    S: Stream<Item = std::io::Result<Bytes>> + Send + 'static,
+{
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for encoding in [Encoding::Zstd, Encoding::Brotli, Encoding::Gzip] {
+        let compressed =
+            rt.block_on(async { drain(compressed_body(make_source(), encoding, size_hint)).await });
+        assert_eq!(
+            decode(encoding, &compressed),
+            expected,
+            "{encoding:?} did not round-trip"
+        );
+    }
+}
+
+#[test]
+fn a_body_that_arrives_in_one_batch_encodes_completely() {
+    let payload: Vec<u8> = (0..3000).map(|i| b"small static asset "[i % 19]).collect();
+    let chunks: Vec<Bytes> = payload.chunks(1024).map(Bytes::copy_from_slice).collect();
+    roundtrip_all_encodings(
+        || tokio_stream::iter(chunks.clone().into_iter().map(Ok)),
+        &payload,
+        Some(payload.len() as u64),
+    );
+}
+
+#[test]
+fn a_body_that_arrives_in_several_batches_encodes_completely() {
+    roundtrip_all_encodings(
+        || FakeBlockingSource {
+            remaining: 20,
+            pending: None,
+        },
+        &b"chunk".repeat(20),
+        None,
+    );
+}
+
+#[test]
+fn an_empty_body_still_encodes_to_a_valid_stream() {
+    roundtrip_all_encodings(
+        || tokio_stream::iter(Vec::<std::io::Result<Bytes>>::new()),
+        b"",
+        Some(0),
+    );
+}
+
+/// A script's size hint is unverified.
+#[test]
+fn capped_zstd_tables_still_encode_a_body_larger_than_its_hint() {
+    zstd_roundtrip(1 << 20, Some(1000));
+}
+
 // --- streamed-response size gate ---
 
 /// No declared length means the minimum-size gate is off entirely: a

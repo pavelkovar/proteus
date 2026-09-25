@@ -48,7 +48,7 @@ A reference to an unset variable with no default fails the same way it would in 
 ## cron
 
 ```console
-$ proteus cron [--user <user> --group <group>] [--shutdown-grace <duration>] <crontab>
+$ proteus cron [--user <user> --group <group>] [--inherit-env] [--shutdown-grace <duration>] <crontab>
 ```
 
 Runs every job in a crontab file, each on its own schedule, until it receives `SIGTERM` or `SIGINT`. This is a small, self-contained cron daemon meant to run as the one PID in a container alongside (or instead of) `proteus --config`, not a wrapper around the system's own `cron`/`crond`.
@@ -58,6 +58,7 @@ Runs every job in a crontab file, each on its own schedule, until it receives `S
 | `<crontab>` *(required)* | — | Path to the crontab file to run. |
 | `--user` | inherited | OS user to run every job as. Must be given together with `--group`. |
 | `--group` | inherited | OS group to run every job as. Must be given together with `--user`. Omitting both runs jobs as whatever identity `proteus cron` itself has — the same rule as `php.user`/`php.group`. |
+| `--inherit-env` | off | Start every job with `proteus cron`'s own environment instead of an empty one. See [Job environment](#job-environment). |
 | `--shutdown-grace` | `15s` | How long a running job gets, after the shutdown signal, before it's `SIGKILL`ed. Accepts a human duration such as `30s`, `2m`. |
 
 ### Crontab format
@@ -72,19 +73,29 @@ One job per line: five whitespace-separated schedule fields, then the command as
 
 Blank lines and lines starting with `#` are skipped. The schedule fields use standard cron syntax — `*`, ranges (`1-5`), lists (`1,15`), and steps (`*/5`).
 
+A `NAME=value` line sets an environment variable for the jobs below it, as in cronie.
+
+```
+APP_ENV=prod
+PATH=/opt/app/bin:/usr/local/bin:/usr/bin:/bin
+*/5 * * * * php /var/www/bin/console app:process-orders
+```
+
 A malformed line fails startup with its line number, rather than silently skipping a broken job.
 
 ### Job environment
 
-Each job runs as `sh -c "<command>"`, in a fresh, minimal environment — not the one `proteus cron` itself was started with:
+Each job runs as `sh -c "<command>"`. By default it gets a fresh, minimal environment — not the one `proteus cron` itself was started with:
 
 | Variable | Value |
 |---|---|
 | `HOME` | The identity's home directory. |
 | `LOGNAME`, `USER` | The identity's username. |
 | `SHELL` | `/bin/sh` |
-| `PATH` | `/usr/bin:/bin` |
+| `PATH` | `/usr/local/bin:/usr/bin:/bin` |
 | `TZ` | Passed through from `proteus cron`'s own environment, if set. |
+
+With `--inherit-env`, jobs start from `proteus cron`'s own environment instead; `HOME`, `LOGNAME`, `USER` and `SHELL` still come from the table above. Variables set in the crontab override both.
 
 The job's working directory is the identity's home directory. Its stdout and stderr are inherited directly, not captured into the structured log.
 

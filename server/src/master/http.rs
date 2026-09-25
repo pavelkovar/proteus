@@ -14,7 +14,7 @@ mod routing;
 
 use access_log::{GuardedBody, PendingAccessLog};
 use conditional::*;
-use connection::{ConnBusyGuard, ConnState, ConnTimeouts, wait_until_idle};
+use connection::{ConnBusyGuard, ConnState, ConnTimeouts, WriteStall, wait_until_idle};
 use proxy::*;
 use rate_limit::RateLimiter;
 use response::*;
@@ -199,7 +199,7 @@ async fn handle(
 
     // Decoded once, for routing, the filesystem and PATH_INFO alike.
     // REQUEST_URI keeps the raw form, as every other SAPI reports it.
-    let decoded_path = match percent_decode_path(ending.uri.path()) {
+    let decoded_path = match request_path(ending.uri.path()) {
         Ok(path) => path,
         Err(reason) => {
             logging::debug!(
@@ -420,9 +420,10 @@ async fn accept_loop(
         };
         let state = Arc::clone(&state);
         let listen_addr = Arc::clone(&listen_addr);
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            serve_one_connection(stream, peer, listen_addr, state, timeouts).await;
+            serve_one_connection(stream, peer, listen_addr, state, timeouts, shutdown).await;
         });
     }
     logging::info!(r#type = "controller", %listen_addr, "no longer accepting new connections");
@@ -448,6 +449,7 @@ async fn serve_one_connection(
     listen_addr: Arc<str>,
     state: Arc<AppState>,
     timeouts: ConnTimeouts,
+    mut shutdown: Shutdown,
 ) {
     set_nodelay_or_log(&stream);
     // Before the stream is consumed. A connected socket always has one, so the
@@ -455,7 +457,7 @@ async fn serve_one_connection(
     let server_addr = stream
         .local_addr()
         .map_or(std::net::IpAddr::from([0, 0, 0, 0]), |addr| addr.ip());
-    let io = TokioIo::new(stream);
+    let io = TokioIo::new(WriteStall::new(stream, timeouts.write_stall));
     let peer_identity = Peer::resolve(peer.ip(), &state.config.trusted_proxies);
     let conn = Arc::new(ConnState::new());
     let service = {
@@ -477,17 +479,25 @@ async fn serve_one_connection(
             .header_read_timeout(timeouts.header_read)
             .serve_connection(io, service)
     );
-    let result = if timeouts.idle.is_zero() {
-        connection.as_mut().await
-    } else {
-        tokio::select! {
-            result = connection.as_mut() => result,
-            _ = wait_until_idle(&conn, timeouts.idle) => {
-                // Shutting down rather than dropping lets hyper finish a
-                // response still on the wire.
-                connection.as_mut().graceful_shutdown();
-                connection.as_mut().await
-            }
+    let idle = async {
+        if timeouts.idle.is_zero() {
+            std::future::pending::<()>().await
+        } else {
+            wait_until_idle(&conn, timeouts.idle).await
+        }
+    };
+    // Shut down, not dropped: hyper finishes the response on the wire with
+    // `Connection: close`. Otherwise a busy keep-alive client would hold the
+    // shutdown drain until the grace period.
+    let result = tokio::select! {
+        result = connection.as_mut() => result,
+        () = idle => {
+            connection.as_mut().graceful_shutdown();
+            connection.as_mut().await
+        }
+        () = shutdown.wait() => {
+            connection.as_mut().graceful_shutdown();
+            connection.as_mut().await
         }
     };
     if let Err(err) = result {

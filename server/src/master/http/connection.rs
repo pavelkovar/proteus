@@ -2,9 +2,14 @@
 //! accept.
 
 use super::AppState;
+use std::io::IoSlice;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::task::{Context, Poll, ready};
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::time::Sleep;
 
 /// Lets an idle keep-alive connection be closed without disturbing one
 /// merely waiting on a slow PHP request: wall-clock silence can't tell them
@@ -86,6 +91,7 @@ pub(super) async fn wait_until_idle(conn: &ConnState, idle_timeout: std::time::D
 pub(super) struct ConnTimeouts {
     pub(super) header_read: std::time::Duration,
     pub(super) idle: std::time::Duration,
+    pub(super) write_stall: Option<std::time::Duration>,
 }
 
 impl ConnTimeouts {
@@ -95,7 +101,133 @@ impl ConnTimeouts {
                 state.config.connection.header_read_timeout,
             ),
             idle: std::time::Duration::from_secs(state.config.connection.idle_timeout),
+            write_stall: (state.config.connection.body_write_timeout > 0).then(|| {
+                std::time::Duration::from_secs(state.config.connection.body_write_timeout)
+            }),
         }
+    }
+}
+
+/// Fails a write the client has not acknowledged anything of for `timeout`, so
+/// hyper drops the connection (cut off, never ended as complete) and the PHP
+/// worker blocked behind the body channel is released.
+pub(super) struct WriteStall<T> {
+    inner: T,
+    timeout: Option<std::time::Duration>,
+    deadline: Option<Pin<Box<Sleep>>>,
+    stalled: bool,
+    acked: Option<u64>,
+}
+
+/// Progress for a reader too slow to make the socket writable again (Linux
+/// wants half the send buffer free). `None` before 4.1 or on non-TCP.
+fn bytes_acked(fd: std::os::fd::RawFd) -> Option<u64> {
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&raw mut info).cast(),
+            &mut len,
+        )
+    };
+    let needed = std::mem::offset_of!(libc::tcp_info, tcpi_bytes_acked) + size_of::<u64>();
+    (rc == 0 && len as usize >= needed).then_some(info.tcpi_bytes_acked)
+}
+
+impl<T: std::os::fd::AsRawFd> WriteStall<T> {
+    pub(super) fn new(inner: T, timeout: Option<std::time::Duration>) -> Self {
+        WriteStall {
+            inner,
+            timeout,
+            deadline: None,
+            stalled: false,
+            acked: None,
+        }
+    }
+
+    fn check<R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        poll: Poll<std::io::Result<R>>,
+    ) -> Poll<std::io::Result<R>> {
+        let Some(timeout) = self.timeout else {
+            return poll;
+        };
+        if poll.is_ready() {
+            self.stalled = false;
+            return poll;
+        }
+        let fd = self.inner.as_raw_fd();
+        let at = tokio::time::Instant::now() + timeout;
+        let deadline = self
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+        if !self.stalled {
+            self.stalled = true;
+            self.acked = bytes_acked(fd);
+            deadline.as_mut().reset(at);
+        }
+        loop {
+            ready!(deadline.as_mut().poll(cx));
+            let acked = bytes_acked(fd);
+            if acked.is_none() || acked <= self.acked {
+                break;
+            }
+            self.acked = acked;
+            deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + timeout);
+        }
+        Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "client took no response bytes within body_write_timeout",
+        )))
+    }
+}
+
+impl<T: AsyncRead + std::os::fd::AsRawFd + Unpin> AsyncRead for WriteStall<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + std::os::fd::AsRawFd + Unpin> AsyncWrite for WriteStall<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.check(cx, poll)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.check(cx, poll)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        self.check(cx, poll)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

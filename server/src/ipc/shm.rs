@@ -56,6 +56,9 @@ pub enum RingError {
     /// `raw_write_frame` makes impossible: the peer is scribbling on the
     /// cursors, so the ring cannot be read any further.
     Truncated,
+    /// The peer wrote positions or a length no real ring could have: more
+    /// than a lap published, a reader ahead of its writer, a length past capacity.
+    Corrupt,
 }
 
 /// Returns on expiry exactly as it does on a wake, so callers must recheck
@@ -253,10 +256,10 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     fn declare_waiting(
         state: &AtomicU32,
         peer: &PeerDeath,
-        condition_met: impl Fn() -> bool,
+        condition_met: impl Fn() -> Result<bool, RingError>,
     ) -> Result<bool, RingError> {
         state.store(WAITING, Ordering::SeqCst);
-        if condition_met() {
+        if condition_met().inspect_err(|_| state.store(EMPTY, Ordering::SeqCst))? {
             state.store(EMPTY, Ordering::SeqCst);
             return Ok(false);
         }
@@ -276,10 +279,10 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         state: &AtomicU32,
         peer: &PeerDeath,
         deadline: Option<std::time::Instant>,
-        ready: impl Fn() -> bool,
+        ready: impl Fn() -> Result<bool, RingError>,
     ) -> Result<bool, RingError> {
         loop {
-            if ready() {
+            if ready()? {
                 return Ok(true);
             }
             if peer.is_dead() {
@@ -322,17 +325,27 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         })
     }
 
+    /// Both positions are peer-writable, so no overflowing subtraction and no
+    /// distance larger than the ring.
+    fn used(w: u64, r: u64) -> Result<u64, RingError> {
+        let used = w.wrapping_sub(r);
+        if used > CAPACITY as u64 {
+            return Err(RingError::Corrupt);
+        }
+        Ok(used)
+    }
+
     /// `SeqCst` so `declare_waiting`'s recheck joins the same total order as
     /// its `WAITING` store. Free on the fast path - a `SeqCst` load is the
     /// same instruction as an `Acquire` one on x86_64 and aarch64.
-    fn has_space(&self, w: u64, needed: usize) -> bool {
+    fn has_space(&self, w: u64, needed: usize) -> Result<bool, RingError> {
         let r = self.read_pos.load(Ordering::SeqCst);
-        CAPACITY - (w - r) as usize >= needed
+        Ok(CAPACITY as u64 - Self::used(w, r)? >= needed as u64)
     }
 
-    fn has_data(&self, r: u64, needed: usize) -> bool {
+    fn has_data(&self, r: u64, needed: usize) -> Result<bool, RingError> {
         let w = self.write_pos.load(Ordering::SeqCst);
-        (w - r) as usize >= needed
+        Ok(Self::used(w, r)? >= needed as u64)
     }
 
     /// Parks the task until `ready` or the peer's death.
@@ -340,10 +353,10 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         state: &AtomicU32,
         peer: &PeerDeath,
         efd: &AsyncFd<OwnedFd>,
-        ready: impl Fn() -> bool,
+        ready: impl Fn() -> Result<bool, RingError>,
     ) -> Result<(), RingError> {
         loop {
-            if ready() {
+            if ready()? {
                 return Ok(());
             }
             if peer.is_dead() {
@@ -411,12 +424,13 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
     /// large streamed one still returns its pages promptly.
     const RECLAIM_THRESHOLD: u64 = 64 * 1024;
 
-    /// Two atomic loads, so a caller can skip the `spawn_blocking` hop to
-    /// `reclaim_if_due` in the common case where it would do nothing.
+    /// Lets a caller skip the `spawn_blocking` hop to `reclaim_if_due`. Wrapping,
+    /// as both positions are peer-writable: a mark ahead of the reader reads as
+    /// due, and `reclaim_if_due` resyncs it.
     fn is_reclaim_due(&self) -> bool {
         let read_pos = self.read_pos.load(Ordering::Relaxed);
         let reclaimed = self.reclaimed_pos.load(Ordering::Relaxed);
-        read_pos - reclaimed >= Self::RECLAIM_THRESHOLD
+        read_pos.wrapping_sub(reclaimed) >= Self::RECLAIM_THRESHOLD
     }
 
     /// Punches out the range consumed since the last reclaim. `file_offset`
@@ -433,6 +447,12 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         // the peer's write, not ours.
         let read_pos = self.read_pos.load(Ordering::Relaxed);
         let reclaimed = self.reclaimed_pos.load(Ordering::Relaxed);
+        // Only a corrupting peer puts the mark past the reader: punch nothing
+        // and restart the mark from what was really consumed.
+        if reclaimed > read_pos {
+            self.reclaimed_pos.store(read_pos, Ordering::Relaxed);
+            return;
+        }
         let consumed = read_pos - reclaimed;
         if consumed < Self::RECLAIM_THRESHOLD {
             return;
@@ -586,6 +606,15 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         Ok(())
     }
 
+    /// Publishes raw bytes, as a peer scribbling on the mapping could.
+    #[cfg(test)]
+    pub(crate) fn publish_raw_for_test(&self, bytes: &[u8]) {
+        let w = self.write_pos.load(Ordering::Relaxed);
+        unsafe { self.copy_at(w, bytes) };
+        self.write_pos
+            .store(w + bytes.len() as u64, Ordering::Release);
+    }
+
     #[cfg(test)]
     pub fn read_frame(
         &self,
@@ -614,7 +643,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         unsafe { self.raw_read(&mut len_buf) };
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > CAPACITY - LEN_PREFIX {
-            return Err(RingError::FrameTooLarge);
+            return Err(RingError::Corrupt);
         }
         self.wait_for_data(len, peer)?;
         unsafe { self.read_into_scratch(scratch, len) };
@@ -653,7 +682,7 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         peer: &PeerDeath,
     ) -> Result<bool, RingError> {
         let r = self.read_pos.load(Ordering::Relaxed); // consumer-only
-        if !self.has_data(r, LEN_PREFIX) {
+        if !self.has_data(r, LEN_PREFIX)? {
             if peer.is_dead() {
                 return Err(RingError::PeerGone);
             }
@@ -663,9 +692,9 @@ impl<const CAPACITY: usize> Ring<CAPACITY> {
         unsafe { self.peek_into(r, len_buf.as_mut_ptr(), LEN_PREFIX) };
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > CAPACITY - LEN_PREFIX {
-            return Err(RingError::FrameTooLarge);
+            return Err(RingError::Corrupt);
         }
-        if !self.has_data(r, LEN_PREFIX + len) {
+        if !self.has_data(r, LEN_PREFIX + len)? {
             return Err(RingError::Truncated);
         }
         unsafe {
